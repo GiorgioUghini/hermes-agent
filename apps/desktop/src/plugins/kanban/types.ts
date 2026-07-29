@@ -89,6 +89,12 @@ export interface KanbanAttachment {
   id: number | string
   filename: string
   size?: null | number
+  /** Absolute path of the blob on the backend host. Present since the drawer
+   *  endpoint's first version; the desktop uses it to open the file in the
+   *  preview rail instead of forcing a download to read it. Absent on a remote
+   *  backend whose filesystem the desktop can't reach. */
+  stored_path?: null | string
+  content_type?: null | string
 }
 
 /** Fields present only on the detail endpoint (beyond the card's KanbanTask).

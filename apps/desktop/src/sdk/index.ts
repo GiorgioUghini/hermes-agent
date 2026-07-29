@@ -23,8 +23,10 @@ import { atom, type ReadableAtom } from 'nanostores'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { getLogs, getStatus } from '@/hermes'
+import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
+import { openPreview } from '@/store/preview'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId, $currentCwd, $currentModel, $gatewayState } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
@@ -85,6 +87,26 @@ export const host = {
   /** Navigate the app router (hash routes, e.g. '/command-center?section=system'). */
   navigate: (path: string) => {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
+  },
+
+  /** Open a file (or http URL) in the preview rail — the same surface the file
+   *  browser and tool results use. `target` is an absolute path, a `file://`
+   *  URL, or an `https://` URL; main classifies it (text / image / html /
+   *  binary) so the caller doesn't have to sniff. Resolves false when the
+   *  target can't be previewed, so a caller can fall back (e.g. to a download)
+   *  instead of leaving the user with nothing. */
+  preview: async (target: string, cwd?: string): Promise<boolean> => {
+    const resolved = await normalizeOrLocalPreviewTarget(target, cwd ?? $currentCwd.get() ?? undefined)
+
+    // A binary blob has nothing to show — say so rather than opening a tab
+    // that renders an error.
+    if (!resolved || resolved.previewKind === 'binary') {
+      return false
+    }
+
+    openPreview(resolved, 'tool-result')
+
+    return true
   },
 
   /** HEAR the gateway stream (message deltas, session lifecycle, tool

@@ -149,6 +149,7 @@ type KanbanMessages = {
     attachments: (n: number) => string
     noAttachments: string
     uploadAttachment: string
+    openAttachment: string
     downloadAttachment: string
     attachmentSaved: (name: string) => string
     reveal: string
@@ -339,6 +340,7 @@ const en: KanbanMessages = {
     attachments: n => `Attachments · ${n}`,
     noAttachments: 'No attachments yet.',
     uploadAttachment: 'Upload attachment',
+    openAttachment: 'Open in preview',
     downloadAttachment: 'Download',
     attachmentSaved: name => `Saved ${name}`,
     reveal: 'Reveal',
@@ -529,6 +531,7 @@ const ja: KanbanMessages = {
     attachments: n => `添付・${n}`,
     noAttachments: 'まだ添付はありません。',
     uploadAttachment: '添付をアップロード',
+    openAttachment: 'プレビューで開く',
     downloadAttachment: 'ダウンロード',
     attachmentSaved: name => `${name} を保存しました`,
     reveal: '表示',
@@ -718,6 +721,7 @@ const zh: KanbanMessages = {
     attachments: n => `附件・${n}`,
     noAttachments: '暂无附件。',
     uploadAttachment: '上传附件',
+    openAttachment: '在预览中打开',
     downloadAttachment: '下载',
     attachmentSaved: name => `已保存 ${name}`,
     reveal: '在文件夹中显示',
@@ -905,6 +909,7 @@ const zhHant: KanbanMessages = {
     attachments: n => `附件・${n}`,
     noAttachments: '尚無附件。',
     uploadAttachment: '上傳附件',
+    openAttachment: '在預覽中開啟',
     downloadAttachment: '下載',
     attachmentSaved: name => `已儲存 ${name}`,
     reveal: '在資料夾中顯示',

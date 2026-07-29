@@ -413,11 +413,13 @@ const isAdminSummary = (summary: string) => /^status changed to \w+ \(dashboard\
 function AttachmentsSection({
   attachments,
   onDownload,
+  onOpen,
   onUpload,
   pending
 }: {
   attachments: KanbanAttachment[]
   onDownload: (attachment: KanbanAttachment) => void
+  onOpen: (attachment: KanbanAttachment) => void
   onUpload: (file: File) => void
   pending: boolean
 }) {
@@ -458,20 +460,25 @@ function AttachmentsSection({
       {attachments.length > 0 ? (
         <ul className="flex flex-col gap-1">
           {attachments.map(attachment => (
-            <li key={attachment.id}>
+            <li className="group/att flex items-center gap-1" key={attachment.id}>
+              {/* Clicking the row OPENS it — reading the artifact an agent just
+                  produced is the common case; saving a copy is the rare one. */}
               <button
-                className="flex w-full items-center gap-1.5 rounded-sm text-left text-[0.75rem] text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)"
-                onClick={() => onDownload(attachment)}
-                title={k.downloadAttachment}
+                className="flex min-w-0 flex-1 items-center gap-1.5 rounded-sm text-left text-[0.75rem] text-(--ui-text-tertiary) transition-colors hover:text-(--ui-text-secondary)"
+                onClick={() => onOpen(attachment)}
+                title={k.openAttachment}
                 type="button"
               >
                 <Codicon className="shrink-0" name="file" size="0.75rem" />
                 <span className="truncate">{attachment.filename}</span>
-                <Codicon
-                  className="ml-auto shrink-0 text-(--ui-text-quaternary)"
-                  name="cloud-download"
-                  size="0.7rem"
-                />
+              </button>
+              <button
+                aria-label={k.downloadAttachment}
+                className="grid size-5 shrink-0 place-items-center rounded text-(--ui-text-tertiary) opacity-0 transition-opacity hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:opacity-100 group-hover/att:opacity-100"
+                onClick={() => onDownload(attachment)}
+                type="button"
+              >
+                <Codicon name="cloud-download" size="0.7rem" />
               </button>
             </li>
           ))}
@@ -683,6 +690,23 @@ export function TaskDrawer({
         message: k.attachmentSaved(filePath.split(/[/\\]/).pop() || '')
       })
     }
+  })
+
+  // Open an attachment in the preview rail. The blob lives on the backend
+  // host, so `stored_path` only resolves when that filesystem is reachable —
+  // and a binary (zip, video) has nothing to render either way. Both cases
+  // fall through to the save dialog rather than dead-ending the click.
+  const openMut = useMutation({
+    mutationFn: async (attachment: KanbanAttachment) => {
+      if (attachment.stored_path && (await host.preview(attachment.stored_path))) {
+        return true
+      }
+
+      await downloadMut.mutateAsync(attachment)
+
+      return false
+    },
+    onError: err => host.notify({ kind: 'error', message: errText(err) })
   })
 
   if (!id) {
@@ -970,6 +994,7 @@ export function TaskDrawer({
             <AttachmentsSection
               attachments={detail.attachments}
               onDownload={attachment => downloadMut.mutate(attachment)}
+              onOpen={attachment => openMut.mutate(attachment)}
               onUpload={file => uploadMut.mutate(file)}
               pending={uploadMut.isPending}
             />
