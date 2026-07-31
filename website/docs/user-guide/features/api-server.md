@@ -356,6 +356,41 @@ The response is JSON:
 The client sets `sdp` as its WebRTC remote description. Neither this response
 nor any control event contains the standard OpenAI API key.
 
+### Quick PC microphone test
+
+The repository includes a dependency-free localhost client for checking the
+voice path before building a mobile app. It uses the browser for microphone
+capture and WebRTC audio, while a small Python proxy keeps `API_SERVER_KEY`
+out of browser JavaScript.
+
+On Linux or macOS:
+
+```bash
+export HERMES_REALTIME_URL="https://your-hermes-api.example.com"
+export HERMES_API_KEY="your-api-server-key"
+python3 scripts/realtime_voice_pc_client.py
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:HERMES_REALTIME_URL = "https://your-hermes-api.example.com"
+$env:HERMES_API_KEY = "your-api-server-key"
+python scripts\realtime_voice_pc_client.py
+```
+
+The script binds only to `127.0.0.1:8787` and opens the page in the default
+browser. Allow microphone access, select **Start talking**, and speak after the
+status becomes live. Use `--port 8788` to choose another local port or
+`--no-open` to suppress automatic browser launch. The local proxy tracks active
+sessions and reclaims them on Ctrl+C; the page also closes microphone capture
+if that proxy disappears.
+
+This is deliberately a media smoke test, not a full application. It does not
+open the structured control WebSocket, display approval prompts, or renew a
+long-running provider call. Stop the session before closing the page; abnormal
+disconnects are eventually reclaimed by the Hermes session manager.
+
 ### What remains available
 
 Realtime voice uses the same `AIAgent` capability substrate as text channels:
