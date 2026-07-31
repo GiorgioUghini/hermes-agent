@@ -1260,3 +1260,64 @@ def build_turn_context(
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
     )
+
+
+def build_host_turn_context(
+    agent,
+    user_message,
+    *,
+    conversation_history=None,
+    task_id=None,
+    persist_user_message=None,
+    persist_user_timestamp=None,
+    persist_user_display_kind=None,
+    persist_user_display_metadata=None,
+) -> TurnContext:
+    """Run the canonical turn prologue for a host-managed model transport.
+
+    Realtime and future session-oriented hosts own provider I/O themselves, but
+    still need the exact memory, plugin, compression, prompt, and persistence
+    lifecycle used by ``run_conversation``. Keeping those imports lazy avoids
+    the existing ``conversation_loop`` -> ``turn_context`` module cycle.
+    """
+
+    from agent.conversation_loop import (
+        _ra,
+        _restore_or_build_system_prompt,
+        _sanitize_surrogates,
+        _summarize_user_message_for_log,
+    )
+    from agent.process_bootstrap import _install_safe_stdio
+    from hermes_logging import set_session_context
+    from tools.skill_provenance import set_current_write_origin
+
+    def _restore_host_system_prompt(
+        target_agent, system_message, history
+    ) -> None:
+        if (
+            getattr(target_agent, "_host_system_prompt_frozen", False)
+            and getattr(target_agent, "_cached_system_prompt", None)
+        ):
+            return
+        _restore_or_build_system_prompt(target_agent, system_message, history)
+
+    return build_turn_context(
+        agent,
+        user_message,
+        None,
+        conversation_history,
+        task_id,
+        None,
+        persist_user_message,
+        persist_user_timestamp,
+        persist_user_display_kind=persist_user_display_kind,
+        persist_user_display_metadata=persist_user_display_metadata,
+        restore_or_build_system_prompt=_restore_host_system_prompt,
+        install_safe_stdio=_install_safe_stdio,
+        sanitize_surrogates=_sanitize_surrogates,
+        summarize_user_message_for_log=_summarize_user_message_for_log,
+        set_session_context=set_session_context,
+        set_current_write_origin=set_current_write_origin,
+        ra=_ra,
+        moa_active=False,
+    )

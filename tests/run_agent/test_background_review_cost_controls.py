@@ -29,6 +29,7 @@ class _FakeAgent:
     def __init__(self, provider="openai-codex", model="gpt-5.5"):
         self.provider = provider
         self.model = model
+        self.platform = "telegram"
         self._credential_pool: Any = None
         self.request_overrides = {}
         self.max_tokens: int | None = None
@@ -109,6 +110,50 @@ def test_routing_resolution_failure_falls_back_to_parent():
         rt = br._resolve_review_runtime(agent)
     assert rt["routed"] is False
     assert rt["provider"] == "openai-codex"
+
+
+def test_realtime_parent_routes_to_text_runtime_instead_of_inheriting():
+    agent = _FakeAgent(provider="openai-api", model="gpt-realtime")
+    agent.platform = "realtime_voice"
+    cfg = {
+        "model": "openai/gpt-5.4",
+        "auxiliary": {"background_review": {"provider": "auto", "model": ""}},
+    }
+    resolved = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5.4",
+        "api_key": "text-key",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_mode": "chat_completions",
+    }
+    with patch(
+        "hermes_cli.config.load_config_readonly", return_value=cfg
+    ), patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value=resolved,
+    ):
+        rt = br._resolve_review_runtime(agent)
+
+    assert rt["routed"] is True
+    assert rt["model"] == "openai/gpt-5.4"
+    assert "realtime" not in rt["model"]
+
+
+def test_realtime_review_runtime_rejects_realtime_only_model():
+    cfg = {
+        "model": "gpt-realtime",
+        "auxiliary": {"background_review": {"provider": "auto", "model": ""}},
+    }
+    with patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value={"provider": "openai-api", "model": "gpt-realtime"},
+    ):
+        try:
+            br.resolve_realtime_review_runtime(cfg)
+        except RuntimeError as exc:
+            assert "text-capable model" in str(exc)
+        else:
+            raise AssertionError("gpt-realtime must not be used for text review")
 
 
 # ---------------------------------------------------------------------------

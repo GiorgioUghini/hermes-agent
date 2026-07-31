@@ -1172,6 +1172,9 @@ DEFAULT_CONFIG = {
             "telegram": {"streaming": True},
             "discord": {"streaming": False},
             "slack": {"streaming": False},
+            # Successful retrospective maintenance never becomes unsolicited
+            # speech or a conversational message on the native voice surface.
+            "realtime_voice": {"memory_notifications": "off"},
         },
         # Gateway runtime-metadata footer appended to the FINAL message of a turn
         # (disabled by default to keep replies minimal). When enabled, renders
@@ -1472,6 +1475,49 @@ DEFAULT_CONFIG = {
         # voice chat instead of being sent to the agent. Case-insensitive,
         # surrounding punctuation ignored. Set [] to disable.
         "stop_phrases": ["stop"],
+    },
+
+    # Native speech-to-speech sessions served by the authenticated API server.
+    # Android/WebRTC media goes directly to OpenAI; Hermes keeps the standard
+    # OPENAI_API_KEY server-side and controls the call through a sideband socket.
+    "realtime_voice": {
+        "enabled": False,
+        "model": "gpt-realtime",
+        "voice": "marin",
+        "transcription_model": "gpt-4o-mini-transcribe",
+        "turn_detection": {
+            "type": "server_vad",
+            "threshold": 0.5,
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": 500,
+        },
+        "intermediate_speech": {
+            "enabled": True,
+            "delay_seconds": 2.5,
+        },
+        "limits": {
+            "max_active_sessions": 4,
+            "max_creations_per_minute": 10,
+            "max_sdp_bytes": 65536,
+            "max_control_event_bytes": 65536,
+            "idle_timeout_seconds": 900,
+            "provider_call_max_seconds": 3300,
+            "provider_call_max_input_tokens": 24000,
+            "approval_timeout_seconds": 600,
+            "control_buffer_events": 256,
+            "control_subscriber_queue_events": 128,
+            "history_message_limit": 40,
+        },
+        "transport": {
+            # Exact OpenAI-compatible provider endpoints. Custom proxies receive
+            # OPENAI_API_KEY as a bearer credential on both connections.
+            "call_url": "https://api.openai.com/v1/realtime/calls",
+            "sideband_url": "wss://api.openai.com/v1/realtime",
+            "request_timeout_seconds": 20,
+            "connect_timeout_seconds": 10,
+            "reconnect_grace_seconds": 30,
+            "transcription_timeout_seconds": 5,
+        },
     },
 
     # "Hey Hermes" hands-free wake word. Always-on, on-device hotword

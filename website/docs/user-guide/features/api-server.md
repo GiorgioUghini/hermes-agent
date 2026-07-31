@@ -250,12 +250,159 @@ Returns a machine-readable description of the API server's stable surface for ex
     "run_submission": true,
     "run_status": true,
     "run_events_sse": true,
-    "run_stop": true
+    "run_stop": true,
+    "realtime_voice": false,
+    "realtime_voice_details": {
+      "available": false,
+      "enabled": false
+    }
   }
 }
 ```
 
 Use this endpoint when integrating dashboards, browser UIs, or control planes so they can discover whether the running Hermes version supports runs, streaming, cancellation, and session continuity without depending on private Python internals.
+
+## Native Realtime Voice (WebRTC)
+
+Hermes can expose a voice-only, speech-to-speech agent backed by OpenAI
+Realtime. The Android client sends microphone audio to OpenAI and receives
+model audio over WebRTC, while Hermes joins the same call over a server-side
+sideband connection.
+
+This split keeps the latency-sensitive audio path direct without moving
+authority out of Hermes:
+
+- The standard `OPENAI_API_KEY` stays on the Hermes host.
+- Hermes supplies the frozen SOUL, context, skill index, and tool schemas.
+- Every tool call still runs through Hermes approvals, guardrails, plugins,
+  checkpoints, memory, and persistence.
+- Only authenticated structured controls can approve privileged work. Spoken
+  confirmation is never authorization.
+- Hermes, not the Android data channel, sends tool results and creates model
+  responses.
+
+The repository provides this backend protocol but does not include an Android
+application. See [Programmatic Integration](/developer-guide/programmatic-integration#native-realtime-voice-androidwebrtc)
+for the client sequence and control envelopes.
+
+### Enable realtime voice
+
+Add the non-secret settings to `~/.hermes/config.yaml`:
+
+```yaml
+realtime_voice:
+  enabled: true
+  model: gpt-realtime
+  voice: marin
+```
+
+Add the provider credential to `~/.hermes/.env`:
+
+```bash
+OPENAI_API_KEY=your-openai-api-key
+```
+
+The API server itself must also be enabled and protected by
+`API_SERVER_KEY`. Restart `hermes gateway`, then check availability:
+
+```bash
+curl http://127.0.0.1:8642/v1/capabilities \
+  -H "Authorization: Bearer $API_SERVER_KEY"
+```
+
+`features.realtime_voice` becomes `true` only when both
+`realtime_voice.enabled` and `OPENAI_API_KEY` are present. The
+`realtime_voice_details` object reports the configured model and voice,
+session limits, barge-in behavior, and whether background self-improvement
+has a text-capable auxiliary runtime.
+
+### Session endpoints
+
+All routes use the normal API-server bearer authentication.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/v1/realtime/sessions` | Exchange an Android SDP offer for the OpenAI SDP answer and create or resume a logical Hermes session |
+| `GET` | `/v1/realtime/sessions/{id}/control?after={sequence}` | Upgrade to the sequenced structured-control WebSocket |
+| `POST` | `/v1/realtime/sessions/{id}/approval` | HTTP fallback for an approval decision |
+| `POST` | `/v1/realtime/sessions/{id}/renew` | Exchange a fresh SDP offer while preserving the logical session |
+| `DELETE` | `/v1/realtime/sessions/{id}` | Close media and sideband resources and finalize the session |
+
+Create and renew accept either `application/sdp` or JSON:
+
+```json
+{
+  "sdp": "v=0\r\n...",
+  "session_id": "optional_existing_logical_session"
+}
+```
+
+The response is JSON:
+
+```json
+{
+  "version": 1,
+  "session_id": "rt_...",
+  "call_id": "rtc_...",
+  "sdp": "v=0\r\n...",
+  "model": "gpt-realtime",
+  "voice": "marin",
+  "control_url": "/v1/realtime/sessions/rt_.../control",
+  "renew_url": "/v1/realtime/sessions/rt_.../renew",
+  "provider_call_max_seconds": 3300
+}
+```
+
+The client sets `sdp` as its WebRTC remote description. Neither this response
+nor any control event contains the standard OpenAI API key.
+
+### What remains available
+
+Realtime voice uses the same `AIAgent` capability substrate as text channels:
+
+- SOUL, project context, memory, skills, plugins, MCP tools, delegation,
+  checkpoints, and approval policy remain active.
+- Skill reads and user-requested skill writes are ordinary foreground tool
+  calls. A skill written during a call is immediately readable by name.
+- The injected skill index and tool schemas stay frozen for the logical
+  session. Newly discovered capabilities appear automatically in the next
+  session.
+- Automatic memory/skill review runs after a settled voice turn in a separate
+  text-model agent. It never delays the next voice turn or speaks its internal
+  work.
+
+Because the main model is `gpt-realtime`, automatic background review needs an
+explicit text-capable runtime. For example:
+
+```yaml
+auxiliary:
+  background_review:
+    provider: openai-api
+    model: gpt-5.4-mini
+```
+
+If no compatible runtime can be resolved, voice remains available but
+`background_self_improvement.available` is `false` in `/v1/capabilities`.
+Successful review notifications are silent by default on the voice surface.
+
+### Interruption and renewal
+
+OpenAI VAD detects turns, but Hermes controls response creation. If the user
+speaks while the agent is responding, current audio is interrupted. A tool
+that already started is allowed to finish; superseded calls that have not
+started are skipped, and the model reevaluates after the durable result
+boundary.
+
+The provider call rotates before its age or input-context limit. When the
+control socket emits `session.rotation_required`, create a fresh peer
+connection, send its offer to `/renew`, and apply the returned answer. The
+logical Hermes session, frozen prompt and tools, transcript, memory, and
+durable tool results continue across that rotation.
+
+Reconnect the control WebSocket with `?after=<last_sequence>` to replay buffered
+events. If the cursor is older than the bounded buffer, Hermes emits
+`control.resync_required`; the client should rebuild transient UI from the
+following state and request events.
 
 ## Per-request model selection
 
@@ -540,6 +687,12 @@ default keys on named prefixes now return `401`.
 
 :::warning Security
 The API server gives full access to hermes-agent's toolset, **including terminal commands**. `API_SERVER_KEY` is **required for every deployment**, including the default loopback bind on `127.0.0.1`. Keep `API_SERVER_CORS_ORIGINS` narrow to control browser access when you explicitly allow browser callers.
+
+For Realtime voice, use HTTPS/WSS outside a trusted loopback or private
+network. The Android client receives only the Hermes bearer credential, never
+the OpenAI key. Raw audio flows over the negotiated WebRTC connection and is
+not persisted by Hermes by default; finalized transcripts, function calls, and
+tool results are durable session history.
 :::
 
 ## Configuration
@@ -572,6 +725,61 @@ gateway:
 ```
 
 `port`, `key`, `host`, `cors_origins`, and `model_name` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
+
+### Realtime voice settings
+
+Realtime behavior belongs in the top-level `realtime_voice` section of
+`config.yaml`; do not put these non-secret settings in `.env`.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Enable native Realtime session routes |
+| `model` | `gpt-realtime` | OpenAI Realtime model, fixed for a logical session |
+| `voice` | `marin` | Voice, fixed for a logical session |
+| `transcription_model` | `gpt-4o-mini-transcribe` | Input transcription used for durable history and lifecycle hooks |
+| `turn_detection.type` | `server_vad` | OpenAI turn detection (`server_vad` or `semantic_vad`) |
+| `turn_detection.threshold` | `0.5` | Server-VAD activation threshold |
+| `turn_detection.silence_duration_ms` | `500` | Silence required to commit a turn |
+| `intermediate_speech.enabled` | `true` | Allow brief out-of-band spoken status during a long tool wait |
+| `intermediate_speech.delay_seconds` | `2.5` | Delay before eligible status speech |
+| `limits.max_active_sessions` | `4` | Concurrent logical Realtime sessions per profile |
+| `limits.provider_call_max_seconds` | `3300` | Proactive provider-call rotation age |
+| `limits.provider_call_max_input_tokens` | `24000` | Proactive input-context rotation threshold |
+| `transport.reconnect_grace_seconds` | `30` | Sideband reconnect window before renewal is required |
+| `transport.call_url` | `https://api.openai.com/v1/realtime/calls` | Exact HTTPS endpoint for WebRTC call creation |
+| `transport.sideband_url` | `wss://api.openai.com/v1/realtime` | Exact WSS endpoint for call-ID sideband attachment |
+| `limits.approval_timeout_seconds` | `600` | Structured approval/clarification wait limit |
+
+The full defaults also bound SDP and control-message sizes, replay history,
+status-speech frequency, and creation rate. Model and voice overrides in a
+session request are rejected. Change the server configuration, restart the
+gateway, and create a new logical session instead.
+
+#### OpenAI-compatible Realtime proxies
+
+Both provider connections can be routed through an OpenAI-compatible proxy:
+
+```yaml
+realtime_voice:
+  enabled: true
+  model: gpt-realtime-2.1
+  voice: marin
+  transport:
+    call_url: https://proxy.example/v1/realtime/calls
+    sideband_url: wss://proxy.example/v1/realtime
+```
+
+`call_url` must accept OpenAI's multipart `sdp` and `session` fields and return
+the raw SDP answer with a `Location` call identifier. `sideband_url` must attach
+to that same call through a `call_id` query parameter and relay Realtime events
+without rewriting them. Existing query parameters are preserved when Hermes
+adds `call_id`.
+
+Hermes sends `OPENAI_API_KEY` as a bearer credential to both configured
+endpoints. Only configure trusted HTTPS/WSS services, and keep credentials out
+of the URLs themselves. These URLs affect only the Realtime media runtime;
+configure `auxiliary.background_review` separately if retrospective
+self-improvement should use the same proxy.
 
 ### Concurrent-run cap
 
@@ -660,6 +868,13 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 - **Simple OpenAI clients still see an alias** — `/v1/models` advertises the
   stable Hermes alias (`hermes-agent` or the active profile name). Richer
   clients can send explicit `provider` / `model_options` overrides on requests.
+- **Realtime is voice-only** — audio is streamed over WebRTC; the control
+  socket carries status and authorization UI, not an assistant text stream.
+- **Streamed audio cannot be rewritten afterward** — post-response observation
+  hooks still run, but `transform_llm_output` cannot alter speech the listener
+  has already heard.
+- **OpenAI Realtime only in v1** — there is no provider fallback to a text
+  model when a native voice call fails.
 
 ## Proxy Mode
 

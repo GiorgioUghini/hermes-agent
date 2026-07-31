@@ -5613,6 +5613,216 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    def get_tool_result_by_call_id(
+        self,
+        session_id: str,
+        tool_call_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the durable tool result for an idempotent provider call."""
+
+        if not session_id or not tool_call_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                """SELECT id, content, tool_name, effect_disposition, timestamp
+                   FROM messages
+                   WHERE session_id = ? AND role = 'tool'
+                     AND tool_call_id = ? AND active = 1
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id, tool_call_id),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["content"] = self._decode_content(result.get("content"))
+        result["tool_call_id"] = tool_call_id
+        return result
+
+    def save_realtime_session_state(
+        self,
+        session_id: str,
+        *,
+        provider_call_id: str,
+        provider_call_started_at: float,
+        state: str,
+        model: str = "",
+        voice: str = "",
+        frozen_instructions: str,
+        frozen_tools: Any,
+    ) -> None:
+        """Persist the recoverable OpenAI call projection for a voice session."""
+
+        frozen_tools_json = json.dumps(
+            frozen_tools if isinstance(frozen_tools, list) else [],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO realtime_sessions (
+                       session_id, provider_call_id, provider_call_started_at,
+                       state, model, voice, frozen_instructions, frozen_tools,
+                       updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                       provider_call_id = excluded.provider_call_id,
+                       provider_call_started_at = excluded.provider_call_started_at,
+                       state = excluded.state,
+                       model = excluded.model,
+                       voice = excluded.voice,
+                       frozen_instructions = excluded.frozen_instructions,
+                       frozen_tools = excluded.frozen_tools,
+                       updated_at = excluded.updated_at""",
+                (
+                    session_id,
+                    provider_call_id or None,
+                    float(provider_call_started_at),
+                    state,
+                    str(model or ""),
+                    str(voice or ""),
+                    str(frozen_instructions or ""),
+                    frozen_tools_json,
+                    time.time(),
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def get_realtime_session_state(
+        self, session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return durable voice-call and review state for one logical session."""
+
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM realtime_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            tools = json.loads(result.get("frozen_tools") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            tools = []
+        result["frozen_tools"] = tools if isinstance(tools, list) else []
+        result["review_memory"] = bool(result.get("review_memory"))
+        result["review_skills"] = bool(result.get("review_skills"))
+        return result
+
+    def mark_realtime_review_due(
+        self,
+        session_id: str,
+        *,
+        boundary_message_id: int,
+        review_memory: bool,
+        review_skills: bool,
+    ) -> None:
+        """Durably queue the newest coalesced review boundary."""
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE realtime_sessions
+                   SET review_state = 'due',
+                       review_boundary_message_id = ?,
+                       review_memory = CASE
+                           WHEN review_state IN ('due', 'running')
+                           THEN MAX(review_memory, ?)
+                           ELSE ?
+                       END,
+                       review_skills = CASE
+                           WHEN review_state IN ('due', 'running')
+                           THEN MAX(review_skills, ?)
+                           ELSE ?
+                       END,
+                       review_error = NULL,
+                       updated_at = ?
+                   WHERE session_id = ?""",
+                (
+                    int(boundary_message_id),
+                    int(bool(review_memory)),
+                    int(bool(review_memory)),
+                    int(bool(review_skills)),
+                    int(bool(review_skills)),
+                    time.time(),
+                    session_id,
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def mark_realtime_review_running(
+        self, session_id: str, *, boundary_message_id: int
+    ) -> bool:
+        """Claim a specific due review boundary for the current process."""
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE realtime_sessions
+                   SET review_state = 'running', review_error = NULL, updated_at = ?
+                   WHERE session_id = ? AND review_boundary_message_id = ?
+                     AND review_state = 'due'""",
+                (time.time(), session_id, int(boundary_message_id)),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def finish_realtime_review(
+        self,
+        session_id: str,
+        *,
+        boundary_message_id: int,
+        success: bool,
+        error: Optional[str] = None,
+    ) -> bool:
+        """Finish a review only if no newer boundary superseded it."""
+
+        state = "completed" if success else "failed"
+        safe_error = None if success else str(error or "background review failed")[:1000]
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE realtime_sessions
+                   SET review_state = ?, review_error = ?, updated_at = ?
+                   WHERE session_id = ? AND review_boundary_message_id = ?
+                     AND review_state = 'running'""",
+                (
+                    state,
+                    safe_error,
+                    time.time(),
+                    session_id,
+                    int(boundary_message_id),
+                ),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def delete_realtime_session_state(self, session_id: str) -> None:
+        """Remove the provider projection after an explicit logical close."""
+
+        self._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM realtime_sessions WHERE session_id = ?",
+                (session_id,),
+            )
+        )
+
+    def get_latest_message_id(self, session_id: str) -> Optional[int]:
+        """Return the latest active transcript boundary for a session."""
+
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+        value = row[0] if row is not None else None
+        return int(value) if value is not None else None
+
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
         display_metadata: Optional[Dict[str, Any]] = None,

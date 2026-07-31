@@ -689,3 +689,32 @@ def finalize_turn(
     agent._turn_received_provider_response = False
 
     return result
+
+
+def finalize_host_turn(
+    agent,
+    turn_context,
+    *,
+    final_response,
+    api_call_count,
+    interrupted=False,
+    failed=False,
+    turn_exit_reason="text_response(host_transport)",
+):
+    """Run canonical post-turn lifecycle for a host-managed model transport."""
+
+    return finalize_turn(
+        agent,
+        final_response=final_response,
+        api_call_count=api_call_count,
+        interrupted=interrupted,
+        failed=failed,
+        messages=turn_context.messages,
+        conversation_history=turn_context.conversation_history,
+        effective_task_id=turn_context.effective_task_id,
+        turn_id=turn_context.turn_id,
+        user_message=turn_context.user_message,
+        original_user_message=turn_context.original_user_message,
+        _should_review_memory=turn_context.should_review_memory,
+        _turn_exit_reason=turn_exit_reason,
+    )

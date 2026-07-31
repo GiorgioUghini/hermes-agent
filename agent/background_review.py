@@ -43,6 +43,72 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def resolve_realtime_review_runtime(
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve a concrete text-capable runtime for a Realtime parent."""
+
+    if config is None:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    cfg = config if isinstance(config, dict) else {}
+    aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+    task = (
+        aux.get("background_review", {})
+        if isinstance(aux.get("background_review"), dict)
+        else {}
+    )
+    task_provider = str(task.get("provider", "")).strip()
+    task_model = str(task.get("model", "")).strip()
+    task_base_url = str(task.get("base_url", "")).strip() or None
+    task_api_key = str(task.get("api_key", "")).strip() or None
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.models import get_default_model_for_provider
+
+    if task_provider and task_provider != "auto" and task_model:
+        runtime = resolve_runtime_provider(
+            requested=task_provider,
+            target_model=task_model,
+            explicit_api_key=task_api_key,
+            explicit_base_url=task_base_url,
+        )
+    else:
+        configured_model = cfg.get("model")
+        configured_model = (
+            str(configured_model).strip()
+            if isinstance(configured_model, str)
+            else ""
+        )
+        runtime = resolve_runtime_provider(target_model=configured_model or None)
+
+    provider = str(runtime.get("provider") or task_provider).strip()
+    model = str(
+        runtime.get("model")
+        or task_model
+        or get_default_model_for_provider(provider)
+        or ""
+    ).strip()
+    if not model or "realtime" in model.lower():
+        raise RuntimeError(
+            "no text-capable model is configured for realtime background review"
+        )
+    return {
+        "provider": provider,
+        "model": model,
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "api_mode": runtime.get("api_mode"),
+        "credential_pool": runtime.get("credential_pool"),
+        "request_overrides": dict(runtime.get("request_overrides") or {}),
+        "max_tokens": runtime.get("max_output_tokens"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+        "routed": True,
+    }
+
+
 def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     """Resolve provider/model/credentials for the review fork.
 
@@ -80,10 +146,41 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
     task_api_key = (str(task.get("api_key", "")).strip() or None)
+    realtime_parent = (
+        str(getattr(agent, "platform", "") or "") == "realtime_voice"
+        or "realtime" in str(getattr(agent, "model", "") or "").lower()
+    )
     if not (task_provider and task_provider != "auto" and task_model):
-        return parent
-    if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
+        if not realtime_parent:
+            return parent
+        # A Realtime session cannot be replayed through the ordinary text
+        # AIAgent wire protocol. Resolve the user's configured main text
+        # runtime instead of silently inheriting gpt-realtime.
+        try:
+            return resolve_realtime_review_runtime(cfg)
+        except Exception as exc:
+            logger.warning(
+                "Realtime background review is unavailable: %s. Configure "
+                "auxiliary.background_review.provider/model with a text-capable runtime.",
+                exc,
+            )
+            return {"unavailable": True, "routed": True}
+    if (
+        task_provider == (agent.provider or "")
+        and task_model == (agent.model or "")
+        and not realtime_parent
+    ):
         return parent  # same model/provider as parent -> not routed
+    if realtime_parent:
+        try:
+            return resolve_realtime_review_runtime(cfg)
+        except Exception as exc:
+            logger.warning(
+                "Realtime background-review routing failed (%s); review skipped "
+                "rather than sending a text turn to the realtime model.",
+                exc,
+            )
+            return {"unavailable": True, "routed": True}
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
         rp = resolve_runtime_provider(
@@ -106,6 +203,13 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
             "routed": True,
         }
     except Exception as e:
+        if realtime_parent:
+            logger.warning(
+                "Realtime background-review routing failed (%s); review skipped "
+                "rather than sending a text turn to the realtime model.",
+                e,
+            )
+            return {"unavailable": True, "routed": True}
         logger.debug("background-review aux routing failed (%s); using main model", e)
         return parent
 
@@ -636,7 +740,7 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
-) -> None:
+) -> bool:
     """Worker function executed in the background-review daemon thread.
 
     Spawns a forked ``AIAgent`` inheriting the parent's runtime, runs the
@@ -689,6 +793,8 @@ def _run_review_in_thread(
             # model — that model's runtime (routed=True). The codex_app_server
             # -> codex_responses downgrade is applied inside the resolver.
             _rt = _resolve_review_runtime(agent)
+            if _rt.get("unavailable"):
+                return False
             _routed = bool(_rt.get("routed"))
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,
@@ -941,9 +1047,11 @@ def _run_review_in_thread(
                 except Exception:
                     pass
 
+        return True
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
         agent._emit_auxiliary_failure("background review", e)
+        return False
     finally:
         # Safety-net cleanup for the exception path.  Normal completion already
         # shut down inside the thread-scoped silence above.  Re-enter the
@@ -993,8 +1101,8 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
-    def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+    def _target() -> bool:
+        return _run_review_in_thread(agent, messages_snapshot, prompt)
 
     return _target, prompt
 
@@ -1006,4 +1114,5 @@ __all__ = [
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",
+    "resolve_realtime_review_runtime",
 ]

@@ -1235,6 +1235,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._realtime_managers: Dict[str, Any] = {}
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1813,6 +1814,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            ("POST", "/v1/realtime/sessions", self._handle_realtime_session_create),
+            ("GET", "/v1/realtime/sessions/{session_id}/control", self._handle_realtime_control),
+            ("POST", "/v1/realtime/sessions/{session_id}/approval", self._handle_realtime_approval),
+            ("POST", "/v1/realtime/sessions/{session_id}/renew", self._handle_realtime_session_renew),
+            ("DELETE", "/v1/realtime/sessions/{session_id}", self._handle_realtime_session_delete),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -2678,6 +2684,191 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         return agent
 
+    def _realtime_runtime_status(self):
+        """Return normalized realtime config, credential presence, and review status."""
+
+        from agent.background_review import resolve_realtime_review_runtime
+        from gateway.realtime.protocol import RealtimeVoiceConfig
+        from hermes_cli.config import get_env_value_prefer_dotenv, load_config
+
+        user_config = load_config()
+        realtime_config = RealtimeVoiceConfig.from_config(user_config)
+        api_key = str(get_env_value_prefer_dotenv("OPENAI_API_KEY") or "").strip()
+        try:
+            resolve_realtime_review_runtime(user_config)
+            review_configured = True
+        except Exception:
+            review_configured = False
+        return realtime_config, api_key, review_configured
+
+    def _create_realtime_agent(
+        self,
+        session_id: str,
+        *,
+        realtime_config,
+        api_key: str,
+    ):
+        """Create the Hermes capability substrate without entering its text loop."""
+
+        from run_agent import AIAgent
+        from gateway.realtime.session import REALTIME_SYSTEM_GUIDANCE
+        from gateway.run import (
+            _checkpoint_agent_kwargs,
+            _current_max_iterations,
+            _load_gateway_config,
+        )
+        from hermes_cli.tools_config import _get_platform_tools
+
+        user_config = _load_gateway_config()
+        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        return AIAgent(
+            model=realtime_config.model,
+            api_key=api_key,
+            base_url="https://api.openai.com/v1",
+            provider="openai-api",
+            api_mode="chat_completions",
+            max_iterations=_current_max_iterations(),
+            quiet_mode=True,
+            verbose_logging=False,
+            ephemeral_system_prompt=REALTIME_SYSTEM_GUIDANCE,
+            enabled_toolsets=enabled_toolsets,
+            session_id=session_id,
+            platform="realtime_voice",
+            session_db=self._ensure_session_db(),
+            fallback_model=None,
+            gateway_session_key=session_id,
+            **_checkpoint_agent_kwargs(user_config),
+        )
+
+    def _ensure_realtime_manager(self):
+        """Return the profile-scoped manager or a client-safe availability error."""
+
+        from gateway.realtime.manager import RealtimeSessionError, RealtimeSessionManager
+        from gateway.realtime.protocol import derive_safety_identifier
+
+        realtime_config, api_key, _review_configured = self._realtime_runtime_status()
+        if not realtime_config.enabled:
+            raise RealtimeSessionError(
+                "Native realtime voice is disabled in config.yaml",
+                code="realtime_voice_disabled",
+                status=404,
+            )
+        if not api_key:
+            raise RealtimeSessionError(
+                "OPENAI_API_KEY is required for native realtime voice",
+                code="openai_credentials_missing",
+                status=503,
+            )
+        profile_name = _api_request_profile.get() or ""
+        manager_key = profile_name or "__default__"
+        manager = self._realtime_managers.get(manager_key)
+        if manager is None:
+            safety_identifier = derive_safety_identifier(
+                self._expected_api_key(),
+                profile_name,
+            )
+            manager = RealtimeSessionManager(
+                config=realtime_config,
+                api_key=api_key,
+                profile_name=profile_name,
+                safety_identifier=safety_identifier,
+                agent_factory=lambda session_id: self._create_realtime_agent(
+                    session_id,
+                    realtime_config=realtime_config,
+                    api_key=api_key,
+                ),
+            )
+            self._realtime_managers[manager_key] = manager
+        return manager
+
+    @staticmethod
+    def _realtime_error_response(exc):
+        from gateway.realtime.manager import RealtimeSessionError
+        from gateway.realtime.openai_sideband import OpenAIRealtimeError
+        from gateway.realtime.protocol import RealtimeProtocolError
+
+        if isinstance(exc, RealtimeSessionError):
+            status = exc.status
+            code = exc.code
+        elif isinstance(exc, OpenAIRealtimeError):
+            status = exc.status if exc.status and 400 <= exc.status < 600 else 502
+            code = exc.code
+        elif isinstance(exc, RealtimeProtocolError):
+            status = 400
+            code = exc.code
+        else:
+            status = 500
+            code = "realtime_internal_error"
+        return web.json_response(
+            _openai_error(_redact_api_error_text(exc), code=code),
+            status=status,
+        )
+
+    async def _read_realtime_offer(self, request: "web.Request"):
+        """Read a bounded raw-or-JSON SDP offer without logging media metadata."""
+
+        try:
+            realtime_config, _api_key, _review_configured = self._realtime_runtime_status()
+        except Exception as exc:
+            return None, None, self._realtime_error_response(exc)
+        if (
+            request.content_length is not None
+            and request.content_length > realtime_config.max_sdp_bytes
+        ):
+            return None, None, web.json_response(
+                _openai_error("SDP offer is too large", code="sdp_offer_too_large"),
+                status=413,
+            )
+        raw = await request.read()
+        if len(raw) > realtime_config.max_sdp_bytes:
+            return None, None, web.json_response(
+                _openai_error("SDP offer is too large", code="sdp_offer_too_large"),
+                status=413,
+            )
+        requested_session_id = request.query.get("session_id")
+        if request.content_type == "application/json":
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None, None, web.json_response(
+                    _openai_error("Invalid JSON in request body", code="invalid_json"),
+                    status=400,
+                )
+            if not isinstance(body, dict):
+                return None, None, web.json_response(
+                    _openai_error("Request body must be an object"),
+                    status=400,
+                )
+            offer_sdp = body.get("sdp")
+            requested_session_id = body.get("session_id") or requested_session_id
+            for immutable in ("model", "voice"):
+                requested = body.get(immutable)
+                configured = getattr(realtime_config, immutable)
+                if requested is not None and str(requested) != configured:
+                    return None, None, web.json_response(
+                        _openai_error(
+                            f"{immutable} overrides are not allowed by this server",
+                            code=f"{immutable}_override_not_allowed",
+                        ),
+                        status=400,
+                    )
+        else:
+            try:
+                offer_sdp = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                offer_sdp = ""
+        if not isinstance(offer_sdp, str) or not offer_sdp.strip():
+            return None, None, web.json_response(
+                _openai_error("A non-empty SDP offer is required", code="missing_sdp"),
+                status=400,
+            )
+        if "v=0" not in offer_sdp or "m=audio" not in offer_sdp:
+            return None, None, web.json_response(
+                _openai_error("The SDP offer does not contain an audio media line", code="invalid_sdp"),
+                status=400,
+            )
+        return offer_sdp, requested_session_id, None
+
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
@@ -2832,6 +3023,222 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+    async def _handle_realtime_session_create(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        offer_sdp, requested_session_id, error = await self._read_realtime_offer(
+            request
+        )
+        if error is not None:
+            return error
+        try:
+            manager = self._ensure_realtime_manager()
+            created = await manager.create_session(
+                offer_sdp,
+                requested_session_id=requested_session_id,
+            )
+            config = created.session.config
+            return web.json_response(
+                {
+                    "version": 1,
+                    "session_id": created.session.session_id,
+                    "call_id": created.call_id,
+                    "sdp": created.answer_sdp,
+                    "model": config.model,
+                    "voice": config.voice,
+                    "control_url": (
+                        f"/v1/realtime/sessions/"
+                        f"{created.session.session_id}/control"
+                    ),
+                    "renew_url": (
+                        f"/v1/realtime/sessions/"
+                        f"{created.session.session_id}/renew"
+                    ),
+                    "provider_call_max_seconds": config.provider_call_max_seconds,
+                }
+            )
+        except Exception as exc:
+            logger.warning("Realtime session creation failed: %s", exc)
+            return self._realtime_error_response(exc)
+
+    async def _handle_realtime_session_renew(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        offer_sdp, _requested_session_id, error = await self._read_realtime_offer(
+            request
+        )
+        if error is not None:
+            return error
+        try:
+            manager = self._ensure_realtime_manager()
+            created = await manager.renew_session(
+                request.match_info["session_id"], offer_sdp
+            )
+            config = created.session.config
+            return web.json_response(
+                {
+                    "version": 1,
+                    "session_id": created.session.session_id,
+                    "call_id": created.call_id,
+                    "sdp": created.answer_sdp,
+                    "model": config.model,
+                    "voice": config.voice,
+                    "provider_call_max_seconds": (
+                        config.provider_call_max_seconds
+                    ),
+                }
+            )
+        except Exception as exc:
+            logger.warning("Realtime session renewal failed: %s", exc)
+            return self._realtime_error_response(exc)
+
+    async def _handle_realtime_session_delete(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            manager = self._ensure_realtime_manager()
+            closed = await manager.close_session(
+                request.match_info["session_id"], reason="client_closed"
+            )
+            if not closed:
+                return web.json_response(
+                    _openai_error(
+                        "Realtime session was not found", code="session_not_found"
+                    ),
+                    status=404,
+                )
+            return web.Response(status=204)
+        except Exception as exc:
+            return self._realtime_error_response(exc)
+
+    async def _handle_realtime_approval(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, error = await self._read_json_body(request)
+        if error is not None:
+            return error
+        try:
+            manager = self._ensure_realtime_manager()
+            session = await manager.require_active(request.match_info["session_id"])
+            resolved = await session.resolve_approval(
+                choice=str(body.get("choice") or "").lower(),
+                approval_id=str(body.get("approval_id") or ""),
+                resolve_all=bool(body.get("all", False)),
+                reason=str(body.get("reason") or "") or None,
+            )
+            if resolved == 0:
+                return web.json_response(
+                    _openai_error(
+                        "No approval is pending for this session",
+                        code="approval_not_pending",
+                    ),
+                    status=409,
+                )
+            return web.json_response({"resolved": resolved})
+        except Exception as exc:
+            return self._realtime_error_response(exc)
+
+    async def _handle_realtime_control(
+        self, request: "web.Request"
+    ) -> "web.StreamResponse":
+        from gateway.realtime.protocol import (
+            RealtimeProtocolError,
+            validate_control_command,
+        )
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            manager = self._ensure_realtime_manager()
+            session = await manager.require_active(request.match_info["session_id"])
+            try:
+                after_sequence = max(0, int(request.query.get("after", "0")))
+            except (TypeError, ValueError):
+                raise RealtimeProtocolError(
+                    "after must be a non-negative integer",
+                    code="invalid_control_cursor",
+                )
+        except Exception as exc:
+            return self._realtime_error_response(exc)
+
+        ws = web.WebSocketResponse(
+            heartbeat=30,
+            max_msg_size=manager.config.max_control_event_bytes,
+        )
+        await ws.prepare(request)
+        subscription = session.broker.subscribe(after_sequence=after_sequence)
+        try:
+            for event in subscription.backlog:
+                await ws.send_json(event)
+            if subscription.cursor_expired:
+                session.broker.publish(
+                    "control.resync_required",
+                    {
+                        "requested_after": after_sequence,
+                        "latest_sequence": session.broker.latest_sequence,
+                    },
+                )
+
+            async def send_events() -> None:
+                while not ws.closed:
+                    event = await subscription.queue.get()
+                    await ws.send_json(event)
+
+            sender = asyncio.create_task(
+                send_events(), name=f"realtime-control-{session.session_id}"
+            )
+            try:
+                async for message in ws:
+                    if message.type == web.WSMsgType.TEXT:
+                        try:
+                            command = validate_control_command(message.data)
+                            await session.handle_control_command(command)
+                        except Exception as exc:
+                            code = getattr(exc, "code", "invalid_control_command")
+                            session.broker.publish(
+                                "control.error",
+                                {
+                                    "code": code,
+                                    "message": _redact_api_error_text(exc),
+                                },
+                            )
+                        if session.closed:
+                            break
+                    elif message.type == web.WSMsgType.BINARY:
+                        session.broker.publish(
+                            "control.error",
+                            {
+                                "code": "binary_control_not_supported",
+                                "message": "Control commands must be JSON text.",
+                            },
+                        )
+                    elif message.type in {
+                        web.WSMsgType.ERROR,
+                        web.WSMsgType.CLOSE,
+                        web.WSMsgType.CLOSED,
+                    }:
+                        break
+            finally:
+                sender.cancel()
+                await asyncio.gather(sender, return_exceptions=True)
+        finally:
+            session.broker.unsubscribe(subscription)
+            await ws.close()
+        return ws
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -2842,6 +3249,54 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+
+        try:
+            realtime_config, realtime_key, review_configured = (
+                self._realtime_runtime_status()
+            )
+            realtime_available = bool(realtime_config.enabled and realtime_key)
+            realtime_details = {
+                "available": realtime_available,
+                "enabled": realtime_config.enabled,
+                "transport": "webrtc_sideband",
+                "provider": "openai",
+                "model": realtime_config.model,
+                "voice": realtime_config.voice,
+                "structured_approvals": True,
+                "voice_authorization": False,
+                "barge_in": {
+                    "interrupts_audio": True,
+                    "cancels_started_tools": False,
+                },
+                "max_active_sessions": realtime_config.max_active_sessions,
+                "provider_call_max_seconds": (
+                    realtime_config.provider_call_max_seconds
+                ),
+                "provider_call_max_input_tokens": (
+                    realtime_config.provider_call_max_input_tokens
+                ),
+                "background_self_improvement": {
+                    "available": bool(realtime_available and review_configured),
+                    "configured": review_configured,
+                    "silent_by_default": True,
+                },
+            }
+            if realtime_config.enabled and not realtime_key:
+                realtime_details["unavailable_reason"] = (
+                    "openai_credentials_missing"
+                )
+            elif realtime_available and not review_configured:
+                realtime_details["background_self_improvement"][
+                    "unavailable_reason"
+                ] = "text_auxiliary_runtime_not_configured"
+        except Exception as exc:
+            logger.warning("Could not resolve realtime capabilities: %s", exc)
+            realtime_available = False
+            realtime_details = {
+                "available": False,
+                "enabled": False,
+                "unavailable_reason": "configuration_error",
+            }
 
         return web.json_response({
             "object": "hermes.api_server.capabilities",
@@ -2883,8 +3338,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
-                "audio_api": False,
-                "realtime_voice": False,
+                "audio_api": realtime_available,
+                "realtime_voice": realtime_available,
+                "realtime_voice_details": realtime_details,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -2913,6 +3369,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+                "realtime_session_create": {"method": "POST", "path": "/v1/realtime/sessions"},
+                "realtime_control": {"method": "GET", "path": "/v1/realtime/sessions/{session_id}/control"},
+                "realtime_approval": {"method": "POST", "path": "/v1/realtime/sessions/{session_id}/approval"},
+                "realtime_renew": {"method": "POST", "path": "/v1/realtime/sessions/{session_id}/renew"},
+                "realtime_close": {"method": "DELETE", "path": "/v1/realtime/sessions/{session_id}"},
             },
         })
 
@@ -6917,6 +7378,13 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        if self._realtime_managers:
+            managers = list(self._realtime_managers.values())
+            self._realtime_managers.clear()
+            await asyncio.gather(
+                *(manager.close_all(reason="gateway_shutdown") for manager in managers),
+                return_exceptions=True,
+            )
         if self._response_store is not None:
             try:
                 self._response_store.close()

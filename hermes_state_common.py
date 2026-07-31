@@ -278,6 +278,23 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS realtime_sessions (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    provider_call_id TEXT,
+    provider_call_started_at REAL,
+    state TEXT NOT NULL DEFAULT 'ready',
+    model TEXT NOT NULL DEFAULT '',
+    voice TEXT NOT NULL DEFAULT '',
+    frozen_instructions TEXT NOT NULL DEFAULT '',
+    frozen_tools TEXT NOT NULL DEFAULT '[]',
+    review_state TEXT NOT NULL DEFAULT 'idle',
+    review_boundary_message_id INTEGER,
+    review_memory INTEGER NOT NULL DEFAULT 0,
+    review_skills INTEGER NOT NULL DEFAULT 0,
+    review_error TEXT,
+    updated_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -306,6 +323,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+CREATE INDEX IF NOT EXISTS idx_realtime_sessions_review
+    ON realtime_sessions(review_state, updated_at);
 """
 
 

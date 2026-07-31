@@ -1326,6 +1326,35 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_skip_unstarted_tool_calls", False):
+            remaining_calls = assistant_message.tool_calls[i - 1 :]
+            for skipped_tc in remaining_calls:
+                skipped_name = skipped_tc.function.name
+                messages.append(
+                    make_tool_result_message(
+                        skipped_name,
+                        (
+                            "[Tool execution skipped — the user spoke while an "
+                            "earlier operation was running, so the model must "
+                            "reevaluate before starting this call.]"
+                        ),
+                        skipped_tc.id,
+                        effect_disposition="none",
+                    )
+                )
+            # Keep the voice steer on the final skipped-call boundary. Applying
+            # it before this batch would mutate a result that was already
+            # incrementally persisted.
+            agent._apply_pending_steer_to_tool_results(
+                messages, len(remaining_calls)
+            )
+            if remaining_calls and not _flush_session_db_after_tool_progress(
+                agent,
+                messages,
+                stage="steer-skipped tool results",
+            ):
+                return
+            break
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
@@ -1949,7 +1978,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Drain pending steer BETWEEN individual tool calls so the
         # injection lands as soon as a tool finishes — not after the
         # entire batch.  The model sees it on the next API iteration.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
+        if not getattr(agent, "_skip_unstarted_tool_calls", False):
+            agent._apply_pending_steer_to_tool_results(messages, 1)
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:

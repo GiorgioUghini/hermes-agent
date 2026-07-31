@@ -1739,6 +1739,14 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
+        host_dispatch = getattr(self, "_background_review_dispatch", None)
+        if host_dispatch is not None:
+            host_dispatch(
+                messages_snapshot=messages_snapshot,
+                review_memory=review_memory,
+                review_skills=review_skills,
+            )
+            return
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
