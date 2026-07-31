@@ -75,9 +75,10 @@ import site
 import subprocess
 import sys
 import sysconfig
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 
@@ -112,6 +113,13 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "provider.azure_identity": ("azure-identity==1.25.3",),
 
     # ─── Web search backends ───────────────────────────────────────────────
+    # DuckDuckGo scrape backend. Not in [all]; installed when the user picks
+    # it in `hermes tools` (post_setup) or on first search. It MUST go through
+    # lazy_deps rather than a raw venv pip install: on the published Docker
+    # image the agent venv is sealed and discarded on every container
+    # recreate, so a venv-scoped install evaporates on restart. Routed here it
+    # lands in the durable target on the data volume and survives.
+    "search.ddgs": ("ddgs==9.14.4",),
     "search.exa": ("exa-py==2.10.2",),
     "search.firecrawl": ("firecrawl-py==4.17.0",),
     "search.parallel": ("parallel-web==0.4.2",),
@@ -680,6 +688,72 @@ def _core_constraints_file() -> Optional[Path]:
         return None
 
 
+@dataclass
+class DurableTargetPlan:
+    """How one pip invocation should be routed on this deployment.
+
+    ``target`` — the durable install dir, or ``None`` for a normal
+                 venv-scoped install.
+    ``args``   — extra pip/uv args (``--target`` + ``--constraint``) to splice
+                 into the command. Empty in venv-scoped mode.
+    ``error``  — non-empty when a durable target is configured but unusable
+                 (read-only mount, permission error). Callers must abort and
+                 report this rather than falling back to the sealed venv.
+    """
+    target: Optional[Path] = None
+    args: list[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+@contextmanager
+def durable_target_plan() -> Iterator[DurableTargetPlan]:
+    """Yield the install routing for this deployment; clean up afterwards.
+
+    Shared by :func:`_venv_pip_install` and
+    ``hermes_cli.tools_config._pip_install`` so *every* Hermes-driven package
+    install honours the same rule: on an immutable image (sealed agent venv +
+    ``HERMES_LAZY_INSTALL_TARGET``) packages go to the writable data volume,
+    where they survive a container recreate; everywhere else they go into the
+    active venv exactly as before.
+
+    The temp constraints file (pinning shared deps to the core venv's
+    versions) is deleted when the context exits, so callers can't leak it.
+    """
+    target = _lazy_install_target()
+    if target is None:
+        yield DurableTargetPlan()
+        return
+
+    err = _ensure_target_ready(target)
+    if err:
+        yield DurableTargetPlan(target=target, error=err)
+        return
+
+    constraints = _core_constraints_file()
+    # --target tells both uv and pip to install into an arbitrary dir.
+    args = ["--target", str(target)]
+    if constraints is not None:
+        args += ["--constraint", str(constraints)]
+    try:
+        yield DurableTargetPlan(target=target, args=args)
+    finally:
+        if constraints is not None:
+            try:
+                constraints.unlink()
+            except OSError:
+                pass
+
+
+def combine_install_errors(*parts: str) -> str:
+    """Join the errors from each install tier into one readable message.
+
+    Public so ``hermes_cli.tools_config`` reports failures the same way: when
+    uv runs first and fails, its error must reach the user even if a later
+    tier produces its own (often less relevant) error.
+    """
+    return "; ".join(p.strip() for p in parts if p and p.strip())
+
+
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
     """Install ``specs`` using the uv → pip → ensurepip ladder.
 
@@ -699,35 +773,24 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     if not specs:
         return _InstallResult(True, "", "")
 
-    target = _lazy_install_target()
-    constraints: Optional[Path] = None
+    with durable_target_plan() as plan:
+        if plan.error:
+            return _InstallResult(False, "", plan.error)
+        target = plan.target
+        extra_args = plan.args
 
-    if target is not None:
-        err = _ensure_target_ready(target)
-        if err:
-            return _InstallResult(False, "", err)
-        constraints = _core_constraints_file()
-
-    target_args: list[str] = []
-    if target is not None:
-        # --target tells both uv and pip to install into an arbitrary dir.
-        target_args = ["--target", str(target)]
-    constraint_args: list[str] = []
-    if constraints is not None:
-        constraint_args = ["--constraint", str(constraints)]
-
-    try:
         venv_root = Path(sys.executable).parent.parent
         from tools.environments.local import hermes_subprocess_env
         uv_env = hermes_subprocess_env(inherit_credentials=False)
         uv_env["VIRTUAL_ENV"] = str(venv_root)
 
         # Tier 1: uv (preferred — fast, doesn't need pip in the venv)
+        uv_error = ""
         uv_bin = shutil.which("uv")
         if uv_bin:
             try:
                 r = subprocess.run(
-                    [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
+                    [uv_bin, "pip", "install", *extra_args, *specs],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
                     stdin=subprocess.DEVNULL,
                     creationflags=windows_hide_flags(),
@@ -736,8 +799,10 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                     if target is not None:
                         _activate_target_on_syspath(target)
                     return _InstallResult(True, r.stdout or "", r.stderr or "")
+                uv_error = (r.stderr or r.stdout or "").strip()
                 logger.debug("uv pip install failed: %s", r.stderr)
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                uv_error = f"uv pip install failed: {e}"
                 logger.debug("uv invocation failed: %s", e)
 
         # Tier 2: python -m pip (with ensurepip bootstrap if needed)
@@ -760,29 +825,37 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                     creationflags=windows_hide_flags(),
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                return _InstallResult(False, "",
-                                      f"pip not available and ensurepip failed: {e}")
+                # Report uv's failure too — it ran first and is the reason we
+                # fell through. Without it the user sees "pip not available"
+                # on a host where uv is installed and working, which sends
+                # them debugging the wrong thing entirely.
+                return _InstallResult(
+                    False, "", combine_install_errors(
+                        uv_error, f"pip not available and ensurepip failed: {e}"
+                    ),
+                )
 
         try:
             r = subprocess.run(
-                pip_cmd + ["install", *target_args, *constraint_args, *specs],
+                pip_cmd + ["install", *extra_args, *specs],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags(),
             )
             if r.returncode == 0 and target is not None:
                 _activate_target_on_syspath(target)
-            return _InstallResult(r.returncode == 0, r.stdout or "", r.stderr or "")
+            if r.returncode != 0:
+                return _InstallResult(
+                    False, r.stdout or "",
+                    combine_install_errors(uv_error, (r.stderr or "").strip()),
+                )
+            return _InstallResult(True, r.stdout or "", r.stderr or "")
         except subprocess.TimeoutExpired as e:
-            return _InstallResult(False, "", f"pip install timed out: {e}")
+            return _InstallResult(False, "", combine_install_errors(
+                uv_error, f"pip install timed out: {e}"))
         except Exception as e:
-            return _InstallResult(False, "", f"pip install failed: {e}")
-    finally:
-        if constraints is not None:
-            try:
-                constraints.unlink()
-            except OSError:
-                pass
+            return _InstallResult(False, "", combine_install_errors(
+                uv_error, f"pip install failed: {e}"))
 
 
 # =============================================================================

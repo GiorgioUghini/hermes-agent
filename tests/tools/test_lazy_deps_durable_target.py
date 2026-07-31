@@ -227,6 +227,105 @@ class TestRealInstallCoreWins:
         assert Path(mod.__file__).is_relative_to(target)
 
 
+class TestDurableTargetPlan:
+    """``durable_target_plan`` is the single routing decision shared by the
+    lazy installer and the ``hermes tools`` post-setup installer, so both
+    honour the sealed-venv redirect identically."""
+
+    def test_venv_scoped_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+        with ld.durable_target_plan() as plan:
+            assert plan.target is None
+            assert plan.args == []
+            assert plan.error is None
+
+    def test_target_and_constraint_args_when_configured(self, tmp_path, monkeypatch):
+        target = tmp_path / "lazy-packages"
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+        with ld.durable_target_plan() as plan:
+            assert plan.error is None
+            assert plan.target == target
+            assert plan.args[:2] == ["--target", str(target)]
+            assert "--constraint" in plan.args
+            constraints = Path(plan.args[plan.args.index("--constraint") + 1])
+            assert constraints.exists()
+        # The temp constraints file must not outlive the context.
+        assert not constraints.exists()
+
+    def test_unusable_target_reports_error_instead_of_silently_using_venv(
+        self, tmp_path, monkeypatch
+    ):
+        # A file where the target dir should be — mkdir can never succeed.
+        blocker = tmp_path / "lazy-packages"
+        blocker.write_text("not a directory", encoding="utf-8")
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(blocker / "nested"))
+        with ld.durable_target_plan() as plan:
+            assert plan.error, "an unusable durable target must be reported"
+            assert plan.args == []
+
+
+class TestInstallErrorReporting:
+    """When uv runs first and fails, its error must survive to the caller.
+
+    Reported symptom: on the Docker image ``hermes tools post-setup ddgs``
+    printed "pip not available and ensurepip failed" on a host where uv was
+    installed and working — the real (permission) error from uv had been
+    thrown away, sending the user to debug the wrong tool."""
+
+    def test_uv_error_survives_ensurepip_failure(self, monkeypatch):
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+        monkeypatch.setattr(ld.shutil, "which", lambda _: "/usr/local/bin/uv")
+
+        def fake_run(cmd, *a, **k):
+            if cmd[0] == "/usr/local/bin/uv":
+                return subprocess.CompletedProcess(
+                    cmd, 1, "", "error: failed to write to /opt/hermes/.venv"
+                )
+            if "--version" in cmd:
+                raise FileNotFoundError("no pip")
+            if "ensurepip" in cmd:
+                raise subprocess.CalledProcessError(1, cmd)
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+
+        result = ld._venv_pip_install(("ddgs==9.14.4",))
+        assert result.success is False
+        assert "failed to write to /opt/hermes/.venv" in result.stderr
+        assert "ensurepip failed" in result.stderr
+
+    def test_uv_error_survives_pip_install_failure(self, monkeypatch):
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+        monkeypatch.setattr(ld.shutil, "which", lambda _: "/usr/local/bin/uv")
+
+        def fake_run(cmd, *a, **k):
+            if cmd[0] == "/usr/local/bin/uv":
+                return subprocess.CompletedProcess(cmd, 1, "", "uv: permission denied")
+            if "--version" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "pip 24.0", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "pip: permission denied")
+
+        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+
+        result = ld._venv_pip_install(("ddgs==9.14.4",))
+        assert result.success is False
+        assert "uv: permission denied" in result.stderr
+        assert "pip: permission denied" in result.stderr
+
+
+class TestDdgsIsLazyInstallable:
+    """ddgs must be reachable through the lazy-install pipeline, otherwise it
+    can only be installed into the sealed venv — which the Docker image
+    discards on every container recreate."""
+
+    def test_ddgs_feature_registered(self):
+        assert "search.ddgs" in ld.LAZY_DEPS
+        specs = ld.LAZY_DEPS["search.ddgs"]
+        assert len(specs) == 1
+        assert ld._pkg_name_from_spec(specs[0]) == "ddgs"
+        assert ld._spec_is_safe(specs[0])
+
+
 class TestCoreNeverShadowed:
     """The headline invariant — a package in the durable store can never
     shadow a core module — proved WITHOUT a network install by synthesizing

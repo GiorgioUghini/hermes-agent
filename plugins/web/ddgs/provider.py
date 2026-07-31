@@ -49,6 +49,55 @@ class _SearchInterrupted(Exception):
     """Raised when tools.interrupt.is_interrupted() trips during a search wait."""
 
 
+# Set once we've tried the lazy install in this process, so a genuinely
+# uninstallable ddgs (offline, blocked by security.allow_lazy_installs) costs
+# one attempt per process instead of one per search.
+_install_attempted = False
+
+
+def _ensure_ddgs_installed() -> bool:
+    """Return True when ``ddgs`` is importable, installing it once if needed.
+
+    ddgs is an opt-in backend, so the package can be absent even though the
+    user selected the provider — most often on the Docker image, where the
+    durable package store is wiped whenever a rebuild bumps the interpreter
+    ABI. Rather than telling the user to go run pip, self-heal through
+    :mod:`tools.lazy_deps`, which installs the pinned version to the durable
+    target on immutable deployments and into the venv everywhere else.
+
+    Only runs when the import actually fails: when ddgs is present at some
+    other version we leave it alone instead of churning a reinstall on every
+    search.
+    """
+    global _install_attempted
+
+    try:
+        import ddgs  # type: ignore  # noqa: F401 — availability probe
+
+        return True
+    except ImportError:
+        pass
+
+    if _install_attempted:
+        return False
+    _install_attempted = True
+
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+
+        _lazy_ensure("search.ddgs", prompt=False)
+    except Exception as exc:  # noqa: BLE001 — FeatureUnavailable + import errors
+        logger.warning("ddgs lazy install failed: %s", exc)
+        return False
+
+    try:
+        import ddgs  # type: ignore  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     """Run the blocking ddgs query and return normalized hits.
 
@@ -307,12 +356,13 @@ class DDGSWebSearchProvider(WebSearchProvider):
         a hard wall-clock timeout (``_SEARCH_TIMEOUT_SECS``) so a hung native
         ``primp`` call cannot freeze the Hermes process (#36776, #68096).
         """
-        try:
-            import ddgs  # type: ignore  # noqa: F401 — availability probe
-        except ImportError:
+        if not _ensure_ddgs_installed():
             return {
                 "success": False,
-                "error": "ddgs package is not installed — run `pip install ddgs`",
+                "error": (
+                    "ddgs package is not installed — run "
+                    "`hermes tools post-setup ddgs`"
+                ),
             }
 
         # DDGS().text yields at most `max_results` items; we cap defensively

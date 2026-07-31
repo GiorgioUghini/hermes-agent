@@ -102,6 +102,7 @@ CONFIGURABLE_TOOLSETS = [
     ("video",           "🎬 Video Analysis",            "video_analyze (requires video-capable model)"),
     ("image_gen",       "🎨 Image Generation",          "image_generate"),
     ("video_gen",       "🎬 Video Generation",          "video_generate (text/image/reference)"),
+    ("bfl",             "🎬 BFL FLUX 3 Video",          "bfl_flux3_*"),
     ("x_search",        "🐦 X (Twitter) Search",        "x_search (requires xAI OAuth or XAI_API_KEY)"),
     ("tts",             "🔊 Text-to-Speech",            "text_to_speech"),
     ("stt",             "🎙️ Speech-to-Text",           "voice transcription (gateway voice messages + voice mode)"),
@@ -783,17 +784,72 @@ def _pip_install(
     ``[sys.executable, '-m', 'pip', 'install', ...]`` failed with
     ``No module named pip`` on every fresh install. uv-first sidesteps that.
 
+    Install *location* follows the same rule as the lazy-dep installer (see
+    ``tools.lazy_deps.durable_target_plan``): normally the active venv, but on
+    an immutable deployment (the Docker image seals ``/opt/hermes`` and sets
+    ``HERMES_LAZY_INSTALL_TARGET``) the packages go to the writable data
+    volume instead. Without that redirect a post-setup install either fails
+    outright (venv not writable by the runtime user) or lands in the
+    container's ephemeral layer and vanishes on the next recreate — which is
+    why users had to re-run ``hermes tools post-setup ddgs`` after every
+    ``docker compose up``.
+
     Returns the ``subprocess.CompletedProcess`` from whichever tier succeeded
     (or the last failure for the caller to inspect).
     """
+    try:
+        from tools.lazy_deps import durable_target_plan
+    except Exception:  # pragma: no cover - defensive; lazy_deps is in-tree
+        from contextlib import nullcontext
+        plan_ctx = nullcontext(None)
+    else:
+        plan_ctx = durable_target_plan()
+
+    with plan_ctx as plan:
+        target = getattr(plan, "target", None)
+        extra_args = list(getattr(plan, "args", []) or [])
+        plan_error = getattr(plan, "error", None)
+        if plan_error:
+            return subprocess.CompletedProcess(
+                ["uv", "pip", "install", *args], returncode=1, stdout="",
+                stderr=plan_error,
+            )
+        return _pip_install_with_args(
+            args, extra_args, target,
+            timeout=timeout, capture_output=capture_output,
+        )
+
+
+def _activate_install_target(target) -> None:
+    """Put a durable install target on ``sys.path`` after a successful install."""
+    if target is None:
+        return
+    try:
+        from tools.lazy_deps import activate_durable_lazy_target
+
+        activate_durable_lazy_target()
+    except Exception:  # pragma: no cover - activation is best-effort
+        pass
+
+
+def _pip_install_with_args(
+    args: List[str],
+    extra_args: List[str],
+    target,
+    *,
+    timeout: int,
+    capture_output: bool,
+):
+    """Run the uv → pip → ensurepip ladder with pre-resolved routing args."""
     venv_root = Path(sys.executable).parent.parent
     uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
 
+    uv_error = ""
     uv_bin = shutil.which("uv")
     if uv_bin:
         try:
             result = subprocess.run(
-                [uv_bin, "pip", "install", *args],
+                [uv_bin, "pip", "install", *extra_args, *args],
                 capture_output=capture_output, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                 env=uv_env,
                 creationflags=_post_setup_no_window_flags(
@@ -801,11 +857,16 @@ def _pip_install(
                 ),
             )
             if result.returncode == 0:
+                _activate_install_target(target)
                 return result
             # Fall through to pip — uv may have failed for an unrelated reason
-            # (resolution conflict, network), and pip might handle it.
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+            # (resolution conflict, network), and pip might handle it. Keep
+            # uv's error: if the pip tier also fails, reporting only "pip not
+            # available" hides the real cause on hosts where uv is the
+            # installer that actually matters.
+            uv_error = (result.stderr or result.stdout or "").strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            uv_error = f"uv pip install failed: {e}"
 
     pip_cmd = [sys.executable, "-m", "pip"]
     try:
@@ -826,18 +887,29 @@ def _pip_install(
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             # Synthesize a result so callers see a clean failure path.
+            from tools.lazy_deps import combine_install_errors
+
             return subprocess.CompletedProcess(
                 pip_cmd, returncode=1, stdout="",
-                stderr=f"pip not available and ensurepip failed: {e}",
+                stderr=combine_install_errors(
+                    uv_error, f"pip not available and ensurepip failed: {e}"
+                ),
             )
 
-    return subprocess.run(
-        pip_cmd + ["install", *args],
+    result = subprocess.run(
+        pip_cmd + ["install", *extra_args, *args],
         capture_output=capture_output, text=True, encoding="utf-8", errors="replace", timeout=timeout,
         creationflags=_post_setup_no_window_flags(
             streams_to_console=not capture_output
         ),
     )
+    if result.returncode == 0:
+        _activate_install_target(target)
+    elif uv_error and capture_output:
+        from tools.lazy_deps import combine_install_errors
+
+        result.stderr = combine_install_errors(uv_error, (result.stderr or "").strip())
+    return result
 
 
 
@@ -1830,24 +1902,44 @@ def _run_post_setup(post_setup_key: str):
         _print_info("    Switch voices by setting tts.piper.voice in ~/.hermes/config.yaml")
 
     elif post_setup_key == "ddgs":
+        # Routed through lazy_deps (not a raw pip call) for two reasons:
+        #   1. The version pin lives in ONE place (LAZY_DEPS["search.ddgs"]),
+        #      so the runtime self-heal in plugins/web/ddgs never fights this
+        #      hook by re-installing a different version.
+        #   2. On the published Docker image the agent venv is sealed and
+        #      thrown away on every `docker compose up`; lazy_deps redirects
+        #      the install to the durable data volume so it survives restarts.
         try:
-            __import__("ddgs")
+            from tools.lazy_deps import (
+                FeatureUnavailable,
+                _lazy_install_target,
+                ensure as _lazy_ensure,
+                is_available as _lazy_is_available,
+            )
+        except Exception as exc:  # pragma: no cover - lazy_deps is in-tree
+            _print_warning(f"    Could not load the installer: {exc}")
+            _print_info("    Run manually: uv pip install -U ddgs")
+            return
+
+        if _lazy_is_available("search.ddgs"):
             _print_success("    ddgs is already installed")
-        except ImportError:
+        else:
             _print_info("    Installing ddgs (DuckDuckGo search package)...")
             try:
-                result = _pip_install(["-U", "ddgs", "--quiet"], timeout=300)
-                if result.returncode == 0:
-                    _print_success("    ddgs installed")
-                else:
-                    _print_warning("    ddgs install failed:")
-                    _print_info(f"      {(result.stderr or '').strip()[:300]}")
-                    _print_info("    Run manually: uv pip install -U ddgs")
-                    return
-            except subprocess.TimeoutExpired:
-                _print_warning("    ddgs install timed out (>5min)")
+                _lazy_ensure("search.ddgs", prompt=False)
+            except FeatureUnavailable as exc:
+                _print_warning("    ddgs install failed:")
+                _print_info(f"      {str(exc).strip()[:300]}")
                 _print_info("    Run manually: uv pip install -U ddgs")
                 return
+            except Exception as exc:  # noqa: BLE001 - never crash the wizard
+                _print_warning(f"    ddgs install failed: {str(exc)[:300]}")
+                _print_info("    Run manually: uv pip install -U ddgs")
+                return
+            _print_success("    ddgs installed")
+            target = _lazy_install_target()
+            if target is not None:
+                _print_info(f"    Installed to {target} (persists across restarts)")
         _print_info("    No API key required. DuckDuckGo enforces server-side rate limits.")
         _print_info("    Pair with an extract provider if you also need web_extract.")
 
@@ -2131,6 +2223,66 @@ def _exempt_explicit_platform_native(
             default_off.discard(ts)
 
 
+#: Toolsets young enough that absence from a saved ``platform_toolsets`` list
+#: means "never offered" rather than "declined".
+#:
+#: Saving ``hermes tools`` (or one toggle in the desktop Toolsets UI) replaces
+#: a platform's composite with a frozen explicit list, and nothing ever adds to
+#: that list — so a toolset shipped afterwards stays off forever for anyone who
+#: has touched the picker, while everyone still on ``[hermes-cli]`` inherits it
+#: on upgrade. Listing it here restores that parity.
+#:
+#: MUST ship in the same release as the toolset it names, and be emptied in the
+#: next one. The inference only holds while no released build has put the
+#: toolset on a checklist: once one has, a user who unchecks it writes a config
+#: byte-identical to one saved before the toolset existed (the record below is
+#: only written from that point on), and this rule turns their opt-out back on.
+#: Landing late — or leaving an entry here for a second release — converts a
+#: back-fill into a stuck checkbox.
+#:
+#: Not gated on a Nous sign-in here: the six ``bfl_flux3_*`` tools carry
+#: ``check_fn=check_bfl_requirements``, so an enabled toolset still ships zero
+#: schemas to a user with no Nous credential — the same split Home Assistant
+#: uses. Probing the portal from this path would put a network call on every
+#: CLI start, gateway session and cron tick.
+_RECENTLY_SHIPPED_TOOLSETS = frozenset({"bfl"})
+
+
+def _enable_recently_shipped_toolsets(
+    enabled_toolsets: Set[str], config: dict, platform: str
+) -> None:
+    """Turn on toolsets that shipped after this platform's saved list.
+
+    Either way of saying no outlives this: unchecking in ``hermes tools``
+    records the toolset in ``known_builtin_toolsets`` so it reads as declined
+    from then on, and ``agent.disabled_toolsets`` is subtracted after every
+    rule in :func:`_get_platform_tools`. Mutates ``enabled_toolsets`` in place.
+    """
+    from toolsets import resolve_toolset
+
+    offered = (config.get("known_builtin_toolsets") or {}).get(platform)
+    declined = {str(ts) for ts in offered} if isinstance(offered, list) else set()
+
+    plat_info = PLATFORMS.get(platform)
+    default_ts = plat_info["default_toolset"] if plat_info else f"hermes-{platform}"
+    composite_tools = None
+
+    for ts_key in sorted(_RECENTLY_SHIPPED_TOOLSETS):
+        if ts_key in enabled_toolsets or ts_key in declined:
+            continue
+        if not _toolset_allowed_for_platform(ts_key, platform):
+            continue
+        # Parity is the whole justification, so only enable the toolset where
+        # staying on the composite would have enabled it anyway. Deliberately
+        # narrow composites (hermes-acp, hermes-webhook) stay narrow.
+        ts_tools = set(resolve_toolset(ts_key, include_registry=False))
+        if composite_tools is None:
+            composite_tools = set(resolve_toolset(default_ts))
+        if not ts_tools or not ts_tools.issubset(composite_tools):
+            continue
+        enabled_toolsets.add(ts_key)
+
+
 def _get_platform_tools(
     config: dict,
     platform: str,
@@ -2216,6 +2368,8 @@ def _get_platform_tools(
             expanded -= default_off
 
             enabled_toolsets |= expanded
+
+        _enable_recently_shipped_toolsets(enabled_toolsets, config, platform)
     else:
         # No explicit config — fall back to resolving composite toolset names
         # (e.g. "hermes-cli") to individual tool names and reverse-mapping.
@@ -2482,6 +2636,17 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
         if not isinstance(config.get("known_plugin_toolsets"), dict):
             config["known_plugin_toolsets"] = {}
         config["known_plugin_toolsets"][platform] = sorted(plugin_keys)
+
+    # Same record for builtin toolsets: which ones this platform's checklist
+    # has actually put in front of the user. Without it, a toolset the user
+    # unchecks here is indistinguishable from one that shipped after they
+    # saved, and _enable_recently_shipped_toolsets would turn it straight back
+    # on. Recorded from the full catalog, since that is what the picker showed.
+    if not isinstance(config.get("known_builtin_toolsets"), dict):
+        config["known_builtin_toolsets"] = {}
+    config["known_builtin_toolsets"][platform] = sorted(
+        ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS
+    )
 
     # Reconcile with agent.disabled_toolsets. _get_platform_tools() applies
     # that list as a final override AFTER reading platform_toolsets.<platform>,

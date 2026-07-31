@@ -98,6 +98,19 @@ def main() -> int:
     query = str(request.get("query") or "")
     safe_limit = max(1, int(request.get("safe_limit") or 1))
     try:
+        # On immutable deployments (Docker) the ddgs package lives in the
+        # durable lazy-install store on the data volume, not in the sealed
+        # agent venv. The parent gets that dir onto sys.path via
+        # hermes_bootstrap, but this worker is spawned as a bare script and
+        # imports no entry point — without this call `from ddgs import DDGS`
+        # below fails in the child even though the parent imported it fine.
+        try:
+            from tools.lazy_deps import activate_durable_lazy_target
+
+            activate_durable_lazy_target()
+        except Exception:  # noqa: BLE001 — no-op when unset / not importable
+            pass
+
         # Import inside main so script startup stays light / patchable.
         from plugins.web.ddgs.provider import _run_ddgs_search
 

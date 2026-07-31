@@ -10,6 +10,7 @@ Covers:
 """
 from __future__ import annotations
 
+import builtins
 import json
 import sys
 import time
@@ -226,6 +227,149 @@ class TestDDGSProcessIsolation:
         result = prov.DDGSWebSearchProvider().search("q", limit=5)
         assert result["success"] is True
         _assert_worker_reaped(prov)
+
+
+# ---------------------------------------------------------------------------
+# Missing-package self-heal (Docker: the durable package store can be wiped
+# by an ABI-bumping image rebuild, so a configured ddgs can vanish)
+# ---------------------------------------------------------------------------
+
+
+def _uninstall_ddgs(monkeypatch):
+    """Make ``import ddgs`` fail until the returned state is unblocked."""
+    state = {"blocked": True}
+    monkeypatch.delitem(sys.modules, "ddgs", raising=False)
+    real_import = builtins.__import__
+
+    def _blocked(name, *args, **kwargs):
+        if state["blocked"] and (name == "ddgs" or name.startswith("ddgs.")):
+            raise ImportError("No module named 'ddgs'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked)
+    return state
+
+
+class TestDDGSMissingPackageSelfHeal:
+    def test_search_installs_the_pinned_package_when_missing(self, monkeypatch):
+        """A missing ddgs must be lazy-installed, not handed back to the user
+        as "go run pip" — that's the docker-restart papercut."""
+        import plugins.web.ddgs.provider as prov
+
+        monkeypatch.setattr(prov, "_install_attempted", False, raising=True)
+        state = _uninstall_ddgs(monkeypatch)
+
+        installed: list[str] = []
+
+        def fake_ensure(feature, *, prompt=True):
+            installed.append(feature)
+            # Simulate the install making the package importable again.
+            state["blocked"] = False
+            _install_fake_ddgs(monkeypatch)
+
+        monkeypatch.setattr("tools.lazy_deps.ensure", fake_ensure)
+
+        assert prov._ensure_ddgs_installed() is True
+        assert installed == ["search.ddgs"], (
+            "search must self-heal through the lazy-dep allowlist entry"
+        )
+
+    def test_search_reports_failure_without_raising(self, monkeypatch):
+        import plugins.web.ddgs.provider as prov
+        from tools.lazy_deps import FeatureUnavailable
+
+        monkeypatch.setattr(prov, "_install_attempted", False, raising=True)
+        state = _uninstall_ddgs(monkeypatch)
+
+        def fake_ensure(feature, *, prompt=True):
+            raise FeatureUnavailable(feature, ("ddgs",), "offline")
+
+        monkeypatch.setattr("tools.lazy_deps.ensure", fake_ensure)
+
+        result = prov.DDGSWebSearchProvider().search("q", limit=3)
+        assert state["blocked"] is True
+        assert result["success"] is False
+        assert "not installed" in result["error"]
+
+    def test_install_attempted_once_per_process(self, monkeypatch):
+        """A permanently-unavailable ddgs must not re-run pip on every query."""
+        import plugins.web.ddgs.provider as prov
+        from tools.lazy_deps import FeatureUnavailable
+
+        monkeypatch.setattr(prov, "_install_attempted", False, raising=True)
+        _uninstall_ddgs(monkeypatch)
+
+        calls = []
+
+        def fake_ensure(feature, *, prompt=True):
+            calls.append(feature)
+            raise FeatureUnavailable(feature, ("ddgs",), "offline")
+
+        monkeypatch.setattr("tools.lazy_deps.ensure", fake_ensure)
+
+        assert prov._ensure_ddgs_installed() is False
+        assert prov._ensure_ddgs_installed() is False
+        assert len(calls) == 1
+
+    def test_present_package_is_never_reinstalled(self, monkeypatch):
+        """ddgs at any version counts as installed — no version churn."""
+        import plugins.web.ddgs.provider as prov
+
+        _install_fake_ddgs(monkeypatch)
+        monkeypatch.setattr(prov, "_install_attempted", False, raising=True)
+
+        def boom(feature, *, prompt=True):
+            raise AssertionError(f"unexpected install of {feature}")
+
+        monkeypatch.setattr("tools.lazy_deps.ensure", boom)
+        assert prov._ensure_ddgs_installed() is True
+
+
+class TestDDGSWorkerSeesDurableTarget:
+    """The search worker is a bare child process, so it must activate the
+    durable lazy-install store itself. Without that, a ddgs installed on the
+    Docker data volume imports fine in the parent and fails in the child —
+    every search returns "No module named 'ddgs'".
+    """
+
+    def test_worker_imports_ddgs_from_durable_target(self, tmp_path, monkeypatch):
+        target = tmp_path / "lazy-packages"
+        target.mkdir()
+        (target / "ddgs.py").write_text(
+            "class DDGS:\n"
+            "    def __init__(self, **kwargs):\n"
+            "        pass\n"
+            "    def __enter__(self):\n"
+            "        return self\n"
+            "    def __exit__(self, *a):\n"
+            "        return False\n"
+            "    def text(self, query, max_results=5):\n"
+            "        yield {'title': 'durable', 'href': 'https://d.example.com',\n"
+            "               'body': 'from the data volume'}\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_LAZY_INSTALL_TARGET", str(target))
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+        import plugins.web.ddgs.provider as prov
+
+        # The parent resolves ddgs the same way (hermes_bootstrap does this at
+        # startup); the point of the test is the CHILD, which is spawned fresh.
+        saved_path = list(sys.path)
+        try:
+            from tools.lazy_deps import activate_durable_lazy_target
+
+            activate_durable_lazy_target()
+            result = prov.DDGSWebSearchProvider().search("q", limit=3)
+        finally:
+            sys.path[:] = saved_path
+            sys.modules.pop("ddgs", None)
+
+        assert result["success"] is True, result.get("error")
+        assert result["data"]["web"][0]["url"] == "https://d.example.com"
+        _assert_worker_reaped(prov)
+
 
 # ---------------------------------------------------------------------------
 # Integration: _is_backend_available / _get_backend / check_web_api_key
