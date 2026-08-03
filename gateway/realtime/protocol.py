@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -15,6 +16,11 @@ from urllib.parse import parse_qs, urlparse
 CONTROL_PROTOCOL_VERSION = 1
 MAX_CONTROL_COMMAND_BYTES = 64 * 1024
 MAX_TOOL_COUNT = 128
+PREROLL_SAMPLE_RATE_HZ = 24_000
+PREROLL_CHANNELS = 1
+PREROLL_SAMPLE_WIDTH_BYTES = 2
+PREROLL_MIN_MILLISECONDS = 100
+PREROLL_APPEND_CHUNK_MILLISECONDS = 1_000
 
 SESSION_STATES = frozenset(
     {
@@ -166,6 +172,9 @@ class RealtimeVoiceConfig:
     request_timeout_seconds: float = 20.0
     connect_timeout_seconds: float = 10.0
     transcription_timeout_seconds: float = 5.0
+    preroll_enabled: bool = True
+    preroll_max_seconds: int = 30
+    preroll_timeout_seconds: float = 15.0
     call_url: str = _DEFAULT_CALL_URL
     sideband_url: str = _DEFAULT_SIDEBAND_URL
     approval_timeout_seconds: int = 10 * 60
@@ -179,6 +188,7 @@ class RealtimeVoiceConfig:
         raw = _as_mapping(root.get("realtime_voice", root))
         vad = _as_mapping(raw.get("turn_detection"))
         interim = _as_mapping(raw.get("intermediate_speech"))
+        preroll = _as_mapping(raw.get("preroll"))
         limits = _as_mapping(raw.get("limits"))
         transport = _as_mapping(raw.get("transport"))
 
@@ -307,6 +317,19 @@ class RealtimeVoiceConfig:
                 0.5,
                 30.0,
             ),
+            preroll_enabled=bool(preroll.get("enabled", cls.preroll_enabled)),
+            preroll_max_seconds=_bounded_int(
+                preroll.get("max_seconds"),
+                cls.preroll_max_seconds,
+                1,
+                120,
+            ),
+            preroll_timeout_seconds=_bounded_float(
+                preroll.get("timeout_seconds"),
+                cls.preroll_timeout_seconds,
+                1.0,
+                60.0,
+            ),
             call_url=_validated_transport_url(
                 transport.get("call_url"),
                 field="call_url",
@@ -345,14 +368,16 @@ class RealtimeVoiceConfig:
             ),
         )
 
-    def openai_session(
-        self,
-        *,
-        instructions: str,
-        tools: Iterable[Mapping[str, Any]],
-    ) -> dict[str, Any]:
-        """Build the immutable OpenAI Realtime session configuration."""
+    @property
+    def preroll_max_bytes(self) -> int:
+        return (
+            self.preroll_max_seconds
+            * PREROLL_SAMPLE_RATE_HZ
+            * PREROLL_CHANNELS
+            * PREROLL_SAMPLE_WIDTH_BYTES
+        )
 
+    def turn_detection_config(self) -> dict[str, Any]:
         turn_detection: dict[str, Any] = {
             "type": self.vad_type,
             "create_response": False,
@@ -366,6 +391,15 @@ class RealtimeVoiceConfig:
                     "silence_duration_ms": self.vad_silence_duration_ms,
                 }
             )
+        return turn_detection
+
+    def openai_session(
+        self,
+        *,
+        instructions: str,
+        tools: Iterable[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Build the immutable OpenAI Realtime session configuration."""
 
         return {
             "type": "realtime",
@@ -374,8 +408,12 @@ class RealtimeVoiceConfig:
             "output_modalities": ["audio"],
             "audio": {
                 "input": {
+                    "format": {
+                        "type": "audio/pcm",
+                        "rate": PREROLL_SAMPLE_RATE_HZ,
+                    },
                     "transcription": {"model": self.transcription_model},
-                    "turn_detection": turn_detection,
+                    "turn_detection": self.turn_detection_config(),
                 },
                 "output": {"voice": self.voice},
             },
@@ -401,6 +439,16 @@ class RealtimeFunctionCall:
     arguments: str
     item_id: str = ""
     response_id: str = ""
+
+
+def validate_preroll_idempotency_key(value: Any) -> str:
+    key = str(value or "").strip()
+    if not _ID_RE.fullmatch(key):
+        raise RealtimeProtocolError(
+            "A valid Idempotency-Key header is required",
+            code="invalid_preroll_idempotency_key",
+        )
+    return key
 
 
 def flatten_realtime_tools(
@@ -584,6 +632,68 @@ def conversation_function_call_event(
             "arguments": arguments,
         },
     }
+    if event_id:
+        event["event_id"] = event_id
+    return event
+
+
+def session_turn_detection_update_event(
+    turn_detection: Optional[Mapping[str, Any]],
+    *,
+    event_id: Optional[str] = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "type": "session.update",
+        "session": {
+            "type": "realtime",
+            "audio": {
+                "input": {
+                    "turn_detection": (
+                        dict(turn_detection) if turn_detection is not None else None
+                    )
+                }
+            },
+        },
+    }
+    if event_id:
+        event["event_id"] = event_id
+    return event
+
+
+def input_audio_buffer_clear_event(
+    *,
+    event_id: Optional[str] = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": "input_audio_buffer.clear"}
+    if event_id:
+        event["event_id"] = event_id
+    return event
+
+
+def input_audio_buffer_append_event(
+    audio: bytes,
+    *,
+    event_id: Optional[str] = None,
+) -> dict[str, Any]:
+    if not isinstance(audio, bytes) or not audio:
+        raise RealtimeProtocolError(
+            "Pre-roll audio chunk is empty",
+            code="empty_preroll_audio",
+        )
+    event: dict[str, Any] = {
+        "type": "input_audio_buffer.append",
+        "audio": base64.b64encode(audio).decode("ascii"),
+    }
+    if event_id:
+        event["event_id"] = event_id
+    return event
+
+
+def input_audio_buffer_commit_event(
+    *,
+    event_id: Optional[str] = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": "input_audio_buffer.commit"}
     if event_id:
         event["event_id"] = event_id
     return event

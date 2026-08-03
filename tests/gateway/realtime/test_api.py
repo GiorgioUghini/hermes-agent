@@ -1,3 +1,4 @@
+import base64
 import asyncio
 import json
 from types import SimpleNamespace
@@ -38,6 +39,8 @@ class _FakeManager:
         self.session = _FakeSession()
         self.session.config = self.config
         self.created_offer = ""
+        self.preroll_audio = b""
+        self.preroll_idempotency_key = ""
 
     async def create_session(self, offer_sdp, requested_session_id=None):
         self.created_offer = offer_sdp
@@ -55,6 +58,21 @@ class _FakeManager:
 
     async def require_active(self, session_id):
         return self.require(session_id)
+
+    async def ingest_preroll_audio(self, session_id, audio, *, idempotency_key):
+        self.require(session_id)
+        self.preroll_audio = audio
+        self.preroll_idempotency_key = idempotency_key
+        return {
+            "version": 1,
+            "session_id": session_id,
+            "call_id": "call_1",
+            "idempotency_key": idempotency_key,
+            "status": "committed",
+            "item_id": "item_preroll",
+            "audio_bytes": len(audio),
+            "duration_ms": round(len(audio) * 1000 / 48_000),
+        }
 
     async def close_session(self, session_id, reason="client_closed"):
         if session_id != self.session.session_id:
@@ -82,12 +100,20 @@ def _adapter_and_app():
         "/v1/realtime/sessions/{session_id}/control",
         adapter._handle_realtime_control,
     )
+    app.router.add_post(
+        "/v1/realtime/sessions/{session_id}/audio/preroll",
+        adapter._handle_realtime_preroll,
+    )
     app.router.add_delete(
         "/v1/realtime/sessions/{session_id}",
         adapter._handle_realtime_session_delete,
     )
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     return adapter, manager, app
+
+
+def _authorization(adapter):
+    return {"Authorization": f"Bearer {adapter._expected_api_key()}"}
 
 
 @pytest.mark.asyncio
@@ -114,8 +140,89 @@ async def test_create_returns_sdp_metadata_without_standard_openai_key():
     assert payload["call_id"] == "call_1"
     assert payload["model"] == "gpt-realtime"
     assert payload["voice"] == "marin"
+    assert payload["preroll_url"] == (
+        "/v1/realtime/sessions/voice_1/audio/preroll"
+    )
     assert manager.created_offer.startswith("v=0")
     assert "sk-openai-server-only" not in str(payload)
+
+
+@pytest.mark.asyncio
+async def test_preroll_accepts_bounded_pcm_with_idempotency_key():
+    adapter, manager, app = _adapter_and_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    audio = b"\x01\x00" * 2400
+    try:
+        response = await client.post(
+            "/v1/realtime/sessions/voice_1/audio/preroll",
+            data=audio,
+            headers={
+                **_authorization(adapter),
+                "Content-Type": "audio/pcm;rate=24000;channels=1;format=s16le",
+                "Idempotency-Key": "wake:1",
+            },
+        )
+        payload = await response.json()
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert response.status == 200
+    assert payload["status"] == "committed"
+    assert manager.preroll_audio == audio
+    assert manager.preroll_idempotency_key == "wake:1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "expected_status", "expected_code"),
+    [
+        (
+            {"Content-Type": "application/octet-stream", "Idempotency-Key": "wake:1"},
+            415,
+            "invalid_preroll_content_type",
+        ),
+        (
+            {
+                "Content-Type": "audio/pcm;rate=16000",
+                "Idempotency-Key": "wake:1",
+            },
+            415,
+            "invalid_preroll_sample_rate",
+        ),
+        (
+            {"Content-Type": "audio/pcm", "Idempotency-Key": "wake:1"},
+            415,
+            "invalid_preroll_sample_rate",
+        ),
+        (
+            {"Content-Type": "audio/pcm"},
+            400,
+            "invalid_preroll_idempotency_key",
+        ),
+    ],
+)
+async def test_preroll_rejects_ambiguous_audio_contract(
+    headers, expected_status, expected_code
+):
+    adapter, _manager, app = _adapter_and_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    headers = {**_authorization(adapter), **headers}
+    try:
+        response = await client.post(
+            "/v1/realtime/sessions/voice_1/audio/preroll",
+            data=b"\x00\x00" * 2400,
+            headers=headers,
+        )
+        payload = await response.json()
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert response.status == expected_status
+    assert payload["error"]["code"] == expected_code
 
 
 @pytest.mark.asyncio
@@ -193,6 +300,18 @@ async def test_capabilities_report_transport_and_authorization_semantics():
     assert details["structured_approvals"] is True
     assert details["voice_authorization"] is False
     assert details["barge_in"]["cancels_started_tools"] is False
+    assert details["wake_word_preroll"] == {
+        "available": True,
+        "complete_utterance_required": True,
+        "content_type": "audio/pcm",
+        "format": "s16le",
+        "sample_rate_hz": 24000,
+        "channels": 1,
+        "sample_width_bytes": 2,
+        "max_seconds": 30,
+        "requires_idempotency_key": True,
+        "webrtc_handoff": "unmute_after_committed",
+    }
 
 
 async def _receive_matching(queue, event_type):
@@ -233,10 +352,36 @@ async def test_api_real_manager_round_trip_with_fake_openai_peers(tmp_path):
         await socket.prepare(request)
         provider["call_id"] = request.query.get("call_id")
         provider["socket"] = socket
+        provider["events"] = []
         provider_connected.set()
         async for message in socket:
             if message.type == web.WSMsgType.TEXT:
-                await provider_events.put(json.loads(message.data))
+                event = json.loads(message.data)
+                provider["events"].append(event)
+                await provider_events.put(event)
+                if event["type"] == "session.update":
+                    await socket.send_json(
+                        {"type": "session.updated", "session": event["session"]}
+                    )
+                elif event["type"] == "input_audio_buffer.clear":
+                    await socket.send_json({"type": "input_audio_buffer.cleared"})
+                elif event["type"] == "input_audio_buffer.commit":
+                    await socket.send_json(
+                        {
+                            "type": "input_audio_buffer.committed",
+                            "item_id": "input_integration",
+                        }
+                    )
+                    await socket.send_json(
+                        {
+                            "type": (
+                                "conversation.item."
+                                "input_audio_transcription.completed"
+                            ),
+                            "item_id": "input_integration",
+                            "transcript": "Say hello.",
+                        }
+                    )
         return socket
 
     provider_app = web.Application()
@@ -307,6 +452,10 @@ async def test_api_real_manager_round_trip_with_fake_openai_peers(tmp_path):
         "/v1/realtime/sessions/{session_id}/control",
         adapter._handle_realtime_control,
     )
+    api_app.router.add_post(
+        "/v1/realtime/sessions/{session_id}/audio/preroll",
+        adapter._handle_realtime_preroll,
+    )
     api_app.router.add_delete(
         "/v1/realtime/sessions/{session_id}",
         adapter._handle_realtime_session_delete,
@@ -345,12 +494,44 @@ async def test_api_real_manager_round_trip_with_fake_openai_peers(tmp_path):
             "/v1/realtime/sessions/voice-integration/control",
             headers=authorization,
         )
-        await provider["socket"].send_json(
-            {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "item_id": "input_integration",
-                "transcript": "Say hello.",
-            }
+        preroll_audio = b"\x01\x00" * 7200
+        preroll = await client.post(
+            "/v1/realtime/sessions/voice-integration/audio/preroll",
+            data=preroll_audio,
+            headers={
+                **authorization,
+                "Content-Type": "audio/pcm;rate=24000;channels=1;format=s16le",
+                "Idempotency-Key": "wake:integration",
+            },
+        )
+        preroll_payload = await preroll.json()
+        assert preroll.status == 200
+        assert preroll_payload["status"] == "committed"
+        assert preroll_payload["item_id"] == "input_integration"
+
+        pre_response_events = provider["events"]
+        assert pre_response_events[0]["session"]["audio"]["input"][
+            "turn_detection"
+        ] is None
+        assert any(
+            event["type"] == "input_audio_buffer.clear"
+            for event in pre_response_events
+        )
+        appended = b"".join(
+            base64.b64decode(event["audio"])
+            for event in pre_response_events
+            if event["type"] == "input_audio_buffer.append"
+        )
+        assert appended == preroll_audio
+        assert any(
+            event["type"] == "input_audio_buffer.commit"
+            for event in pre_response_events
+        )
+        assert any(
+            event["type"] == "session.update"
+            and event["session"]["audio"]["input"]["turn_detection"]
+            == config.turn_detection_config()
+            for event in pre_response_events
         )
         response_create = await _receive_matching(
             provider_events, "response.create"

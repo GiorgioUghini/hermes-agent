@@ -1,3 +1,4 @@
+import base64
 import json
 
 import pytest
@@ -6,13 +7,19 @@ from gateway.realtime.controls import ControlEventBroker
 from gateway.realtime.protocol import (
     RealtimeProtocolError,
     RealtimeVoiceConfig,
+    PREROLL_SAMPLE_RATE_HZ,
     conversation_function_call_event,
     derive_safety_identifier,
     extract_call_id,
     flatten_realtime_tools,
     function_call_output_event,
     function_calls_from_event,
+    input_audio_buffer_append_event,
+    input_audio_buffer_clear_event,
+    input_audio_buffer_commit_event,
     response_transcript,
+    session_turn_detection_update_event,
+    validate_preroll_idempotency_key,
     validate_control_command,
 )
 
@@ -25,6 +32,7 @@ def test_config_builds_hermes_owned_vad_session():
                 "model": "gpt-realtime",
                 "voice": "marin",
                 "turn_detection": {"silence_duration_ms": 750},
+                "preroll": {"max_seconds": 12, "timeout_seconds": 9},
             }
         }
     )
@@ -51,8 +59,36 @@ def test_config_builds_hermes_owned_vad_session():
     assert payload["audio"]["input"]["turn_detection"]["create_response"] is False
     assert payload["audio"]["input"]["turn_detection"]["interrupt_response"] is True
     assert payload["audio"]["input"]["turn_detection"]["silence_duration_ms"] == 750
+    assert payload["audio"]["input"]["format"] == {
+        "type": "audio/pcm",
+        "rate": PREROLL_SAMPLE_RATE_HZ,
+    }
+    assert config.preroll_max_seconds == 12
+    assert config.preroll_timeout_seconds == 9
+    assert config.preroll_max_bytes == 12 * PREROLL_SAMPLE_RATE_HZ * 2
     assert payload["tools"][0]["name"] == "skill_view"
     assert "function" not in payload["tools"][0]
+
+
+def test_preroll_events_are_typed_and_server_owned():
+    audio = b"\x01\x02" * 2400
+    append = input_audio_buffer_append_event(audio, event_id="append_1")
+    assert append["type"] == "input_audio_buffer.append"
+    assert base64.b64decode(append["audio"]) == audio
+    assert input_audio_buffer_clear_event(event_id="clear_1") == {
+        "type": "input_audio_buffer.clear",
+        "event_id": "clear_1",
+    }
+    assert input_audio_buffer_commit_event(event_id="commit_1") == {
+        "type": "input_audio_buffer.commit",
+        "event_id": "commit_1",
+    }
+    assert session_turn_detection_update_event(None)["session"]["audio"]["input"][
+        "turn_detection"
+    ] is None
+    assert validate_preroll_idempotency_key("wake:123") == "wake:123"
+    with pytest.raises(RealtimeProtocolError, match="Idempotency-Key"):
+        validate_preroll_idempotency_key("")
 
 
 def test_config_accepts_secure_openai_compatible_proxy_endpoints():
