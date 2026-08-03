@@ -1816,6 +1816,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("POST", "/v1/realtime/sessions", self._handle_realtime_session_create),
             ("GET", "/v1/realtime/sessions/{session_id}/control", self._handle_realtime_control),
+            ("POST", "/v1/realtime/sessions/{session_id}/audio/preroll", self._handle_realtime_preroll),
             ("POST", "/v1/realtime/sessions/{session_id}/approval", self._handle_realtime_approval),
             ("POST", "/v1/realtime/sessions/{session_id}/renew", self._handle_realtime_session_renew),
             ("DELETE", "/v1/realtime/sessions/{session_id}", self._handle_realtime_session_delete),
@@ -2869,6 +2870,104 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return offer_sdp, requested_session_id, None
 
+    async def _read_realtime_preroll(self, request: "web.Request"):
+        """Read bounded PCM without buffering an untrusted oversized body."""
+
+        from gateway.realtime.protocol import (
+            PREROLL_CHANNELS,
+            PREROLL_SAMPLE_RATE_HZ,
+            RealtimeProtocolError,
+            validate_preroll_idempotency_key,
+        )
+
+        try:
+            realtime_config, _api_key, _review_configured = (
+                self._realtime_runtime_status()
+            )
+            idempotency_key = validate_preroll_idempotency_key(
+                request.headers.get("Idempotency-Key")
+            )
+        except Exception as exc:
+            return None, None, self._realtime_error_response(exc)
+
+        raw_content_type = request.headers.get("Content-Type", "")
+        segments = [segment.strip() for segment in raw_content_type.split(";")]
+        if not segments or segments[0].lower() != "audio/pcm":
+            return None, None, web.json_response(
+                _openai_error(
+                    "Pre-roll requires Content-Type audio/pcm",
+                    code="invalid_preroll_content_type",
+                ),
+                status=415,
+            )
+        parameters: dict[str, str] = {}
+        for segment in segments[1:]:
+            name, separator, value = segment.partition("=")
+            if separator:
+                parameters[name.strip().lower()] = value.strip().strip('"').lower()
+        if parameters.get("rate") != str(PREROLL_SAMPLE_RATE_HZ):
+            return None, None, web.json_response(
+                _openai_error(
+                    f"Pre-roll PCM must use {PREROLL_SAMPLE_RATE_HZ} Hz",
+                    code="invalid_preroll_sample_rate",
+                ),
+                status=415,
+            )
+        if parameters.get("channels") != str(PREROLL_CHANNELS):
+            return None, None, web.json_response(
+                _openai_error(
+                    "Pre-roll PCM must be mono",
+                    code="invalid_preroll_channels",
+                ),
+                status=415,
+            )
+        if parameters.get("format") not in {"s16le", "pcm16"}:
+            return None, None, web.json_response(
+                _openai_error(
+                    "Pre-roll PCM must be signed 16-bit little-endian",
+                    code="invalid_preroll_format",
+                ),
+                status=415,
+            )
+        content_encoding = request.headers.get("Content-Encoding", "identity").lower()
+        if content_encoding not in {"", "identity"}:
+            return None, None, web.json_response(
+                _openai_error(
+                    "Compressed pre-roll request bodies are not supported",
+                    code="invalid_preroll_content_encoding",
+                ),
+                status=415,
+            )
+        if (
+            request.content_length is not None
+            and request.content_length > realtime_config.preroll_max_bytes
+        ):
+            return None, None, web.json_response(
+                _openai_error(
+                    "Pre-roll audio exceeds the configured duration limit",
+                    code="preroll_audio_too_large",
+                ),
+                status=413,
+            )
+
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            async for chunk in request.content.iter_chunked(64 * 1024):
+                total += len(chunk)
+                if total > realtime_config.preroll_max_bytes:
+                    return None, None, web.json_response(
+                        _openai_error(
+                            "Pre-roll audio exceeds the configured duration limit",
+                            code="preroll_audio_too_large",
+                        ),
+                        status=413,
+                    )
+                chunks.append(bytes(chunk))
+        except RealtimeProtocolError as exc:
+            return None, None, self._realtime_error_response(exc)
+        return b"".join(chunks), idempotency_key, None
+
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
@@ -3041,27 +3140,53 @@ class APIServerAdapter(BasePlatformAdapter):
                 requested_session_id=requested_session_id,
             )
             config = created.session.config
-            return web.json_response(
-                {
-                    "version": 1,
-                    "session_id": created.session.session_id,
-                    "call_id": created.call_id,
-                    "sdp": created.answer_sdp,
-                    "model": config.model,
-                    "voice": config.voice,
-                    "control_url": (
-                        f"/v1/realtime/sessions/"
-                        f"{created.session.session_id}/control"
-                    ),
-                    "renew_url": (
-                        f"/v1/realtime/sessions/"
-                        f"{created.session.session_id}/renew"
-                    ),
-                    "provider_call_max_seconds": config.provider_call_max_seconds,
-                }
-            )
+            payload = {
+                "version": 1,
+                "session_id": created.session.session_id,
+                "call_id": created.call_id,
+                "sdp": created.answer_sdp,
+                "model": config.model,
+                "voice": config.voice,
+                "control_url": (
+                    f"/v1/realtime/sessions/"
+                    f"{created.session.session_id}/control"
+                ),
+                "renew_url": (
+                    f"/v1/realtime/sessions/"
+                    f"{created.session.session_id}/renew"
+                ),
+                "provider_call_max_seconds": config.provider_call_max_seconds,
+            }
+            if config.preroll_enabled:
+                payload["preroll_url"] = (
+                    f"/v1/realtime/sessions/"
+                    f"{created.session.session_id}/audio/preroll"
+                )
+            return web.json_response(payload)
         except Exception as exc:
             logger.warning("Realtime session creation failed: %s", exc)
+            return self._realtime_error_response(exc)
+
+    async def _handle_realtime_preroll(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        audio, idempotency_key, error = await self._read_realtime_preroll(request)
+        if error is not None:
+            return error
+        assert audio is not None and idempotency_key is not None
+        try:
+            manager = self._ensure_realtime_manager()
+            result = await manager.ingest_preroll_audio(
+                request.match_info["session_id"],
+                audio,
+                idempotency_key=idempotency_key,
+            )
+            return web.json_response(result)
+        except Exception as exc:
+            logger.warning("Realtime pre-roll upload failed: %s", exc)
             return self._realtime_error_response(exc)
 
     async def _handle_realtime_session_renew(
@@ -3081,19 +3206,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 request.match_info["session_id"], offer_sdp
             )
             config = created.session.config
-            return web.json_response(
-                {
-                    "version": 1,
-                    "session_id": created.session.session_id,
-                    "call_id": created.call_id,
-                    "sdp": created.answer_sdp,
-                    "model": config.model,
-                    "voice": config.voice,
-                    "provider_call_max_seconds": (
-                        config.provider_call_max_seconds
-                    ),
-                }
-            )
+            payload = {
+                "version": 1,
+                "session_id": created.session.session_id,
+                "call_id": created.call_id,
+                "sdp": created.answer_sdp,
+                "model": config.model,
+                "voice": config.voice,
+                "provider_call_max_seconds": config.provider_call_max_seconds,
+            }
+            if config.preroll_enabled:
+                payload["preroll_url"] = (
+                    f"/v1/realtime/sessions/"
+                    f"{created.session.session_id}/audio/preroll"
+                )
+            return web.json_response(payload)
         except Exception as exc:
             logger.warning("Realtime session renewal failed: %s", exc)
             return self._realtime_error_response(exc)
@@ -3251,6 +3378,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         try:
+            from gateway.realtime.protocol import (
+                PREROLL_CHANNELS,
+                PREROLL_SAMPLE_RATE_HZ,
+                PREROLL_SAMPLE_WIDTH_BYTES,
+            )
+
             realtime_config, realtime_key, review_configured = (
                 self._realtime_runtime_status()
             )
@@ -3275,6 +3408,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 "provider_call_max_input_tokens": (
                     realtime_config.provider_call_max_input_tokens
                 ),
+                "wake_word_preroll": {
+                    "available": bool(
+                        realtime_available and realtime_config.preroll_enabled
+                    ),
+                    "complete_utterance_required": True,
+                    "content_type": "audio/pcm",
+                    "format": "s16le",
+                    "sample_rate_hz": PREROLL_SAMPLE_RATE_HZ,
+                    "channels": PREROLL_CHANNELS,
+                    "sample_width_bytes": PREROLL_SAMPLE_WIDTH_BYTES,
+                    "max_seconds": realtime_config.preroll_max_seconds,
+                    "requires_idempotency_key": True,
+                    "webrtc_handoff": "unmute_after_committed",
+                },
                 "background_self_improvement": {
                     "available": bool(realtime_available and review_configured),
                     "configured": review_configured,
@@ -3371,6 +3518,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
                 "realtime_session_create": {"method": "POST", "path": "/v1/realtime/sessions"},
                 "realtime_control": {"method": "GET", "path": "/v1/realtime/sessions/{session_id}/control"},
+                "realtime_preroll": {"method": "POST", "path": "/v1/realtime/sessions/{session_id}/audio/preroll"},
                 "realtime_approval": {"method": "POST", "path": "/v1/realtime/sessions/{session_id}/approval"},
                 "realtime_renew": {"method": "POST", "path": "/v1/realtime/sessions/{session_id}/renew"},
                 "realtime_close": {"method": "DELETE", "path": "/v1/realtime/sessions/{session_id}"},

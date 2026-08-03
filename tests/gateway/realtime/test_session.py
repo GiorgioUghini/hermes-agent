@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import threading
 from types import SimpleNamespace
@@ -6,7 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from gateway.realtime.protocol import RealtimeVoiceConfig
+from gateway.realtime.openai_sideband import OpenAIRealtimeError
+from gateway.realtime.protocol import RealtimeProtocolError, RealtimeVoiceConfig
 from gateway.realtime.session import RealtimeVoiceSession, prepare_realtime_agent
 from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
@@ -43,6 +45,367 @@ class _FakeSideband:
     async def close(self):
         self.closed = True
         self._stop.set()
+
+
+class _ResponsivePrerollSideband(_FakeSideband):
+    def __init__(self):
+        super().__init__()
+        self.handler = None
+
+    async def send(self, event):
+        await super().send(event)
+        if self.handler is None:
+            return
+        if event["type"] == "session.update":
+            await self.handler({"type": "session.updated", "session": event["session"]})
+        elif event["type"] == "input_audio_buffer.clear":
+            await self.handler({"type": "input_audio_buffer.cleared"})
+        elif event["type"] == "input_audio_buffer.commit":
+            await self.handler(
+                {
+                    "type": "input_audio_buffer.committed",
+                    "item_id": "input_preroll",
+                }
+            )
+
+
+class _DeferredRestoreAckSideband(_ResponsivePrerollSideband):
+    def __init__(self):
+        super().__init__()
+        self.update_count = 0
+        self.restore_sent = asyncio.Event()
+        self.restore_event = None
+
+    async def send(self, event):
+        if event["type"] == "session.update":
+            self.update_count += 1
+            if self.update_count == 2:
+                await _FakeSideband.send(self, event)
+                self.restore_event = event
+                self.restore_sent.set()
+                return
+        await super().send(event)
+
+
+class _FailingCommitPrerollSideband(_ResponsivePrerollSideband):
+    async def send(self, event):
+        if event["type"] == "input_audio_buffer.commit":
+            await _FakeSideband.send(self, event)
+            raise OpenAIRealtimeError(
+                "provider commit failed",
+                code="commit_failed",
+                status=502,
+            )
+        await super().send(event)
+
+
+class _FailingInitialClearSideband(_ResponsivePrerollSideband):
+    def __init__(self):
+        super().__init__()
+        self.clear_count = 0
+
+    async def send(self, event):
+        if event["type"] == "input_audio_buffer.clear":
+            self.clear_count += 1
+            if self.clear_count == 1:
+                await _FakeSideband.send(self, event)
+                raise OpenAIRealtimeError(
+                    "initial clear failed",
+                    code="clear_failed",
+                    status=502,
+                )
+        await super().send(event)
+
+
+class _StalledPrerollSideband(_FakeSideband):
+    async def send(self, event):
+        self.sent.append(event)
+        await asyncio.Event().wait()
+
+
+class _RecordingRealtimeStateDB:
+    def __init__(self):
+        self.states = []
+
+    def save_realtime_session_state(self, _session_id, **values):
+        self.states.append(values["state"])
+
+
+@pytest.mark.asyncio
+async def test_preroll_commits_complete_utterance_once_and_restores_vad():
+    sideband = _ResponsivePrerollSideband()
+    session = RealtimeVoiceSession(
+        session_id="preroll",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_preroll",
+    )
+    sideband.handler = session.handle_provider_event
+    session.state = "ready"
+    audio = b"\x01\x00" * 7200
+
+    try:
+        first = await session.ingest_preroll_audio(
+            audio,
+            idempotency_key="wake:1",
+        )
+        repeated = await session.ingest_preroll_audio(
+            audio,
+            idempotency_key="wake:1",
+        )
+
+        assert first == repeated
+        assert first["status"] == "committed"
+        assert first["item_id"] == "input_preroll"
+        assert first["duration_ms"] == 300
+        assert [event["type"] for event in sideband.sent].count(
+            "input_audio_buffer.commit"
+        ) == 1
+        appended = b"".join(
+            base64.b64decode(event["audio"])
+            for event in sideband.sent
+            if event["type"] == "input_audio_buffer.append"
+        )
+        assert appended == audio
+        updates = [
+            event
+            for event in sideband.sent
+            if event["type"] == "session.update"
+        ]
+        assert updates[0]["session"]["audio"]["input"]["turn_detection"] is None
+        assert updates[-1]["session"]["audio"]["input"][
+            "turn_detection"
+        ] == session.config.turn_detection_config()
+        assert session.can_renew is True
+
+        with pytest.raises(RealtimeProtocolError) as conflict:
+            await session.ingest_preroll_audio(
+                b"\x02\x00" * 7200,
+                idempotency_key="wake:1",
+            )
+        assert conflict.value.code == "preroll_idempotency_conflict"
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_preroll_ignores_stale_vad_acknowledgment():
+    sideband = _DeferredRestoreAckSideband()
+    session = RealtimeVoiceSession(
+        session_id="preroll-stale-ack",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_preroll_stale_ack",
+    )
+    sideband.handler = session.handle_provider_event
+    session.state = "ready"
+    upload = asyncio.create_task(
+        session.ingest_preroll_audio(
+            b"\x01\x00" * 7200,
+            idempotency_key="wake:stale-ack",
+        )
+    )
+    try:
+        await asyncio.wait_for(sideband.restore_sent.wait(), timeout=1)
+        await session.handle_provider_event(
+            {
+                "type": "session.updated",
+                "session": {"audio": {"input": {"turn_detection": None}}},
+            }
+        )
+        await asyncio.sleep(0)
+        assert upload.done() is False
+
+        await session.handle_provider_event(
+            {
+                "type": "session.updated",
+                "session": sideband.restore_event["session"],
+            }
+        )
+        result = await upload
+        assert result["status"] == "committed"
+    finally:
+        if not upload.done():
+            upload.cancel()
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_preroll_failure_clears_audio_and_requires_sticky_renewal():
+    sideband = _FailingCommitPrerollSideband()
+    db = _RecordingRealtimeStateDB()
+    session = RealtimeVoiceSession(
+        session_id="preroll-cleanup",
+        agent=SimpleNamespace(tools=[], _session_db=db),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_preroll_cleanup",
+    )
+    sideband.handler = session.handle_provider_event
+    session.state = "ready"
+    audio = b"\x01\x00" * 7200
+
+    with pytest.raises(OpenAIRealtimeError, match="provider commit failed"):
+        await session.ingest_preroll_audio(
+            audio,
+            idempotency_key="wake:cleanup",
+        )
+    await asyncio.sleep(0)
+
+    event_types = [event["type"] for event in sideband.sent]
+    commit_index = event_types.index("input_audio_buffer.commit")
+    cleanup_clear_index = event_types.index(
+        "input_audio_buffer.clear",
+        commit_index + 1,
+    )
+    restore_index = event_types.index("session.update", cleanup_clear_index + 1)
+    assert commit_index < cleanup_clear_index < restore_index
+    assert session._renewal_required is True
+    assert session.state == "degraded"
+    assert session.can_renew is True
+    assert db.states[-1] == "renewal_required"
+
+    record = session._preroll_requests["wake:cleanup"]
+    assert record.task is None
+    assert record.failure is not None
+    sent_count = len(sideband.sent)
+    with pytest.raises(OpenAIRealtimeError, match="provider commit failed"):
+        await session.ingest_preroll_audio(
+            audio,
+            idempotency_key="wake:cleanup",
+        )
+    assert len(sideband.sent) == sent_count
+
+    await session._persist_runtime_state("ready")
+    assert db.states[-1] == "renewal_required"
+    await session.close(reason="test_complete", end_session=False)
+    assert db.states[-1] == "renewal_required"
+
+
+@pytest.mark.asyncio
+async def test_preroll_initial_clear_failure_retries_clear_before_vad_restore():
+    sideband = _FailingInitialClearSideband()
+    session = RealtimeVoiceSession(
+        session_id="preroll-initial-clear",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_preroll_initial_clear",
+    )
+    sideband.handler = session.handle_provider_event
+    session.state = "ready"
+
+    with pytest.raises(OpenAIRealtimeError, match="initial clear failed"):
+        await session.ingest_preroll_audio(
+            b"\x01\x00" * 7200,
+            idempotency_key="wake:initial-clear",
+        )
+
+    event_types = [event["type"] for event in sideband.sent]
+    first_clear = event_types.index("input_audio_buffer.clear")
+    cleanup_clear = event_types.index("input_audio_buffer.clear", first_clear + 1)
+    restore = event_types.index("session.update", cleanup_clear + 1)
+    assert first_clear < cleanup_clear < restore
+    assert session._renewal_required is True
+    await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_preroll_stalled_send_honors_operation_timeout():
+    sideband = _StalledPrerollSideband()
+    session = RealtimeVoiceSession(
+        session_id="preroll-send-timeout",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+            preroll_timeout_seconds=0.05,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_preroll_send_timeout",
+    )
+    session.state = "ready"
+
+    with pytest.raises(RealtimeProtocolError) as timeout:
+        await session.ingest_preroll_audio(
+            b"\x01\x00" * 7200,
+            idempotency_key="wake:send-timeout",
+        )
+    assert timeout.value.code == "preroll_provider_timeout"
+    assert session._preroll_active is False
+    assert session._renewal_required is True
+    assert session.can_renew is True
+    await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_preroll_blocks_rotation_and_parallel_upload_until_teardown():
+    sideband = _FakeSideband()
+    db = _RecordingRealtimeStateDB()
+    session = RealtimeVoiceSession(
+        session_id="preroll-blocked",
+        agent=SimpleNamespace(tools=[], _session_db=db),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_preroll_blocked",
+    )
+    session.state = "ready"
+    upload = asyncio.create_task(
+        session.ingest_preroll_audio(
+            b"\x01\x00" * 7200,
+            idempotency_key="wake:blocked",
+        )
+    )
+    await _wait_until(lambda: session._preroll_active)
+    try:
+        assert session.can_renew is False
+        assert session.idle_timeout_eligible is False
+        with pytest.raises(RealtimeProtocolError) as concurrent:
+            await session.ingest_preroll_audio(
+                b"\x01\x00" * 7200,
+                idempotency_key="wake:other",
+            )
+        assert concurrent.value.code == "preroll_in_progress"
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+    with pytest.raises(asyncio.CancelledError):
+        await upload
+    assert db.states[-1] == "renewal_required"
 
 
 @pytest.mark.asyncio

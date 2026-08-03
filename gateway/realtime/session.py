@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 import uuid
 
 from agent.turn_context import TurnContext, build_host_turn_context
@@ -24,13 +25,23 @@ from gateway.realtime.protocol import (
     RealtimeFunctionCall,
     RealtimeProtocolError,
     RealtimeVoiceConfig,
+    PREROLL_APPEND_CHUNK_MILLISECONDS,
+    PREROLL_CHANNELS,
+    PREROLL_MIN_MILLISECONDS,
+    PREROLL_SAMPLE_RATE_HZ,
+    PREROLL_SAMPLE_WIDTH_BYTES,
     SESSION_STATES,
     conversation_function_call_event,
     conversation_message_event,
     function_call_output_event,
     function_calls_from_event,
+    input_audio_buffer_append_event,
+    input_audio_buffer_clear_event,
+    input_audio_buffer_commit_event,
     response_create_event,
     response_transcript,
+    session_turn_detection_update_event,
+    validate_preroll_idempotency_key,
 )
 
 
@@ -53,6 +64,31 @@ class _PendingPrompt:
     kind: str
     event: threading.Event
     response: Optional[str] = None
+
+
+@dataclass
+class _PrerollRequest:
+    digest: str
+    call_id: str
+    task: Optional[asyncio.Task]
+    result: Optional[dict[str, Any]] = None
+    failure: Optional["_PrerollFailure"] = None
+
+
+@dataclass(frozen=True)
+class _PrerollFailure:
+    kind: str
+    message: str
+    code: str
+    status: Optional[int] = None
+    retryable: bool = False
+
+
+@dataclass
+class _PrerollWaiter:
+    event_type: str
+    future: asyncio.Future
+    matches: Optional[Callable[[Mapping[str, Any]], bool]] = None
 
 
 def prepare_realtime_agent(
@@ -162,6 +198,14 @@ class RealtimeVoiceSession:
         self._receive_task: Optional[asyncio.Task] = None
         self._rotation_task: Optional[asyncio.Task] = None
         self._event_lock = asyncio.Lock()
+        self._preroll_request_lock = asyncio.Lock()
+        self._preroll_requests: OrderedDict[str, _PrerollRequest] = OrderedDict()
+        self._preroll_tasks: set[asyncio.Task] = set()
+        self._preroll_active = False
+        self._preroll_waiter: Optional[_PrerollWaiter] = None
+        self._preroll_error_future: Optional[asyncio.Future] = None
+        self._preroll_event_ids: set[str] = set()
+        self._renewal_required = False
         self._turn: Optional[TurnContext] = None
         self._turn_response_count = 0
         self._pending_next_inputs: deque[tuple[str, str]] = deque()
@@ -182,6 +226,7 @@ class RealtimeVoiceSession:
         self._rotation_notified = False
         self._barge_in_during_response = False
         self._skip_current_tool_batch = False
+        self._closing = False
         self._closed = False
         self._logical_end = False
         self._close_lock = asyncio.Lock()
@@ -203,6 +248,8 @@ class RealtimeVoiceSession:
     def can_renew(self) -> bool:
         return (
             not self._closed
+            and not self._closing
+            and not self._preroll_active
             and self._turn is None
             and (self._tool_task is None or self._tool_task.done())
             and not self._pending_approvals
@@ -216,6 +263,8 @@ class RealtimeVoiceSession:
             has_pending_prompts = bool(self._pending_prompts)
         return (
             not self._closed
+            and not self._closing
+            and not self._preroll_active
             and self._turn is None
             and (self._tool_task is None or self._tool_task.done())
             and not self._pending_approvals
@@ -227,6 +276,478 @@ class RealtimeVoiceSession:
             instructions=self.frozen_instructions,
             tools=self.frozen_tools,
         )
+
+    async def ingest_preroll_audio(
+        self,
+        audio: bytes,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Commit one complete, locally endpointed first utterance."""
+
+        if not self.config.preroll_enabled:
+            raise RealtimeProtocolError(
+                "Wake-word pre-roll upload is disabled",
+                code="preroll_disabled",
+            )
+        key = validate_preroll_idempotency_key(idempotency_key)
+        if not isinstance(audio, bytes):
+            raise RealtimeProtocolError(
+                "Pre-roll audio must be raw PCM bytes",
+                code="invalid_preroll_audio",
+            )
+        frame_bytes = PREROLL_CHANNELS * PREROLL_SAMPLE_WIDTH_BYTES
+        minimum_bytes = (
+            PREROLL_SAMPLE_RATE_HZ
+            * frame_bytes
+            * PREROLL_MIN_MILLISECONDS
+            // 1000
+        )
+        if len(audio) < minimum_bytes:
+            raise RealtimeProtocolError(
+                f"Pre-roll audio must contain at least {PREROLL_MIN_MILLISECONDS} ms",
+                code="preroll_audio_too_short",
+            )
+        if len(audio) > self.config.preroll_max_bytes:
+            raise RealtimeProtocolError(
+                "Pre-roll audio exceeds the configured duration limit",
+                code="preroll_audio_too_large",
+            )
+        if len(audio) % frame_bytes:
+            raise RealtimeProtocolError(
+                "Pre-roll PCM contains an incomplete sample frame",
+                code="invalid_preroll_audio",
+            )
+
+        digest = hashlib.sha256(audio).hexdigest()
+        async with self._preroll_request_lock:
+            existing = self._preroll_requests.get(key)
+            if existing is not None and existing.call_id != self.call_id:
+                self._preroll_requests.pop(key, None)
+                existing = None
+            if existing is not None:
+                if existing.digest != digest:
+                    raise RealtimeProtocolError(
+                        "Idempotency-Key was already used with different audio",
+                        code="preroll_idempotency_conflict",
+                    )
+                self._preroll_requests.move_to_end(key)
+                if existing.failure is not None:
+                    self._raise_preroll_failure(existing.failure)
+                if existing.result is not None:
+                    return dict(existing.result)
+                task = existing.task
+                if task is None:
+                    raise RuntimeError("Pre-roll request has no cached outcome")
+            else:
+                if any(
+                    request.task is not None
+                    and not request.task.done()
+                    and request.call_id == self.call_id
+                    for request in self._preroll_requests.values()
+                ):
+                    raise RealtimeProtocolError(
+                        "Another pre-roll upload is already in progress",
+                        code="preroll_in_progress",
+                    )
+                self._prune_preroll_requests()
+                task = asyncio.create_task(
+                    self._run_preroll_upload(audio, key),
+                    name=f"realtime-preroll-{self.session_id}",
+                )
+                self._preroll_tasks.add(task)
+                request = _PrerollRequest(
+                    digest=digest,
+                    call_id=self.call_id,
+                    task=task,
+                )
+                self._preroll_requests[key] = request
+                task.add_done_callback(
+                    lambda completed, request_key=key, record=request: (
+                        self._preroll_task_done(request_key, record, completed)
+                    )
+                )
+        return await asyncio.shield(task)
+
+    def _preroll_task_done(
+        self,
+        key: str,
+        request: _PrerollRequest,
+        task: asyncio.Task,
+    ) -> None:
+        self._preroll_tasks.discard(task)
+        if self._preroll_requests.get(key) is not request:
+            return
+        if task.cancelled():
+            self._preroll_requests.pop(key, None)
+            return
+        try:
+            request.result = dict(task.result())
+        except Exception as exc:
+            request.failure = self._sanitize_preroll_failure(exc)
+        finally:
+            request.task = None
+
+    @staticmethod
+    def _sanitize_preroll_failure(exc: Exception) -> _PrerollFailure:
+        message = str(exc).replace("\r", " ").replace("\n", " ").strip()[:1000]
+        if isinstance(exc, RealtimeProtocolError):
+            return _PrerollFailure(
+                kind="protocol",
+                message=message,
+                code=exc.code,
+            )
+        if isinstance(exc, OpenAIRealtimeError):
+            return _PrerollFailure(
+                kind="provider",
+                message=message,
+                code=exc.code,
+                status=exc.status,
+                retryable=exc.retryable,
+            )
+        return _PrerollFailure(
+            kind="internal",
+            message=message or "Pre-roll upload failed",
+            code="realtime_internal_error",
+        )
+
+    @staticmethod
+    def _raise_preroll_failure(failure: _PrerollFailure) -> None:
+        if failure.kind == "protocol":
+            raise RealtimeProtocolError(failure.message, code=failure.code)
+        if failure.kind == "provider":
+            raise OpenAIRealtimeError(
+                failure.message,
+                code=failure.code,
+                status=failure.status,
+                retryable=failure.retryable,
+            )
+        raise RuntimeError(failure.message)
+
+    def _prune_preroll_requests(self) -> None:
+        while len(self._preroll_requests) >= 16:
+            for key, request in list(self._preroll_requests.items()):
+                if request.task is None or request.task.done():
+                    self._preroll_requests.pop(key)
+                    break
+            else:
+                raise RealtimeProtocolError(
+                    "Pre-roll request capacity is temporarily exhausted",
+                    code="preroll_in_progress",
+                )
+
+    async def _run_preroll_upload(
+        self,
+        audio: bytes,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        with self._pending_prompts_lock:
+            has_pending_prompts = bool(self._pending_prompts)
+        async with self._event_lock:
+            tool_running = self._tool_task is not None and not self._tool_task.done()
+            if self._renewal_required:
+                raise RealtimeProtocolError(
+                    "The provider call must be renewed before another pre-roll upload",
+                    code="session_renewal_required",
+                )
+            if (
+                self._closing
+                or self._closed
+                or self.state != "ready"
+                or self._turn is not None
+                or tool_running
+                or self._pending_approvals
+                or has_pending_prompts
+                or self._preroll_active
+            ):
+                raise RealtimeProtocolError(
+                    "Realtime session is busy; pre-roll requires an idle session",
+                    code="session_busy",
+                )
+            self._preroll_active = True
+            self.last_activity_at = time.time()
+
+        duration_ms = round(
+            len(audio)
+            * 1000
+            / (
+                PREROLL_SAMPLE_RATE_HZ
+                * PREROLL_CHANNELS
+                * PREROLL_SAMPLE_WIDTH_BYTES
+            )
+        )
+        self.broker.publish(
+            "audio.preroll_started",
+            {"duration_ms": duration_ms, "audio_bytes": len(audio)},
+        )
+        self._reset_preroll_provider_signals()
+        self._preroll_error_future = asyncio.get_running_loop().create_future()
+        deadline = (
+            asyncio.get_running_loop().time() + self.config.preroll_timeout_seconds
+        )
+        vad_may_be_disabled = False
+        buffer_may_be_dirty = True
+        try:
+            vad_may_be_disabled = True
+            await self._send_preroll_and_wait(
+                session_turn_detection_update_event(
+                    None,
+                    event_id=self._event_id("preroll_vad_off"),
+                ),
+                "session.updated",
+                deadline,
+                matches=lambda event: self._session_update_matches(event, None),
+            )
+            await self._send_preroll_and_wait(
+                input_audio_buffer_clear_event(
+                    event_id=self._event_id("preroll_clear")
+                ),
+                "input_audio_buffer.cleared",
+                deadline,
+            )
+            buffer_may_be_dirty = False
+
+            chunk_bytes = (
+                PREROLL_SAMPLE_RATE_HZ
+                * PREROLL_CHANNELS
+                * PREROLL_SAMPLE_WIDTH_BYTES
+                * PREROLL_APPEND_CHUNK_MILLISECONDS
+                // 1000
+            )
+            for offset in range(0, len(audio), chunk_bytes):
+                buffer_may_be_dirty = True
+                event = input_audio_buffer_append_event(
+                    audio[offset : offset + chunk_bytes],
+                    event_id=self._event_id("preroll_append"),
+                )
+                self._preroll_event_ids.add(event["event_id"])
+                await self._send_preroll_event(event, deadline)
+                self._raise_preroll_provider_error()
+
+            committed = await self._send_preroll_and_wait(
+                input_audio_buffer_commit_event(
+                    event_id=self._event_id("preroll_commit")
+                ),
+                "input_audio_buffer.committed",
+                deadline,
+            )
+            buffer_may_be_dirty = False
+            await self._restore_preroll_vad(deadline)
+            vad_may_be_disabled = False
+            item_id = str(committed.get("item_id") or "").strip()
+            result = {
+                "version": 1,
+                "session_id": self.session_id,
+                "call_id": self.call_id,
+                "idempotency_key": idempotency_key,
+                "status": "committed",
+                "item_id": item_id,
+                "audio_bytes": len(audio),
+                "duration_ms": duration_ms,
+            }
+            self.broker.publish(
+                "audio.preroll_committed",
+                {
+                    "provider_item_id": item_id,
+                    "duration_ms": duration_ms,
+                    "audio_bytes": len(audio),
+                },
+            )
+            return result
+        except (Exception, asyncio.CancelledError):
+            if vad_may_be_disabled and not self._closed:
+                try:
+                    await self._cleanup_failed_preroll(
+                        buffer_may_be_dirty=buffer_may_be_dirty,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not clean provider audio after pre-roll failure for %s",
+                        self.session_id,
+                    )
+                await self._mark_preroll_renewal_required("preroll_upload_failed")
+            raise
+        finally:
+            self._reset_preroll_provider_signals()
+            async with self._event_lock:
+                self._preroll_active = False
+
+    async def _cleanup_failed_preroll(
+        self,
+        *,
+        buffer_may_be_dirty: bool,
+    ) -> None:
+        self._reset_preroll_provider_signals()
+        self._preroll_error_future = asyncio.get_running_loop().create_future()
+        deadline = (
+            asyncio.get_running_loop().time()
+            + min(5.0, self.config.preroll_timeout_seconds)
+        )
+        if buffer_may_be_dirty:
+            await self._send_preroll_and_wait(
+                input_audio_buffer_clear_event(
+                    event_id=self._event_id("preroll_cleanup_clear")
+                ),
+                "input_audio_buffer.cleared",
+                deadline,
+            )
+        await self._restore_preroll_vad(deadline)
+
+    async def _mark_preroll_renewal_required(self, reason: str) -> None:
+        first_notification = not self._renewal_required
+        self._renewal_required = True
+        if self._closed:
+            return
+        self._set_state("degraded", reason=reason)
+        try:
+            await self._persist_runtime_state("renewal_required")
+        except Exception:
+            logger.exception(
+                "Could not persist required pre-roll renewal for %s",
+                self.session_id,
+            )
+        if first_notification:
+            self.broker.publish("session.rotation_required", {"reason": reason})
+
+    async def _restore_preroll_vad(
+        self,
+        deadline: float,
+        *,
+        reset_signals: bool = False,
+    ) -> None:
+        turn_detection = self.config.turn_detection_config()
+        if reset_signals:
+            self._reset_preroll_provider_signals()
+            self._preroll_error_future = asyncio.get_running_loop().create_future()
+        try:
+            await self._send_preroll_and_wait(
+                session_turn_detection_update_event(
+                    turn_detection,
+                    event_id=self._event_id("preroll_vad_on"),
+                ),
+                "session.updated",
+                deadline,
+                matches=lambda event: self._session_update_matches(
+                    event, turn_detection
+                ),
+            )
+        except Exception:
+            if self._closed:
+                raise
+            self._reset_preroll_provider_signals()
+            self._preroll_error_future = asyncio.get_running_loop().create_future()
+            await self._send_preroll_and_wait(
+                session_turn_detection_update_event(
+                    turn_detection,
+                    event_id=self._event_id("preroll_vad_retry"),
+                ),
+                "session.updated",
+                asyncio.get_running_loop().time()
+                + min(5.0, self.config.preroll_timeout_seconds),
+                matches=lambda event: self._session_update_matches(
+                    event, turn_detection
+                ),
+            )
+
+    @staticmethod
+    def _session_update_matches(
+        event: Mapping[str, Any],
+        expected: Optional[Mapping[str, Any]],
+    ) -> bool:
+        session = event.get("session")
+        session = session if isinstance(session, Mapping) else {}
+        audio = session.get("audio")
+        audio = audio if isinstance(audio, Mapping) else {}
+        input_config = audio.get("input")
+        input_config = input_config if isinstance(input_config, Mapping) else {}
+        if "turn_detection" not in input_config:
+            return False
+        actual = input_config.get("turn_detection")
+        if expected is None:
+            return actual is None
+        if not isinstance(actual, Mapping):
+            return False
+        return all(actual.get(key) == value for key, value in expected.items())
+
+    async def _send_preroll_event(
+        self,
+        event: Mapping[str, Any],
+        deadline: float,
+    ) -> None:
+        timeout = deadline - asyncio.get_running_loop().time()
+        event_type = str(event.get("type") or "provider event")
+        if timeout <= 0:
+            raise RealtimeProtocolError(
+                f"Timed out sending {event_type}",
+                code="preroll_provider_timeout",
+            )
+        try:
+            await asyncio.wait_for(self.sideband.send(event), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise RealtimeProtocolError(
+                f"Timed out sending {event_type}",
+                code="preroll_provider_timeout",
+            ) from exc
+
+    async def _send_preroll_and_wait(
+        self,
+        event: Mapping[str, Any],
+        expected_event_type: str,
+        deadline: float,
+        *,
+        matches: Optional[Callable[[Mapping[str, Any]], bool]] = None,
+    ) -> Mapping[str, Any]:
+        if self._preroll_waiter is not None:
+            raise RuntimeError("A pre-roll provider acknowledgment is already pending")
+        future = asyncio.get_running_loop().create_future()
+        waiter = _PrerollWaiter(expected_event_type, future, matches)
+        self._preroll_waiter = waiter
+        event_id = str(event.get("event_id") or "")
+        if event_id:
+            self._preroll_event_ids.add(event_id)
+        try:
+            await self._send_preroll_event(event, deadline)
+            timeout = deadline - asyncio.get_running_loop().time()
+            if timeout <= 0:
+                raise asyncio.TimeoutError
+            error_future = self._preroll_error_future
+            futures = {future}
+            if error_future is not None:
+                futures.add(error_future)
+            done, _pending = await asyncio.wait(
+                futures,
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise asyncio.TimeoutError
+            if error_future is not None and error_future in done:
+                raise error_future.result()
+            return future.result()
+        except asyncio.TimeoutError as exc:
+            raise RealtimeProtocolError(
+                f"Timed out waiting for {expected_event_type}",
+                code="preroll_provider_timeout",
+            ) from exc
+        finally:
+            if self._preroll_waiter is waiter:
+                self._preroll_waiter = None
+            if not future.done():
+                future.cancel()
+
+    def _raise_preroll_provider_error(self) -> None:
+        future = self._preroll_error_future
+        if future is not None and future.done():
+            raise future.result()
+
+    def _reset_preroll_provider_signals(self) -> None:
+        waiter, self._preroll_waiter = self._preroll_waiter, None
+        if waiter is not None and not waiter.future.done():
+            waiter.future.cancel()
+        error_future, self._preroll_error_future = self._preroll_error_future, None
+        if error_future is not None and not error_future.done():
+            error_future.cancel()
+        self._preroll_event_ids.clear()
 
     async def start(
         self,
@@ -278,12 +799,15 @@ class RealtimeVoiceSession:
         db = getattr(self.agent, "_session_db", None)
         if db is None:
             return
+        persisted_state = (
+            "renewal_required" if self._renewal_required else (state or self.state)
+        )
         await asyncio.to_thread(
             db.save_realtime_session_state,
             self.session_id,
             provider_call_id=self.call_id,
             provider_call_started_at=self.call_started_at,
-            state=state or self.state,
+            state=persisted_state,
             model=self.config.model,
             voice=self.config.voice,
             frozen_instructions=self.frozen_instructions,
@@ -693,6 +1217,16 @@ class RealtimeVoiceSession:
         self.last_activity_at = time.time()
         async with self._event_lock:
             event_type = str(event.get("type") or "")
+            waiter = self._preroll_waiter
+            if (
+                waiter is not None
+                and event_type == waiter.event_type
+                and not waiter.future.done()
+                and (waiter.matches is None or waiter.matches(event))
+            ):
+                waiter.future.set_result(dict(event))
+            if event_type in {"session.updated", "input_audio_buffer.cleared"}:
+                return
             if event_type == "input_audio_buffer.speech_started":
                 self.broker.publish("vad.speech_started", {})
                 if self.state in {"responding", "tool_wait"}:
@@ -781,15 +1315,26 @@ class RealtimeVoiceSession:
             if event_type == "error":
                 error = event.get("error")
                 error = error if isinstance(error, Mapping) else {}
+                event_id = str(error.get("event_id") or event.get("event_id") or "")
+                provider_error = OpenAIRealtimeError(
+                    str(error.get("message") or "Realtime provider error")[:1000],
+                    code=str(error.get("code") or "openai_realtime_error"),
+                    retryable=False,
+                )
+                if (
+                    self._preroll_active
+                    and event_id in self._preroll_event_ids
+                    and self._preroll_error_future is not None
+                    and not self._preroll_error_future.done()
+                ):
+                    self._preroll_error_future.set_result(provider_error)
                 self.broker.publish(
                     "error",
                     {
                         "fatal": False,
-                        "code": str(error.get("code") or "openai_realtime_error"),
-                        "message": str(error.get("message") or "Realtime provider error")[
-                            :1000
-                        ],
-                        "event_id": str(error.get("event_id") or ""),
+                        "code": provider_error.code,
+                        "message": str(provider_error),
+                        "event_id": event_id,
                     },
                 )
 
@@ -1447,11 +1992,13 @@ class RealtimeVoiceSession:
         await self.sideband.close()
         self.sideband = sideband
         self.call_id = call_id
+        self._preroll_requests.clear()
         await self.sideband.connect()
         await self._seed_history()
         self.call_started_at = time.time()
         self._provider_input_tokens = 0
         self._rotation_notified = False
+        self._renewal_required = False
         if self._rotation_task is not None:
             self._rotation_task.cancel()
         self._rotation_task = asyncio.create_task(
@@ -1539,8 +2086,16 @@ class RealtimeVoiceSession:
         async with self._close_lock:
             if self._closed:
                 return
+            self._closing = True
             self._logical_end = end_session
-            recoverable_state = "turn_active" if self._turn is not None else "ready"
+            if self._renewal_required or self._preroll_active:
+                # The provider may currently have VAD disabled. A fresh call is
+                # required because shutdown cancels the acknowledgment sequence.
+                recoverable_state = "renewal_required"
+            else:
+                recoverable_state = (
+                    "turn_active" if self._turn is not None else "ready"
+                )
             if not end_session:
                 try:
                     await self._persist_runtime_state(recoverable_state)
@@ -1565,6 +2120,7 @@ class RealtimeVoiceSession:
                 self._rotation_task,
                 self._intermediate_task,
                 self._status_watchdog_task,
+                *self._preroll_tasks,
                 *self._transcript_wait_tasks.values(),
             ):
                 if task is not None:
@@ -1577,12 +2133,14 @@ class RealtimeVoiceSession:
                     self._rotation_task,
                     self._intermediate_task,
                     self._status_watchdog_task,
+                    *self._preroll_tasks,
                     *self._transcript_wait_tasks.values(),
                 )
                 if task is not None and task is not current_task
             ]
             if cancelled:
                 await asyncio.gather(*cancelled, return_exceptions=True)
+            self._reset_preroll_provider_signals()
             if self._tool_task is not None and not self._tool_task.done():
                 # Started tools intentionally survive barge-in, but explicit
                 # session destruction waits for their thread-bound work rather

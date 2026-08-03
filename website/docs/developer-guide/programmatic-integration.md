@@ -103,6 +103,8 @@ GET  /api/model/options          Provider-aware picker inventory
 POST /v1/realtime/sessions       Exchange a WebRTC SDP offer
 GET  /v1/realtime/sessions/{id}/control
                                  Structured control WebSocket
+POST /v1/realtime/sessions/{id}/audio/preroll
+                                 Commit a wake-word client's first utterance
 POST /v1/realtime/sessions/{id}/renew
                                  Rotate the provider call with a new SDP offer
 POST /v1/realtime/sessions/{id}/approval
@@ -162,6 +164,11 @@ sequenceDiagram
     API->>Actor: Attach sideband WebSocket by call_id
     API-->>App: session_id + SDP answer + control_url
     App->>App: Apply remote description
+    opt Locally buffered first utterance
+        App->>API: POST complete PCM utterance
+        API->>Actor: Disable VAD, append, commit, restore VAD
+        Actor-->>App: Committed; live microphone may start
+    end
     App<<->>OAI: WebRTC microphone and model audio
     App<<->>API: Sequenced structured controls
     OAI-->>Actor: Committed input, function calls, response events
@@ -212,6 +219,7 @@ Raw `application/sdp` request bodies are also accepted. JSON is always returned:
   "model": "gpt-realtime",
   "voice": "marin",
   "control_url": "/v1/realtime/sessions/rt_123/control",
+  "preroll_url": "/v1/realtime/sessions/rt_123/audio/preroll",
   "renew_url": "/v1/realtime/sessions/rt_123/renew",
   "provider_call_max_seconds": 3300
 }
@@ -226,6 +234,64 @@ The Android OpenAI data channel is transport-only. It must not send
 `response.create`. Hermes is the only writer for those events, which prevents
 client state from bypassing its frozen prompt, authorization, or durable
 ordering.
+
+#### 1a. Preserve wake-word audio during startup
+
+`features.realtime_voice_details.wake_word_preroll` describes the optional
+server-mediated handoff. Use it when the app starts a provider call only after
+local wake detection and cannot inject historical PCM into its WebRTC audio
+source.
+
+The upload represents one **complete first utterance**, not an unfinished
+prefix that continues over RTP:
+
+1. Keep one local `AudioRecord` stream feeding both the wake detector and a
+   rolling buffer.
+2. On detection, start SDP negotiation while continuing that same capture
+   stream.
+3. Run local end-of-speech detection. Retain audio from the desired pre-wake
+   boundary through the end of the command.
+4. Stop/release that capture source. Keep the WebRTC microphone sender
+   inactive.
+5. Apply the SDP answer, then upload the complete utterance to the returned
+   `preroll_url`.
+6. Enable the normal WebRTC microphone only after Hermes returns
+   `status: "committed"`.
+
+```http
+POST /v1/realtime/sessions/rt_123/audio/preroll HTTP/1.1
+Authorization: ******
+Content-Type: audio/pcm;rate=24000;channels=1;format=s16le
+Idempotency-Key: wake-018f3c0d
+
+<raw signed 16-bit little-endian mono PCM>
+```
+
+```json
+{
+  "version": 1,
+  "session_id": "rt_123",
+  "call_id": "rtc_456",
+  "idempotency_key": "wake-018f3c0d",
+  "status": "committed",
+  "item_id": "item_789",
+  "audio_bytes": 288000,
+  "duration_ms": 6000
+}
+```
+
+Hermes temporarily disables provider VAD, clears any pending input, appends the
+PCM through its authoritative sideband, commits it, and restores the configured
+VAD before acknowledging. The normal transcript, persistence, tools, and
+response path then handles that provider item.
+
+Do not upload a partial utterance and immediately continue it over WebRTC:
+cross-transport ordering cannot make that one coherent VAD turn. Do not run a
+wake-word `AudioRecord` and a second WebRTC-owned `AudioRecord` concurrently;
+either share a custom audio device or release local capture before enabling the
+WebRTC source. On an ambiguous timeout or provider error, keep the microphone
+inactive and renew/recreate the provider call rather than submitting the audio
+under a new idempotency key.
 
 #### 2. Attach the control WebSocket
 
@@ -262,6 +328,7 @@ usage, and recovery UI. Important event families include:
 |--------|-----------------|
 | `session.state`, `session.reconnected`, `session.rotated` | Update connection/lifecycle UI; `session.state` carries closing and closed states |
 | `vad.speech_started`, `vad.speech_stopped` | Show microphone/turn state |
+| `audio.preroll_started`, `audio.preroll_committed` | Keep the initial WebRTC microphone inactive until the upload is committed |
 | `turn.input_committed`, `turn.steered`, `turn.completed` | Reconcile logical voice-turn state without rendering assistant text |
 | `tool.started`, `tool.completed` | Render tool activity; arguments are reduced to key names |
 | `approval.request`, `approval.resolved` | Show and resolve a privileged-action decision |
@@ -406,9 +473,10 @@ The HTTP route returns `204` after finalizing local resources.
 - The standard OpenAI API key never appears in the Android-facing SDP response
   or control stream. Hermes derives the OpenAI safety identifier from its
   authenticated server/profile scope.
-- Raw microphone audio is not persisted by Hermes by default. Canonical
-  history stores finalized transcripts, function calls/results, interruption
-  metadata, and usage.
+- Raw microphone audio is not persisted by Hermes by default. A pre-roll body
+  passes through process memory to the provider sideband and is discarded;
+  canonical history stores finalized transcripts, function calls/results,
+  interruption metadata, and usage.
 - If transcription fails or times out, Hermes stores an explicit unavailable
   marker and emits a warning; it does not invent text or block indefinitely.
 - Tool argument values and provider errors are redacted before control-plane

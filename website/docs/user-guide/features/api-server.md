@@ -324,6 +324,7 @@ All routes use the normal API-server bearer authentication.
 |--------|------|---------|
 | `POST` | `/v1/realtime/sessions` | Exchange an Android SDP offer for the OpenAI SDP answer and create or resume a logical Hermes session |
 | `GET` | `/v1/realtime/sessions/{id}/control?after={sequence}` | Upgrade to the sequenced structured-control WebSocket |
+| `POST` | `/v1/realtime/sessions/{id}/audio/preroll` | Commit one complete first utterance buffered locally during wake-word/session startup |
 | `POST` | `/v1/realtime/sessions/{id}/approval` | HTTP fallback for an approval decision |
 | `POST` | `/v1/realtime/sessions/{id}/renew` | Exchange a fresh SDP offer while preserving the logical session |
 | `DELETE` | `/v1/realtime/sessions/{id}` | Close media and sideband resources and finalize the session |
@@ -348,6 +349,7 @@ The response is JSON:
   "model": "gpt-realtime",
   "voice": "marin",
   "control_url": "/v1/realtime/sessions/rt_.../control",
+  "preroll_url": "/v1/realtime/sessions/rt_.../audio/preroll",
   "renew_url": "/v1/realtime/sessions/rt_.../renew",
   "provider_call_max_seconds": 3300
 }
@@ -355,6 +357,36 @@ The response is JSON:
 
 The client sets `sdp` as its WebRTC remote description. Neither this response
 nor any control event contains the standard OpenAI API key.
+
+### Wake-word startup without dropped speech
+
+An always-open provider call is not required. Keep wake detection and a rolling
+PCM buffer entirely on the Android device, then use `preroll_url` for the first
+utterance:
+
+1. One local `AudioRecord` feeds both the wake detector and a 4-6 second ring
+   buffer.
+2. After detection, start SDP negotiation and continue the same local capture
+   through **local end-of-speech**.
+3. Keep the WebRTC microphone sender inactive. Stop/release the local capture
+   source after the command ends.
+4. Upload the complete utterance as `audio/pcm;rate=24000;channels=1;format=s16le`
+   with a unique `Idempotency-Key`.
+5. Enable the normal WebRTC microphone only after the endpoint returns
+   `status: committed`.
+
+Hermes temporarily disables provider VAD, clears the provider input buffer,
+appends and commits the PCM through its server-owned sideband, then restores
+the configured VAD before replying. The resulting item follows the same
+transcription, persistence, tool, memory, and response path as live WebRTC
+speech.
+
+The upload must be a complete first utterance. Do not send an unfinished prefix
+and continue it over RTP: the two transports cannot guarantee one coherent VAD
+turn. Avoid two simultaneous Android `AudioRecord` owners; use one shared
+capture source or release wake-word capture before enabling WebRTC recording.
+If an upload times out, keep the microphone inactive and renew/recreate the
+provider call rather than resubmitting under a new key.
 
 ### Quick PC microphone test
 
@@ -777,6 +809,9 @@ Realtime behavior belongs in the top-level `realtime_voice` section of
 | `turn_detection.silence_duration_ms` | `500` | Silence required to commit a turn |
 | `intermediate_speech.enabled` | `true` | Allow brief out-of-band spoken status during a long tool wait |
 | `intermediate_speech.delay_seconds` | `2.5` | Delay before eligible status speech |
+| `preroll.enabled` | `true` | Accept a complete wake-word startup utterance through the authenticated sideband bridge |
+| `preroll.max_seconds` | `30` | Maximum PCM duration accepted by one pre-roll upload |
+| `preroll.timeout_seconds` | `15` | Maximum provider-acknowledgment wait for the handoff |
 | `limits.max_active_sessions` | `4` | Concurrent logical Realtime sessions per profile |
 | `limits.provider_call_max_seconds` | `3300` | Proactive provider-call rotation age |
 | `limits.provider_call_max_input_tokens` | `24000` | Proactive input-context rotation threshold |
@@ -807,8 +842,10 @@ realtime_voice:
 `call_url` must accept OpenAI's multipart `sdp` and `session` fields and return
 the raw SDP answer with a `Location` call identifier. `sideband_url` must attach
 to that same call through a `call_id` query parameter and relay Realtime events
-without rewriting them. Existing query parameters are preserved when Hermes
-adds `call_id`.
+without rewriting them, including `session.update`,
+`input_audio_buffer.clear`, `input_audio_buffer.append`, and
+`input_audio_buffer.commit`. Existing query parameters are preserved when
+Hermes adds `call_id`.
 
 Hermes sends `OPENAI_API_KEY` as a bearer credential to both configured
 endpoints. Only configure trusted HTTPS/WSS services, and keep credentials out

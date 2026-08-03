@@ -406,6 +406,37 @@ class RealtimeSessionManager:
                 call_id=call.call_id,
             )
 
+    async def ingest_preroll_audio(
+        self,
+        session_id: str,
+        audio: bytes,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        session = await self.require_active(session_id)
+        try:
+            return await session.ingest_preroll_audio(
+                audio,
+                idempotency_key=idempotency_key,
+            )
+        except RealtimeProtocolError as exc:
+            if exc.code == "preroll_disabled":
+                status = 404
+            elif exc.code == "preroll_audio_too_large":
+                status = 413
+            elif exc.code in {
+                "session_busy",
+                "session_renewal_required",
+                "preroll_in_progress",
+                "preroll_idempotency_conflict",
+            }:
+                status = 409
+            elif exc.code == "preroll_provider_timeout":
+                status = 504
+            else:
+                status = 400
+            raise RealtimeSessionError(str(exc), code=exc.code, status=status) from exc
+
     async def close_session(
         self,
         session_id: str,

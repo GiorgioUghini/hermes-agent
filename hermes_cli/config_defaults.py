@@ -1518,6 +1518,13 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "delay_seconds": 2.5,
         },
+        # Lets a wake-word client submit one complete first utterance captured
+        # locally while its WebRTC call was being negotiated.
+        "preroll": {
+            "enabled": True,
+            "max_seconds": 30,
+            "timeout_seconds": 15,
+        },
         "limits": {
             "max_active_sessions": 4,
             "max_creations_per_minute": 10,
