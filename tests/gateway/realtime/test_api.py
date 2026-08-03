@@ -24,12 +24,30 @@ class _FakeSession:
     def __init__(self, session_id="voice_1"):
         self.session_id = session_id
         self.broker = ControlEventBroker(session_id)
+        self.state = "ready"
         self.closed = False
+        self.commands = []
+
+    def control_snapshot(self):
+        return {
+            "session": {"state": self.state},
+            "response": {},
+            "pending_controls": [],
+        }
 
     async def handle_control_command(self, command):
+        self.commands.append(command)
         if command["type"] == "session.ping":
             self.broker.publish(
                 "session.pong", {"request_id": command.get("request_id")}
+            )
+        elif command.get("request_id"):
+            self.broker.publish(
+                "control.ack",
+                {
+                    "request_id": command["request_id"],
+                    "command": command["type"],
+                },
             )
 
 
@@ -41,6 +59,7 @@ class _FakeManager:
         self.created_offer = ""
         self.preroll_audio = b""
         self.preroll_idempotency_key = ""
+        self.suspended_session_id = ""
 
     async def create_session(self, offer_sdp, requested_session_id=None):
         self.created_offer = offer_sdp
@@ -80,6 +99,13 @@ class _FakeManager:
         self.session.closed = True
         return True
 
+    async def suspend_session(self, session_id, reason="client_suspended"):
+        if session_id != self.session.session_id:
+            return False
+        self.suspended_session_id = session_id
+        self.session.closed = True
+        return True
+
 
 def _adapter_and_app():
     adapter = APIServerAdapter(
@@ -103,6 +129,10 @@ def _adapter_and_app():
     app.router.add_post(
         "/v1/realtime/sessions/{session_id}/audio/preroll",
         adapter._handle_realtime_preroll,
+    )
+    app.router.add_post(
+        "/v1/realtime/sessions/{session_id}/suspend",
+        adapter._handle_realtime_session_suspend,
     )
     app.router.add_delete(
         "/v1/realtime/sessions/{session_id}",
@@ -140,9 +170,8 @@ async def test_create_returns_sdp_metadata_without_standard_openai_key():
     assert payload["call_id"] == "call_1"
     assert payload["model"] == "gpt-realtime"
     assert payload["voice"] == "marin"
-    assert payload["preroll_url"] == (
-        "/v1/realtime/sessions/voice_1/audio/preroll"
-    )
+    assert payload["preroll_url"] == ("/v1/realtime/sessions/voice_1/audio/preroll")
+    assert payload["suspend_url"] == "/v1/realtime/sessions/voice_1/suspend"
     assert manager.created_offer.startswith("v=0")
     assert "sk-openai-server-only" not in str(payload)
 
@@ -226,6 +255,24 @@ async def test_preroll_rejects_ambiguous_audio_contract(
 
 
 @pytest.mark.asyncio
+async def test_suspend_preserves_logical_session_for_later_renewal():
+    adapter, manager, app = _adapter_and_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/v1/realtime/sessions/voice_1/suspend",
+            headers=_authorization(adapter),
+        )
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert response.status == 204
+    assert manager.suspended_session_id == "voice_1"
+
+
+@pytest.mark.asyncio
 async def test_create_rejects_client_model_override():
     adapter, _manager, app = _adapter_and_app()
     client = TestClient(TestServer(app))
@@ -260,14 +307,12 @@ async def test_control_socket_replays_state_and_accepts_structured_ping():
             headers={"Authorization": "Bearer gateway-secret"},
         )
         replay = await socket.receive_json()
-        await socket.send_json(
-            {
-                "version": 1,
-                "type": "session.ping",
-                "request_id": "request_1",
-                "data": {},
-            }
-        )
+        await socket.send_json({
+            "version": 1,
+            "type": "session.ping",
+            "request_id": "request_1",
+            "data": {},
+        })
         pong = await socket.receive_json()
         await socket.close()
     finally:
@@ -277,6 +322,116 @@ async def test_control_socket_replays_state_and_accepts_structured_ping():
     assert replay["type"] == "session.state"
     assert pong["type"] == "session.pong"
     assert pong["data"]["request_id"] == "request_1"
+
+
+@pytest.mark.asyncio
+async def test_control_socket_accepts_structured_response_interrupt():
+    adapter, manager, app = _adapter_and_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        socket = await client.ws_connect(
+            "/v1/realtime/sessions/voice_1/control",
+            headers=_authorization(adapter),
+        )
+        await socket.send_json({
+            "version": 1,
+            "type": "response.interrupt",
+            "request_id": "wake-2",
+            "data": {"audio_end_ms": 875},
+        })
+        ack = await socket.receive_json()
+        await socket.close()
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert ack["type"] == "control.ack"
+    assert manager.session.commands[-1]["type"] == "response.interrupt"
+    assert manager.session.commands[-1]["data"] == {"audio_end_ms": 875}
+
+
+@pytest.mark.asyncio
+async def test_control_socket_resets_cursor_when_stream_epoch_changes():
+    adapter, manager, app = _adapter_and_app()
+    sequence_before = manager.session.broker.latest_sequence
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        socket = await client.ws_connect(
+            (
+                "/v1/realtime/sessions/voice_1/control"
+                "?after=99&stream_id=previous-stream"
+            ),
+            headers=_authorization(adapter),
+        )
+        resync = await socket.receive_json()
+        await socket.close()
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert resync["type"] == "control.resync_required"
+    assert resync["data"]["reason"] == "stream_changed"
+    assert resync["stream_id"] == manager.session.broker.stream_id
+    assert resync["data"]["snapshot"]["session"]["state"] == "ready"
+    assert manager.session.broker.latest_sequence == sequence_before
+
+
+@pytest.mark.asyncio
+async def test_control_socket_closes_when_provider_session_is_suspended():
+    adapter, manager, app = _adapter_and_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        socket = await client.ws_connect(
+            "/v1/realtime/sessions/voice_1/control",
+            headers=_authorization(adapter),
+        )
+        manager.session.broker.publish(
+            "session.suspended",
+            {"reason": "client_suspended"},
+        )
+        suspended = await socket.receive_json()
+        closed = await socket.receive(timeout=1)
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert suspended["type"] == "session.suspended"
+    assert closed.type in {
+        web.WSMsgType.CLOSE,
+        web.WSMsgType.CLOSED,
+        web.WSMsgType.CLOSING,
+    }
+
+
+@pytest.mark.asyncio
+async def test_control_socket_closes_when_suspension_is_replayed():
+    adapter, manager, app = _adapter_and_app()
+    manager.session.broker.publish(
+        "session.suspended",
+        {"reason": "client_suspended"},
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        socket = await client.ws_connect(
+            "/v1/realtime/sessions/voice_1/control",
+            headers=_authorization(adapter),
+        )
+        suspended = await socket.receive_json()
+        closed = await socket.receive(timeout=1)
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert suspended["type"] == "session.suspended"
+    assert closed.type in {
+        web.WSMsgType.CLOSE,
+        web.WSMsgType.CLOSED,
+        web.WSMsgType.CLOSING,
+    }
 
 
 @pytest.mark.asyncio
@@ -300,6 +455,11 @@ async def test_capabilities_report_transport_and_authorization_semantics():
     assert details["structured_approvals"] is True
     assert details["voice_authorization"] is False
     assert details["barge_in"]["cancels_started_tools"] is False
+    assert details["barge_in"]["control_command"] == "response.interrupt"
+    assert details["barge_in"]["supports_post_generation_interrupt"] is True
+    assert details["playback_completion_command"] == "response.playback_completed"
+    assert details["turn_completed_after_playback"] is True
+    assert details["idle_provider_suspension"] is True
     assert details["wake_word_preroll"] == {
         "available": True,
         "complete_utterance_required": True,
@@ -310,6 +470,7 @@ async def test_capabilities_report_transport_and_authorization_semantics():
         "sample_width_bytes": 2,
         "max_seconds": 30,
         "requires_idempotency_key": True,
+        "reusable_per_provider_call": True,
         "webrtc_handoff": "unmute_after_committed",
     }
 
@@ -360,28 +521,24 @@ async def test_api_real_manager_round_trip_with_fake_openai_peers(tmp_path):
                 provider["events"].append(event)
                 await provider_events.put(event)
                 if event["type"] == "session.update":
-                    await socket.send_json(
-                        {"type": "session.updated", "session": event["session"]}
-                    )
+                    await socket.send_json({
+                        "type": "session.updated",
+                        "session": event["session"],
+                    })
                 elif event["type"] == "input_audio_buffer.clear":
                     await socket.send_json({"type": "input_audio_buffer.cleared"})
                 elif event["type"] == "input_audio_buffer.commit":
-                    await socket.send_json(
-                        {
-                            "type": "input_audio_buffer.committed",
-                            "item_id": "input_integration",
-                        }
-                    )
-                    await socket.send_json(
-                        {
-                            "type": (
-                                "conversation.item."
-                                "input_audio_transcription.completed"
-                            ),
-                            "item_id": "input_integration",
-                            "transcript": "Say hello.",
-                        }
-                    )
+                    await socket.send_json({
+                        "type": "input_audio_buffer.committed",
+                        "item_id": "input_integration",
+                    })
+                    await socket.send_json({
+                        "type": (
+                            "conversation.item.input_audio_transcription.completed"
+                        ),
+                        "item_id": "input_integration",
+                        "transcript": "Say hello.",
+                    })
         return socket
 
     provider_app = web.Application()
@@ -462,9 +619,7 @@ async def test_api_real_manager_round_trip_with_fake_openai_peers(tmp_path):
     )
     client = TestClient(TestServer(api_app))
     await client.start_server()
-    authorization = {
-        "Authorization": f"Bearer {adapter._expected_api_key()}"
-    }
+    authorization = {"Authorization": f"Bearer {adapter._expected_api_key()}"}
     control = None
     try:
         response = await client.post(
@@ -485,9 +640,10 @@ async def test_api_real_manager_round_trip_with_fake_openai_peers(tmp_path):
         session_config = provider["session"]
         assert REALTIME_SYSTEM_GUIDANCE.strip() in session_config["instructions"]
         assert "skill_view" in {tool["name"] for tool in session_config["tools"]}
-        assert session_config["audio"]["input"]["turn_detection"][
-            "create_response"
-        ] is False
+        assert (
+            session_config["audio"]["input"]["turn_detection"]["create_response"]
+            is False
+        )
         assert provider["call_id"] == "call_integration"
 
         control = await client.ws_connect(
@@ -510,12 +666,12 @@ async def test_api_real_manager_round_trip_with_fake_openai_peers(tmp_path):
         assert preroll_payload["item_id"] == "input_integration"
 
         pre_response_events = provider["events"]
-        assert pre_response_events[0]["session"]["audio"]["input"][
-            "turn_detection"
-        ] is None
+        assert (
+            pre_response_events[0]["session"]["audio"]["input"]["turn_detection"]
+            is None
+        )
         assert any(
-            event["type"] == "input_audio_buffer.clear"
-            for event in pre_response_events
+            event["type"] == "input_audio_buffer.clear" for event in pre_response_events
         )
         appended = b"".join(
             base64.b64decode(event["audio"])
@@ -533,28 +689,22 @@ async def test_api_real_manager_round_trip_with_fake_openai_peers(tmp_path):
             == config.turn_detection_config()
             for event in pre_response_events
         )
-        response_create = await _receive_matching(
-            provider_events, "response.create"
-        )
+        response_create = await _receive_matching(provider_events, "response.create")
         assert response_create["response"].get("conversation", "auto") == "auto"
 
-        await provider["socket"].send_json(
-            {
-                "type": "response.output_audio_transcript.done",
-                "response_id": "response_integration",
-                "transcript": "Hello from the voice agent.",
-            }
-        )
-        await provider["socket"].send_json(
-            {
-                "type": "response.done",
-                "response": {
-                    "id": "response_integration",
-                    "status": "completed",
-                    "output": [],
-                },
-            }
-        )
+        await provider["socket"].send_json({
+            "type": "response.output_audio_transcript.done",
+            "response_id": "response_integration",
+            "transcript": "Hello from the voice agent.",
+        })
+        await provider["socket"].send_json({
+            "type": "response.done",
+            "response": {
+                "id": "response_integration",
+                "status": "completed",
+                "output": [],
+            },
+        })
         completed = await _receive_control_matching(control, "turn.completed")
         assert completed["data"]["provider_response_id"] == "response_integration"
 

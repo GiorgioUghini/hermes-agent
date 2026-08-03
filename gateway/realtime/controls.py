@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Mapping
+import uuid
 
 from gateway.realtime.protocol import control_event
 
@@ -28,6 +29,7 @@ class ControlEventBroker:
         subscriber_queue_events: int = 128,
     ):
         self.session_id = session_id
+        self.stream_id = uuid.uuid4().hex
         self._events: Deque[dict[str, Any]] = deque(maxlen=max(1, buffer_events))
         self._queue_size = max(1, subscriber_queue_events)
         self._subscribers: set[asyncio.Queue] = set()
@@ -46,6 +48,7 @@ class ControlEventBroker:
         event = control_event(
             sequence=self._sequence,
             session_id=self.session_id,
+            stream_id=self.stream_id,
             event_type=event_type,
             data=data,
         )

@@ -56,6 +56,18 @@ class _FakeCallClient:
         return self._calls.pop(0)
 
 
+class _BlockingCallClient:
+    def __init__(self, call):
+        self.call = call
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def create_call(self, _offer_sdp, _session_config):
+        self.started.set()
+        await self.release.wait()
+        return self.call
+
+
 def _manager(db, *, call_client=None):
     sidebands = []
 
@@ -91,17 +103,15 @@ def _manager(db, *, call_client=None):
 
 
 def test_manager_wires_configured_provider_endpoints(db):
-    config = RealtimeVoiceConfig.from_config(
-        {
-            "realtime_voice": {
-                "enabled": True,
-                "transport": {
-                    "call_url": "https://proxy.example/v1/realtime/calls",
-                    "sideband_url": "wss://proxy.example/v1/realtime",
-                },
-            }
+    config = RealtimeVoiceConfig.from_config({
+        "realtime_voice": {
+            "enabled": True,
+            "transport": {
+                "call_url": "https://proxy.example/v1/realtime/calls",
+                "sideband_url": "wss://proxy.example/v1/realtime",
+            },
         }
-    )
+    })
     manager = RealtimeSessionManager(
         config=config,
         api_key="proxy-key",
@@ -113,7 +123,17 @@ def test_manager_wires_configured_provider_endpoints(db):
     assert sideband._websocket_url == config.sideband_url
 
 
-def _persist_call(db, *, state="ready", started_at=None):
+def _persist_call(db, *, state="ready", started_at=None, frozen_tools=None):
+    if frozen_tools is None:
+        frozen_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "frozen_tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
     db.save_realtime_session_state(
         "voice-recovery",
         provider_call_id="call_original",
@@ -122,15 +142,7 @@ def _persist_call(db, *, state="ready", started_at=None):
         model="gpt-realtime-snapshot",
         voice="cedar",
         frozen_instructions="original frozen prompt",
-        frozen_tools=[
-            {
-                "type": "function",
-                "function": {
-                    "name": "frozen_tool",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ],
+        frozen_tools=frozen_tools,
     )
 
 
@@ -237,6 +249,93 @@ async def test_persisted_renewal_reuses_prompt_tools_and_replays_tool_chain(db):
         assert output["item"]["call_id"] == "tool_call_1"
         assert "latest" in output["item"]["output"]
     finally:
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_persisted_renewal_preserves_empty_frozen_tool_snapshot(db):
+    _persist_call(db, state="suspended", frozen_tools=[])
+    call_client = _FakeCallClient(
+        RealtimeCall(answer_sdp="answer", call_id="call_without_tools")
+    )
+    manager, _sidebands = _manager(db, call_client=call_client)
+    try:
+        created = await manager.renew_session("voice-recovery", "offer")
+
+        assert created.session.frozen_tools == []
+        assert call_client.requests[0][1]["tools"] == []
+    finally:
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_suspend_closes_provider_call_and_later_renew_preserves_session(db):
+    _persist_call(db)
+    call_client = _FakeCallClient(
+        RealtimeCall(answer_sdp="answer", call_id="call_after_suspend")
+    )
+    manager, sidebands = _manager(db, call_client=call_client)
+    try:
+        session = await manager.require_active("voice-recovery")
+        assert await manager.suspend_session("voice-recovery") is True
+
+        assert manager.get("voice-recovery") is None
+        assert session.closed is True
+        assert sidebands[0].closed is True
+        assert db.get_realtime_session_state("voice-recovery")["state"] == "suspended"
+
+        renewed = await manager.renew_session("voice-recovery", "new-offer")
+        assert renewed.call_id == "call_after_suspend"
+        assert renewed.session.frozen_instructions == "original frozen prompt"
+        assert renewed.session.config.voice == "cedar"
+        assert db.get_realtime_session_state("voice-recovery")["state"] == "ready"
+    finally:
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_suspend_rejects_live_session_before_turn_settles(db):
+    _persist_call(db)
+    manager, _sidebands = _manager(db)
+    session = await manager.require_active("voice-recovery")
+    session._turn = object()
+    try:
+        with pytest.raises(RealtimeSessionError) as caught:
+            await manager.suspend_session("voice-recovery")
+        assert caught.value.code == "session_busy"
+        assert manager.get("voice-recovery") is session
+    finally:
+        session._turn = None
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_suspend_serializes_with_in_progress_provider_renewal(db):
+    _persist_call(db)
+    call_client = _BlockingCallClient(
+        RealtimeCall(answer_sdp="answer", call_id="call_racing_renew")
+    )
+    manager, sidebands = _manager(db, call_client=call_client)
+    try:
+        await manager.require_active("voice-recovery")
+        renew_task = asyncio.create_task(
+            manager.renew_session("voice-recovery", "new-offer")
+        )
+        await call_client.started.wait()
+        suspend_task = asyncio.create_task(manager.suspend_session("voice-recovery"))
+        await asyncio.sleep(0)
+        assert suspend_task.done() is False
+
+        call_client.release.set()
+        renewed = await renew_task
+        assert renewed.call_id == "call_racing_renew"
+        assert await suspend_task is True
+
+        assert manager.get("voice-recovery") is None
+        assert db.get_realtime_session_state("voice-recovery")["state"] == "suspended"
+        assert all(sideband.closed for sideband in sidebands)
+    finally:
+        call_client.release.set()
         await manager.close_all()
 
 

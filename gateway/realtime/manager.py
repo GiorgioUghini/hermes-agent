@@ -8,20 +8,31 @@ from dataclasses import dataclass, replace
 import logging
 import re
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 import uuid
 
 from gateway.realtime.openai_sideband import (
     OpenAIRealtimeCallClient,
     OpenAIRealtimeSideband,
 )
-from gateway.realtime.protocol import RealtimeCall, RealtimeProtocolError, RealtimeVoiceConfig
+from gateway.realtime.protocol import (
+    RealtimeCall,
+    RealtimeProtocolError,
+    RealtimeVoiceConfig,
+)
 from gateway.realtime.session import RealtimeVoiceSession, prepare_realtime_agent
 
 
 logger = logging.getLogger(__name__)
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
+
+
+def _normalize_frozen_tools(value: Any, fallback: Any = None) -> list[dict[str, Any]]:
+    candidate = value if isinstance(value, list) else fallback
+    if not isinstance(candidate, list):
+        return []
+    return [dict(tool) for tool in candidate if isinstance(tool, Mapping)]
 
 
 class RealtimeSessionError(RuntimeError):
@@ -104,9 +115,7 @@ class RealtimeSessionManager:
             )
         return session
 
-    def _logical_config(
-        self, record: Optional[dict[str, Any]]
-    ) -> RealtimeVoiceConfig:
+    def _logical_config(self, record: Optional[dict[str, Any]]) -> RealtimeVoiceConfig:
         """Keep model and voice stable across restart and provider-call rotation."""
 
         if not record:
@@ -150,9 +159,7 @@ class RealtimeSessionManager:
         )
         return agent, history, frozen_instructions, record
 
-    async def _recover_active_session(
-        self, session_id: str
-    ) -> RealtimeVoiceSession:
+    async def _recover_active_session(self, session_id: str) -> RealtimeVoiceSession:
         agent, history, frozen_instructions, record = await self._prepare_agent(
             session_id
         )
@@ -195,7 +202,10 @@ class RealtimeSessionManager:
             agent=agent,
             config=logical_config,
             frozen_instructions=frozen_instructions,
-            frozen_tools=record.get("frozen_tools") or agent.tools or [],
+            frozen_tools=_normalize_frozen_tools(
+                record.get("frozen_tools"),
+                agent.tools,
+            ),
             conversation_history=history,
             sideband=sideband,
             call_id=call_id,
@@ -235,13 +245,15 @@ class RealtimeSessionManager:
                     status=409,
                 )
 
-            agent, history, frozen_instructions, prior_state = (
-                await self._prepare_agent(session_id)
-            )
-            frozen_tools = (
-                prior_state.get("frozen_tools")
-                if prior_state and prior_state.get("frozen_tools")
-                else agent.tools or []
+            (
+                agent,
+                history,
+                frozen_instructions,
+                prior_state,
+            ) = await self._prepare_agent(session_id)
+            frozen_tools = _normalize_frozen_tools(
+                prior_state.get("frozen_tools") if prior_state else None,
+                agent.tools,
             )
             logical_config = self._logical_config(prior_state)
             agent.model = logical_config.model
@@ -289,33 +301,41 @@ class RealtimeSessionManager:
         session_id: str,
         offer_sdp: str,
     ) -> CreatedRealtimeSession:
-        session = self.get(session_id)
-        if session is None:
-            return await self._renew_persisted_session(session_id, offer_sdp)
-        if not session.can_renew:
-            raise RealtimeSessionError(
-                "Realtime session is busy; wait for the current turn to settle",
-                code="session_busy",
-                status=409,
-            )
-        call = await self._call_client.create_call(
-            offer_sdp, session.session_config()
-        )
-        sideband = self._sideband_factory(
-            call.call_id, session.handle_provider_event
-        )
-        try:
-            await session.replace_sideband(sideband=sideband, call_id=call.call_id)
-        except RealtimeProtocolError as exc:
-            await sideband.close()
-            raise RealtimeSessionError(
-                str(exc), code=exc.code, status=409
-            ) from exc
-        return CreatedRealtimeSession(
-            session=session,
-            answer_sdp=call.answer_sdp,
-            call_id=call.call_id,
-        )
+        async with self._lock:
+            session = self.get(session_id)
+            if session is not None:
+                if not session.can_renew:
+                    raise RealtimeSessionError(
+                        "Realtime session is busy; wait for the current turn to settle",
+                        code="session_busy",
+                        status=409,
+                    )
+                call = await self._call_client.create_call(
+                    offer_sdp,
+                    session.session_config(),
+                )
+                sideband = self._sideband_factory(
+                    call.call_id,
+                    session.handle_provider_event,
+                )
+                try:
+                    await session.replace_sideband(
+                        sideband=sideband,
+                        call_id=call.call_id,
+                    )
+                except RealtimeProtocolError as exc:
+                    await sideband.close()
+                    raise RealtimeSessionError(
+                        str(exc),
+                        code=exc.code,
+                        status=409,
+                    ) from exc
+                return CreatedRealtimeSession(
+                    session=session,
+                    answer_sdp=call.answer_sdp,
+                    call_id=call.call_id,
+                )
+        return await self._renew_persisted_session(session_id, offer_sdp)
 
     async def _renew_persisted_session(
         self,
@@ -339,9 +359,7 @@ class RealtimeSessionManager:
                 sideband = self._sideband_factory(
                     call.call_id, existing.handle_provider_event
                 )
-                await existing.replace_sideband(
-                    sideband=sideband, call_id=call.call_id
-                )
+                await existing.replace_sideband(sideband=sideband, call_id=call.call_id)
                 return CreatedRealtimeSession(
                     session=existing,
                     answer_sdp=call.answer_sdp,
@@ -356,8 +374,8 @@ class RealtimeSessionManager:
                     status=429,
                 )
             session_id = self._normalize_session_id(session_id)
-            agent, history, frozen_instructions, record = (
-                await self._prepare_agent(session_id)
+            agent, history, frozen_instructions, record = await self._prepare_agent(
+                session_id
             )
             if not record:
                 raise RealtimeSessionError(
@@ -365,7 +383,10 @@ class RealtimeSessionManager:
                     code="session_not_found",
                     status=404,
                 )
-            frozen_tools = record.get("frozen_tools") or agent.tools or []
+            frozen_tools = _normalize_frozen_tools(
+                record.get("frozen_tools"),
+                agent.tools,
+            )
             logical_config = self._logical_config(record)
             agent.model = logical_config.model
             session_config = logical_config.openai_session(
@@ -443,6 +464,15 @@ class RealtimeSessionManager:
         *,
         reason: str = "client_closed",
     ) -> bool:
+        async with self._lock:
+            return await self._close_session_locked(session_id, reason=reason)
+
+    async def _close_session_locked(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> bool:
         session = self._sessions.pop(session_id, None)
         if session is not None:
             await session.close(reason=reason, end_session=True)
@@ -457,6 +487,71 @@ class RealtimeSessionManager:
             return False
         await asyncio.to_thread(db.delete_realtime_session_state, session_id)
         await asyncio.to_thread(db.end_session, session_id, reason)
+        return True
+
+    async def suspend_session(
+        self,
+        session_id: str,
+        *,
+        reason: str = "client_suspended",
+    ) -> bool:
+        """Close the provider call while retaining logical Hermes history."""
+
+        async with self._lock:
+            return await self._suspend_session_locked(session_id, reason=reason)
+
+    async def _suspend_session_locked(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> bool:
+        session = self.get(session_id)
+        if session is None:
+            agent = await asyncio.to_thread(self._agent_factory, session_id)
+            db = getattr(agent, "_session_db", None)
+            if db is None:
+                return False
+            record = await asyncio.to_thread(
+                db.get_realtime_session_state,
+                session_id,
+            )
+            if record is None:
+                return False
+            if record.get("state") != "suspended":
+                await asyncio.to_thread(
+                    db.save_realtime_session_state,
+                    session_id,
+                    provider_call_id=str(record.get("provider_call_id") or ""),
+                    provider_call_started_at=float(
+                        record.get("provider_call_started_at") or 0
+                    ),
+                    state="suspended",
+                    model=str(record.get("model") or ""),
+                    voice=str(record.get("voice") or ""),
+                    frozen_instructions=str(record.get("frozen_instructions") or ""),
+                    frozen_tools=_normalize_frozen_tools(
+                        record.get("frozen_tools"),
+                    ),
+                )
+            return True
+
+        if not session.can_suspend:
+            raise RealtimeSessionError(
+                "Realtime session is busy; wait for the current turn to settle",
+                code="session_busy",
+                status=409,
+            )
+        try:
+            await session.suspend(reason=reason)
+        except RealtimeProtocolError as exc:
+            raise RealtimeSessionError(
+                str(exc),
+                code=exc.code,
+                status=409,
+            ) from exc
+        if self._sessions.get(session_id) is session:
+            self._sessions.pop(session_id, None)
         return True
 
     async def close_all(self, *, reason: str = "gateway_shutdown") -> None:
