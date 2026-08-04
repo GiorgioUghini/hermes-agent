@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import logging
+from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from gateway.realtime.protocol import (
     PREROLL_SAMPLE_RATE_HZ,
     PREROLL_SAMPLE_WIDTH_BYTES,
     SESSION_STATES,
+    conversation_item_truncate_event,
     conversation_function_call_event,
     conversation_message_event,
     function_call_output_event,
@@ -38,6 +40,8 @@ from gateway.realtime.protocol import (
     input_audio_buffer_append_event,
     input_audio_buffer_clear_event,
     input_audio_buffer_commit_event,
+    output_audio_buffer_clear_event,
+    response_cancel_event,
     response_create_event,
     response_transcript,
     session_turn_detection_update_event,
@@ -46,6 +50,17 @@ from gateway.realtime.protocol import (
 
 
 logger = logging.getLogger(__name__)
+
+PLAYBACK_COMPLETION_GRACE_SECONDS = 2.0
+_REVIEW_PROCESS_LOCKS_GUARD = threading.Lock()
+_REVIEW_PROCESS_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+
+
+def _review_process_lock(db: Any, session_id: str) -> threading.Lock:
+    raw_path = getattr(db, "db_path", "")
+    key = (str(Path(raw_path).resolve()) if raw_path else "", session_id)
+    with _REVIEW_PROCESS_LOCKS_GUARD:
+        return _REVIEW_PROCESS_LOCKS.setdefault(key, threading.Lock())
 
 
 REALTIME_SYSTEM_GUIDANCE = """\
@@ -63,6 +78,7 @@ class _PendingPrompt:
     prompt_id: str
     kind: str
     event: threading.Event
+    data: dict[str, Any]
     response: Optional[str] = None
 
 
@@ -89,6 +105,13 @@ class _PrerollWaiter:
     event_type: str
     future: asyncio.Future
     matches: Optional[Callable[[Mapping[str, Any]], bool]] = None
+
+
+@dataclass(frozen=True)
+class _PendingTerminalResponse:
+    response_id: str
+    transcript: str
+    failed: bool
 
 
 def prepare_realtime_agent(
@@ -209,7 +232,9 @@ class RealtimeVoiceSession:
         self._turn: Optional[TurnContext] = None
         self._turn_response_count = 0
         self._pending_next_inputs: deque[tuple[str, str]] = deque()
-        self._response_calls: dict[str, dict[str, RealtimeFunctionCall]] = defaultdict(dict)
+        self._response_calls: dict[str, dict[str, RealtimeFunctionCall]] = defaultdict(
+            dict
+        )
         self._response_transcripts: dict[str, str] = {}
         self._processed_responses: set[str] = set()
         self._processed_calls: set[str] = set()
@@ -218,25 +243,50 @@ class RealtimeVoiceSession:
         self._status_response_active = False
         self._status_response_requested = False
         self._status_response_ids: set[str] = set()
+        self._active_status_response_id = ""
         self._status_watchdog_task: Optional[asyncio.Task] = None
         self._continuation_pending = False
+        self._active_response_id = ""
+        self._generation_active_response_ids: set[str] = set()
+        self._active_audio_item_id = ""
+        self._active_output_audio_response_id = ""
+        self._playback_started_response_ids: set[str] = set()
+        self._output_drained_response_ids: set[str] = set()
+        self._client_playback_completed_response_ids: set[str] = set()
+        self._pending_terminal_response: Optional[_PendingTerminalResponse] = None
+        self._playback_finalize_task: Optional[asyncio.Task] = None
+        self._playback_completion_requests: OrderedDict[str, dict[str, Any]] = (
+            OrderedDict()
+        )
+        self._client_interrupt_pending = False
+        self._pending_interrupt_audio_end_ms: Optional[int] = None
+        self._interrupted_response_ids: set[str] = set()
+        self._interrupt_cancels_sent: set[str] = set()
+        self._interrupt_truncations_sent: set[str] = set()
+        self._interrupt_output_clears_sent: set[str] = set()
+        self._interrupt_requests: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._interrupt_lock = asyncio.Lock()
+        self._interrupt_handoff_task: Optional[asyncio.Task] = None
         self._transcript_wait_tasks: dict[str, asyncio.Task] = {}
         self._handled_input_items: set[str] = set()
+        self._provider_input_active = False
         self._provider_input_tokens = 0
         self._rotation_notified = False
         self._barge_in_during_response = False
         self._skip_current_tool_batch = False
+        self._finalizing_turn = False
         self._closing = False
         self._closed = False
         self._logical_end = False
         self._close_lock = asyncio.Lock()
         self._pending_approvals: deque[str] = deque()
+        self._pending_approval_events: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._pending_prompts: dict[str, _PendingPrompt] = {}
         self._pending_prompts_lock = threading.Lock()
         self._review_lock = threading.Lock()
-        self._review_pending: Optional[
-            tuple[int, list[dict[str, Any]], bool, bool]
-        ] = None
+        self._review_pending: Optional[tuple[int, list[dict[str, Any]], bool, bool]] = (
+            None
+        )
         self._review_running = False
         self._review_thread: Optional[threading.Thread] = None
 
@@ -249,11 +299,23 @@ class RealtimeVoiceSession:
         return (
             not self._closed
             and not self._closing
+            and not self._finalizing_turn
             and not self._preroll_active
+            and not self._provider_input_active
+            and not any(
+                not task.done() for task in self._transcript_wait_tasks.values()
+            )
+            and not self._pending_next_inputs
             and self._turn is None
             and (self._tool_task is None or self._tool_task.done())
             and not self._pending_approvals
         )
+
+    @property
+    def can_suspend(self) -> bool:
+        """Return whether provider resources can close at a durable boundary."""
+
+        return self.idle_timeout_eligible
 
     @property
     def idle_timeout_eligible(self) -> bool:
@@ -264,12 +326,65 @@ class RealtimeVoiceSession:
         return (
             not self._closed
             and not self._closing
+            and not self._finalizing_turn
             and not self._preroll_active
+            and not self._provider_input_active
+            and not any(
+                not task.done() for task in self._transcript_wait_tasks.values()
+            )
+            and not self._pending_next_inputs
             and self._turn is None
             and (self._tool_task is None or self._tool_task.done())
             and not self._pending_approvals
             and not has_pending_prompts
         )
+
+    def control_snapshot(self) -> dict[str, Any]:
+        """Return authoritative transient state for one reconnecting client."""
+
+        with self._pending_prompts_lock:
+            pending_prompts = [
+                {
+                    "type": f"{prompt.kind}.request",
+                    "data": dict(prompt.data),
+                }
+                for prompt in self._pending_prompts.values()
+            ]
+        pending_controls = [
+            {
+                "type": "approval.request",
+                "data": dict(payload),
+            }
+            for payload in self._pending_approval_events.values()
+        ]
+        pending_controls.extend(pending_prompts)
+        pending_terminal = self._pending_terminal_response
+        response_id = (
+            self._active_output_audio_response_id
+            or self._active_response_id
+            or self._active_status_response_id
+        )
+        return {
+            "session": {
+                "state": self.state,
+                "turn_active": self._turn is not None,
+                "tool_running": (
+                    self._tool_task is not None and not self._tool_task.done()
+                ),
+                "input_active": self._provider_input_active,
+            },
+            "response": {
+                "provider_response_id": response_id,
+                "output_playing": bool(self._active_output_audio_response_id),
+                "awaiting_playback_completion": pending_terminal is not None,
+                "provider_output_drained": bool(
+                    pending_terminal is not None
+                    and pending_terminal.response_id
+                    in self._output_drained_response_ids
+                ),
+            },
+            "pending_controls": pending_controls,
+        }
 
     def session_config(self) -> dict[str, Any]:
         return self.config.openai_session(
@@ -298,10 +413,7 @@ class RealtimeVoiceSession:
             )
         frame_bytes = PREROLL_CHANNELS * PREROLL_SAMPLE_WIDTH_BYTES
         minimum_bytes = (
-            PREROLL_SAMPLE_RATE_HZ
-            * frame_bytes
-            * PREROLL_MIN_MILLISECONDS
-            // 1000
+            PREROLL_SAMPLE_RATE_HZ * frame_bytes * PREROLL_MIN_MILLISECONDS // 1000
         )
         if len(audio) < minimum_bytes:
             raise RealtimeProtocolError(
@@ -445,6 +557,10 @@ class RealtimeVoiceSession:
             has_pending_prompts = bool(self._pending_prompts)
         async with self._event_lock:
             tool_running = self._tool_task is not None and not self._tool_task.done()
+            interrupted_handoff = self._client_interrupt_pending and self.state in {
+                "responding",
+                "tool_wait",
+            }
             if self._renewal_required:
                 raise RealtimeProtocolError(
                     "The provider call must be renewed before another pre-roll upload",
@@ -453,15 +569,22 @@ class RealtimeVoiceSession:
             if (
                 self._closing
                 or self._closed
-                or self.state != "ready"
-                or self._turn is not None
-                or tool_running
+                or self._finalizing_turn
+                or self._pending_next_inputs
+                or (self.state != "ready" and not interrupted_handoff)
+                or (self._turn is not None and not interrupted_handoff)
+                or (tool_running and not interrupted_handoff)
+                or self._provider_input_active
+                or any(not task.done() for task in self._transcript_wait_tasks.values())
                 or self._pending_approvals
                 or has_pending_prompts
                 or self._preroll_active
             ):
                 raise RealtimeProtocolError(
-                    "Realtime session is busy; pre-roll requires an idle session",
+                    (
+                        "Realtime session is busy; pre-roll requires an idle "
+                        "session or an accepted response interruption"
+                    ),
                     code="session_busy",
                 )
             self._preroll_active = True
@@ -470,11 +593,7 @@ class RealtimeVoiceSession:
         duration_ms = round(
             len(audio)
             * 1000
-            / (
-                PREROLL_SAMPLE_RATE_HZ
-                * PREROLL_CHANNELS
-                * PREROLL_SAMPLE_WIDTH_BYTES
-            )
+            / (PREROLL_SAMPLE_RATE_HZ * PREROLL_CHANNELS * PREROLL_SAMPLE_WIDTH_BYTES)
         )
         self.broker.publish(
             "audio.preroll_started",
@@ -579,9 +698,8 @@ class RealtimeVoiceSession:
     ) -> None:
         self._reset_preroll_provider_signals()
         self._preroll_error_future = asyncio.get_running_loop().create_future()
-        deadline = (
-            asyncio.get_running_loop().time()
-            + min(5.0, self.config.preroll_timeout_seconds)
+        deadline = asyncio.get_running_loop().time() + min(
+            5.0, self.config.preroll_timeout_seconds
         )
         if buffer_may_be_dirty:
             await self._send_preroll_and_wait(
@@ -791,9 +909,7 @@ class RealtimeVoiceSession:
         self.agent.tool_start_callback = self._tool_start_sync
         self.agent.tool_complete_callback = self._tool_complete_sync
         self.agent.clarify_callback = self._clarify_sync
-        self.agent._background_review_dispatch = (
-            self._schedule_background_review_sync
-        )
+        self.agent._background_review_dispatch = self._schedule_background_review_sync
 
     async def _persist_runtime_state(self, state: Optional[str] = None) -> None:
         db = getattr(self.agent, "_session_db", None)
@@ -868,13 +984,19 @@ class RealtimeVoiceSession:
         self._review_thread.start()
 
     def _drain_background_reviews(self) -> None:
-        from agent.background_review import spawn_background_review_thread
-
         db = getattr(self.agent, "_session_db", None)
         if db is None:
             with self._review_lock:
                 self._review_running = False
             return
+
+        with _review_process_lock(db, self.session_id):
+            self._drain_background_reviews_owned(db)
+
+    def _drain_background_reviews_owned(self, db: Any) -> None:
+        """Drain reviews while holding the process-wide logical-session lease."""
+
+        from agent.background_review import spawn_background_review_thread
 
         active_pending = None
         try:
@@ -890,8 +1012,28 @@ class RealtimeVoiceSession:
                 if not db.mark_realtime_review_running(
                     self.session_id, boundary_message_id=boundary
                 ):
-                    active_pending = None
-                    continue
+                    record = db.get_realtime_session_state(self.session_id)
+                    abandoned_running_review = bool(
+                        record
+                        and record.get("review_state") == "running"
+                        and record.get("review_boundary_message_id") == boundary
+                    )
+                    if abandoned_running_review:
+                        db.mark_realtime_review_due(
+                            self.session_id,
+                            boundary_message_id=boundary,
+                            review_memory=review_memory,
+                            review_skills=review_skills,
+                        )
+                    if (
+                        not abandoned_running_review
+                        or not db.mark_realtime_review_running(
+                            self.session_id,
+                            boundary_message_id=boundary,
+                        )
+                    ):
+                        active_pending = None
+                        continue
                 target, _prompt = spawn_background_review_thread(
                     self.agent,
                     snapshot,
@@ -900,15 +1042,26 @@ class RealtimeVoiceSession:
                 )
                 success = bool(target())
                 with self._review_lock:
+                    if not success and self._review_pending is not None:
+                        (
+                            newer_boundary,
+                            newer_snapshot,
+                            newer_memory,
+                            newer_skills,
+                        ) = self._review_pending
+                        self._review_pending = (
+                            newer_boundary,
+                            newer_snapshot,
+                            newer_memory or review_memory,
+                            newer_skills or review_skills,
+                        )
                     newer_pending = self._review_pending is not None
                 if not newer_pending:
                     db.finish_realtime_review(
                         self.session_id,
                         boundary_message_id=boundary,
                         success=success,
-                        error=None
-                        if success
-                        else "background review did not complete",
+                        error=None if success else "background review did not complete",
                     )
                 active_pending = None
         except Exception:
@@ -943,9 +1096,7 @@ class RealtimeVoiceSession:
         db = getattr(self.agent, "_session_db", None)
         if db is None:
             return
-        record = await asyncio.to_thread(
-            db.get_realtime_session_state, self.session_id
-        )
+        record = await asyncio.to_thread(db.get_realtime_session_state, self.session_id)
         if not record or record.get("review_state") not in {
             "due",
             "running",
@@ -965,11 +1116,46 @@ class RealtimeVoiceSession:
             return
         await asyncio.to_thread(
             self._run_in_session_context,
-            self._schedule_background_review_sync,
+            self._queue_recovered_review_sync,
+            boundary=boundary,
             messages_snapshot=snapshot,
             review_memory=bool(record.get("review_memory")),
             review_skills=bool(record.get("review_skills")),
+            mark_due=record.get("review_state") != "running",
         )
+
+    def _queue_recovered_review_sync(
+        self,
+        *,
+        boundary: int,
+        messages_snapshot: list[dict[str, Any]],
+        review_memory: bool,
+        review_skills: bool,
+        mark_due: bool,
+    ) -> None:
+        """Queue one exact durable boundary without widening its snapshot."""
+
+        if self._logical_end:
+            return
+        db = getattr(self.agent, "_session_db", None)
+        if db is None:
+            return
+        with self._review_lock:
+            if mark_due:
+                db.mark_realtime_review_due(
+                    self.session_id,
+                    boundary_message_id=boundary,
+                    review_memory=review_memory,
+                    review_skills=review_skills,
+                )
+            self._review_pending = (
+                boundary,
+                list(messages_snapshot),
+                bool(review_memory),
+                bool(review_skills),
+            )
+            if not self._review_running:
+                self._start_review_thread_locked()
 
     def _publish_threadsafe(self, event_type: str, data: Mapping[str, Any]) -> None:
         loop = self._loop
@@ -999,9 +1185,7 @@ class RealtimeVoiceSession:
         _display_args: Mapping[str, Any],
         _result: Any,
     ) -> None:
-        self._publish_threadsafe(
-            "tool.completed", {"call_id": call_id, "name": name}
-        )
+        self._publish_threadsafe("tool.completed", {"call_id": call_id, "name": name})
 
     def _register_approval_notifications(self) -> None:
         from tools.approval import register_gateway_notify
@@ -1017,16 +1201,15 @@ class RealtimeVoiceSession:
         def publish() -> None:
             from gateway.run import _redact_approval_command
 
+            payload = {
+                "approval_id": approval_id,
+                "command": _redact_approval_command(approval_data.get("command")),
+                "description": str(approval_data.get("description") or "")[:1000],
+                "choices": ["once", "session", "always", "deny"],
+            }
             self._pending_approvals.append(approval_id)
-            self.broker.publish(
-                "approval.request",
-                {
-                    "approval_id": approval_id,
-                    "command": _redact_approval_command(approval_data.get("command")),
-                    "description": str(approval_data.get("description") or "")[:1000],
-                    "choices": ["once", "session", "always", "deny"],
-                },
-            )
+            self._pending_approval_events[approval_id] = payload
+            self.broker.publish("approval.request", payload)
 
         loop.call_soon_threadsafe(publish)
 
@@ -1036,10 +1219,13 @@ class RealtimeVoiceSession:
         *,
         event_data: Mapping[str, Any],
     ) -> str:
+        prompt_id = f"{kind}_{uuid.uuid4().hex}"
+        payload = {"prompt_id": prompt_id, **dict(event_data)}
         prompt = _PendingPrompt(
-            prompt_id=f"{kind}_{uuid.uuid4().hex}",
+            prompt_id=prompt_id,
             kind=kind,
             event=threading.Event(),
+            data=payload,
         )
         with self._pending_prompts_lock:
             self._pending_prompts[prompt.prompt_id] = prompt
@@ -1049,10 +1235,7 @@ class RealtimeVoiceSession:
             with self._pending_prompts_lock:
                 self._pending_prompts.pop(prompt.prompt_id, None)
             return ""
-        payload = {"prompt_id": prompt.prompt_id, **dict(event_data)}
-        loop.call_soon_threadsafe(
-            self.broker.publish, f"{kind}.request", payload
-        )
+        loop.call_soon_threadsafe(self.broker.publish, f"{kind}.request", payload)
         prompt.event.wait(timeout=self.config.approval_timeout_seconds)
         with self._pending_prompts_lock:
             self._pending_prompts.pop(prompt.prompt_id, None)
@@ -1092,8 +1275,7 @@ class RealtimeVoiceSession:
                 "Invalid approval choice", code="invalid_approval_choice"
             )
         if approval_id and (
-            not self._pending_approvals
-            or self._pending_approvals[0] != approval_id
+            not self._pending_approvals or self._pending_approvals[0] != approval_id
         ):
             raise RealtimeProtocolError(
                 "Approval is no longer pending", code="stale_approval"
@@ -1108,6 +1290,7 @@ class RealtimeVoiceSession:
         )
         for _ in range(min(resolved, len(self._pending_approvals))):
             resolved_id = self._pending_approvals.popleft()
+            self._pending_approval_events.pop(resolved_id, None)
             self.broker.publish(
                 "approval.resolved",
                 {"approval_id": resolved_id, "choice": choice},
@@ -1122,6 +1305,279 @@ class RealtimeVoiceSession:
             prompt.response = value
             prompt.event.set()
             return True
+
+    async def interrupt_response(
+        self,
+        *,
+        request_id: str,
+        audio_end_ms: int,
+    ) -> dict[str, Any]:
+        """Cancel active speech and synchronize provider history to playout."""
+
+        async with self._interrupt_lock:
+            cached = self._interrupt_requests.get(request_id)
+            if cached is not None:
+                if cached.get("audio_end_ms") != audio_end_ms:
+                    raise RealtimeProtocolError(
+                        "request_id was already used with another playout position",
+                        code="interrupt_request_conflict",
+                    )
+                self._interrupt_requests.move_to_end(request_id)
+                return dict(cached)
+
+            async with self._event_lock:
+                if self._closing or self._closed:
+                    raise RealtimeProtocolError(
+                        "Realtime session is closed",
+                        code="session_closed",
+                    )
+                if self._renewal_required:
+                    raise RealtimeProtocolError(
+                        "The provider call must be renewed before interruption",
+                        code="session_renewal_required",
+                    )
+
+                tool_running = (
+                    self._tool_task is not None and not self._tool_task.done()
+                )
+                turn_response_pending = (
+                    self.state == "responding" and self._turn is not None
+                )
+                tracked_response_id = self._active_response_id
+                main_response_active = bool(
+                    tracked_response_id
+                    and tracked_response_id in self._generation_active_response_ids
+                )
+                pending_terminal = self._pending_terminal_response
+                status_response_active = bool(
+                    self._active_status_response_id
+                    or self._status_response_active
+                    or self._status_response_requested
+                )
+                output_playback_active = bool(self._active_output_audio_response_id)
+                if (
+                    not main_response_active
+                    and not turn_response_pending
+                    and not tool_running
+                    and not status_response_active
+                    and not output_playback_active
+                ):
+                    raise RealtimeProtocolError(
+                        "No response is active",
+                        code="response_not_active",
+                    )
+
+                if self._client_interrupt_pending:
+                    result = {
+                        "status": "already_requested",
+                        "provider_response_id": self._active_response_id,
+                        "audio_end_ms": audio_end_ms,
+                    }
+                    self._cache_interrupt_request(request_id, result)
+                    return result
+
+                self._client_interrupt_pending = True
+                self._pending_interrupt_audio_end_ms = audio_end_ms
+                if turn_response_pending or tool_running:
+                    self._barge_in_during_response = True
+                    self.agent._skip_unstarted_tool_calls = True
+                if tracked_response_id and (turn_response_pending or tool_running):
+                    self._interrupted_response_ids.add(tracked_response_id)
+
+                response_id = tracked_response_id if main_response_active else ""
+                status_response_id = self._active_status_response_id
+                playback_response_id = self._active_output_audio_response_id
+                interrupted_response_id = (
+                    response_id
+                    or status_response_id
+                    or playback_response_id
+                    or (tracked_response_id if tool_running else "")
+                )
+                audio_item_id = (
+                    self._active_audio_item_id
+                    if turn_response_pending or tool_running
+                    else ""
+                )
+                generation_completed = bool(
+                    pending_terminal is not None
+                    and pending_terminal.response_id == tracked_response_id
+                )
+                try:
+                    if response_id and not generation_completed:
+                        await self._send_interrupt_cancel(response_id)
+                    if status_response_id:
+                        await self._send_interrupt_cancel(status_response_id)
+                    if output_playback_active:
+                        await self._send_interrupt_output_clear(playback_response_id)
+                    if (
+                        tracked_response_id
+                        and audio_item_id
+                        and not output_playback_active
+                    ):
+                        await self._send_interrupt_truncate(
+                            audio_item_id,
+                            audio_end_ms,
+                        )
+                except Exception:
+                    self._renewal_required = True
+                    self._set_state("degraded", reason="interrupt_delivery_failed")
+                    await self._persist_runtime_state("renewal_required")
+                    self.broker.publish(
+                        "session.rotation_required",
+                        {"reason": "interrupt_delivery_failed"},
+                    )
+                    raise
+
+                result = {
+                    "status": "accepted",
+                    "provider_response_id": interrupted_response_id,
+                    "audio_end_ms": audio_end_ms,
+                    "truncation_requested": bool(
+                        output_playback_active
+                        or (tracked_response_id and audio_item_id)
+                    ),
+                    "output_clear_requested": output_playback_active,
+                }
+                if tool_running:
+                    self._mark_response_transcript_interrupted(
+                        tracked_response_id or playback_response_id
+                    )
+                elif output_playback_active and not response_id:
+                    self._mark_response_transcript_interrupted(playback_response_id)
+                self._cache_interrupt_request(request_id, result)
+                self.broker.publish(
+                    "response.interrupted",
+                    {
+                        "reason": "client_barge_in",
+                        "provider_response_id": interrupted_response_id,
+                        "audio_end_ms": audio_end_ms,
+                    },
+                )
+                if self._continuation_pending:
+                    self._schedule_interrupt_handoff_timeout()
+                if generation_completed:
+                    await self._finalize_pending_terminal_response(interrupted=True)
+                return result
+
+    def _cache_interrupt_request(
+        self,
+        request_id: str,
+        result: Mapping[str, Any],
+    ) -> None:
+        self._interrupt_requests[request_id] = dict(result)
+        self._interrupt_requests.move_to_end(request_id)
+        while len(self._interrupt_requests) > 32:
+            self._interrupt_requests.popitem(last=False)
+
+    async def _send_interrupt_cancel(self, response_id: str) -> None:
+        if not response_id or response_id in self._interrupt_cancels_sent:
+            return
+        try:
+            await asyncio.wait_for(
+                self.sideband.send(
+                    response_cancel_event(
+                        response_id=response_id,
+                        event_id=self._event_id("interrupt_cancel"),
+                    )
+                ),
+                timeout=self.config.request_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RealtimeProtocolError(
+                "Timed out cancelling the active response",
+                code="interrupt_provider_timeout",
+            ) from exc
+        self._interrupt_cancels_sent.add(response_id)
+
+    async def _send_interrupt_truncate(
+        self,
+        item_id: str,
+        audio_end_ms: int,
+    ) -> None:
+        if not item_id or item_id in self._interrupt_truncations_sent:
+            return
+        try:
+            await asyncio.wait_for(
+                self.sideband.send(
+                    conversation_item_truncate_event(
+                        item_id,
+                        audio_end_ms,
+                        event_id=self._event_id("interrupt_truncate"),
+                    )
+                ),
+                timeout=self.config.request_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RealtimeProtocolError(
+                "Timed out truncating interrupted audio",
+                code="interrupt_provider_timeout",
+            ) from exc
+        self._interrupt_truncations_sent.add(item_id)
+
+    async def _send_interrupt_output_clear(self, response_id: str) -> None:
+        if not response_id or response_id in self._interrupt_output_clears_sent:
+            return
+        try:
+            await asyncio.wait_for(
+                self.sideband.send(
+                    output_audio_buffer_clear_event(
+                        event_id=self._event_id("interrupt_output_clear"),
+                    )
+                ),
+                timeout=self.config.request_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RealtimeProtocolError(
+                "Timed out clearing interrupted audio",
+                code="interrupt_provider_timeout",
+            ) from exc
+        self._interrupt_output_clears_sent.add(response_id)
+
+    async def complete_playback(
+        self,
+        *,
+        request_id: str,
+        response_id: str,
+    ) -> dict[str, Any]:
+        """Finalize a generated turn only after the client rendered its audio."""
+
+        async with self._event_lock:
+            cached = self._playback_completion_requests.get(request_id)
+            if cached is not None:
+                if cached.get("provider_response_id") != response_id:
+                    raise RealtimeProtocolError(
+                        "request_id was already used for another response",
+                        code="playback_request_conflict",
+                    )
+                self._playback_completion_requests.move_to_end(request_id)
+                return dict(cached)
+
+            pending = self._pending_terminal_response
+            if pending is None or pending.response_id != response_id:
+                raise RealtimeProtocolError(
+                    "Response is not awaiting playback completion",
+                    code="stale_playback_completion",
+                )
+
+            result = {
+                "status": "accepted",
+                "provider_response_id": response_id,
+                "provider_output_drained": (
+                    response_id in self._output_drained_response_ids
+                ),
+            }
+            self._playback_completion_requests[request_id] = dict(result)
+            self._playback_completion_requests.move_to_end(request_id)
+            while len(self._playback_completion_requests) > 32:
+                self._playback_completion_requests.popitem(last=False)
+            self.broker.publish(
+                "response.playback_confirmed",
+                {"provider_response_id": response_id},
+            )
+            self._client_playback_completed_response_ids.add(response_id)
+            if response_id in self._output_drained_response_ids:
+                await self._finalize_pending_terminal_response(interrupted=False)
+            return result
 
     async def handle_control_command(self, command: Mapping[str, Any]) -> None:
         command_type = command["type"]
@@ -1144,6 +1600,16 @@ class RealtimeVoiceSession:
                     "Clarification is no longer pending",
                     code="stale_clarification",
                 )
+        elif command_type == "response.interrupt":
+            await self.interrupt_response(
+                request_id=str(request_id),
+                audio_end_ms=int(data["audio_end_ms"]),
+            )
+        elif command_type == "response.playback_completed":
+            await self.complete_playback(
+                request_id=str(request_id),
+                response_id=str(data["response_id"]),
+            )
         elif command_type == "secret.respond":
             if not self.resolve_prompt(
                 str(data.get("prompt_id") or ""),
@@ -1227,18 +1693,94 @@ class RealtimeVoiceSession:
                 waiter.future.set_result(dict(event))
             if event_type in {"session.updated", "input_audio_buffer.cleared"}:
                 return
+            if event_type == "output_audio_buffer.started":
+                response_id = str(event.get("response_id") or "")
+                if response_id:
+                    self._playback_started_response_ids.add(response_id)
+                    self._active_output_audio_response_id = response_id
+                self.broker.publish(
+                    "response.playback_started",
+                    {"provider_response_id": response_id},
+                )
+                if response_id and (
+                    response_id in self._interrupted_response_ids
+                    or (
+                        self._client_interrupt_pending
+                        and response_id
+                        in {
+                            self._active_response_id,
+                            self._active_status_response_id,
+                        }
+                    )
+                ):
+                    await self._send_interrupt_output_clear(response_id)
+                return
+            if event_type == "output_audio_buffer.stopped":
+                response_id = str(event.get("response_id") or "")
+                self._playback_started_response_ids.discard(response_id)
+                if response_id == self._active_response_id:
+                    self._output_drained_response_ids.add(response_id)
+                if self._active_output_audio_response_id == response_id:
+                    self._active_output_audio_response_id = ""
+                self.broker.publish(
+                    "response.output_drained",
+                    {"provider_response_id": response_id},
+                )
+                pending = self._pending_terminal_response
+                if pending is not None and pending.response_id == response_id:
+                    if response_id in self._client_playback_completed_response_ids:
+                        await self._finalize_pending_terminal_response(
+                            interrupted=False
+                        )
+                    else:
+                        self._schedule_playback_finalization(
+                            response_id,
+                            delay=PLAYBACK_COMPLETION_GRACE_SECONDS,
+                        )
+                return
+            if event_type == "output_audio_buffer.cleared":
+                response_id = str(event.get("response_id") or "")
+                self._playback_started_response_ids.discard(response_id)
+                if response_id == self._active_response_id:
+                    self._output_drained_response_ids.add(response_id)
+                if self._active_output_audio_response_id == response_id:
+                    self._active_output_audio_response_id = ""
+                self.broker.publish(
+                    "response.output_cleared",
+                    {"provider_response_id": response_id},
+                )
+                return
             if event_type == "input_audio_buffer.speech_started":
+                self._provider_input_active = True
                 self.broker.publish("vad.speech_started", {})
                 if self.state in {"responding", "tool_wait"}:
+                    self._client_interrupt_pending = True
                     self.broker.publish("response.interrupted", {"reason": "barge_in"})
+                    if self._continuation_pending:
+                        self._schedule_interrupt_handoff_timeout()
+                if self.state == "tool_wait":
+                    self.agent._skip_unstarted_tool_calls = True
+                    if self._active_response_id:
+                        self._interrupted_response_ids.add(self._active_response_id)
                 if self.state == "responding":
                     self._barge_in_during_response = True
+                    if self._active_response_id:
+                        self._interrupted_response_ids.add(self._active_response_id)
+                    pending = self._pending_terminal_response
+                    if (
+                        pending is not None
+                        and pending.response_id == self._active_response_id
+                    ):
+                        await self._finalize_pending_terminal_response(interrupted=True)
                 return
             if event_type == "input_audio_buffer.speech_stopped":
                 self.broker.publish("vad.speech_stopped", {})
                 return
             if event_type == "input_audio_buffer.committed":
                 item_id = str(event.get("item_id") or "").strip()
+                if item_id and item_id in self._handled_input_items:
+                    return
+                self._provider_input_active = True
                 if item_id:
                     self._start_transcript_wait(item_id)
                 return
@@ -1295,8 +1837,54 @@ class RealtimeVoiceSession:
                     self._status_response_active = True
                     if response_id:
                         self._status_response_ids.add(response_id)
+                        self._generation_active_response_ids.add(response_id)
+                        self._active_status_response_id = response_id
+                        if self._client_interrupt_pending:
+                            await self._send_interrupt_cancel(response_id)
                 else:
+                    self._active_response_id = response_id
+                    if response_id:
+                        self._generation_active_response_ids.add(response_id)
+                    self._active_audio_item_id = ""
+                    if self._client_interrupt_pending:
+                        self._barge_in_during_response = True
+                        if response_id:
+                            self._interrupted_response_ids.add(response_id)
+                            await self._send_interrupt_cancel(response_id)
                     self._set_state("responding")
+                    self.broker.publish(
+                        "response.started",
+                        {"provider_response_id": response_id},
+                    )
+                return
+            if event_type == "response.output_item.added":
+                response_id = str(event.get("response_id") or "")
+                item = event.get("item")
+                item = item if isinstance(item, Mapping) else {}
+                item_id = str(item.get("id") or "")
+                if (
+                    response_id
+                    and response_id == self._active_response_id
+                    and item_id
+                    and item.get("type") == "message"
+                    and item.get("role") == "assistant"
+                ):
+                    self._active_audio_item_id = item_id
+                    self.broker.publish(
+                        "response.audio_started",
+                        {
+                            "provider_response_id": response_id,
+                            "provider_item_id": item_id,
+                        },
+                    )
+                    if (
+                        response_id in self._interrupted_response_ids
+                        and self._pending_interrupt_audio_end_ms is not None
+                    ):
+                        await self._send_interrupt_truncate(
+                            item_id,
+                            self._pending_interrupt_audio_end_ms,
+                        )
                 return
             if event_type == "response.output_item.done":
                 for call in function_calls_from_event(event):
@@ -1305,6 +1893,15 @@ class RealtimeVoiceSession:
                 return
             if event_type == "response.done":
                 await self._handle_response_done(event)
+                return
+            if event_type == "conversation.item.truncated":
+                self.broker.publish(
+                    "response.truncated",
+                    {
+                        "provider_item_id": str(event.get("item_id") or ""),
+                        "audio_end_ms": int(event.get("audio_end_ms") or 0),
+                    },
+                )
                 return
             if event_type == "rate_limits.updated":
                 self.broker.publish(
@@ -1378,11 +1975,15 @@ class RealtimeVoiceSession:
             task = self._transcript_wait_tasks.pop(item_id, None)
             if task is not None and task is not asyncio.current_task():
                 task.cancel()
-        await self._handle_input(transcript, item_id)
+        try:
+            await self._handle_input(transcript, item_id)
+        finally:
+            self._provider_input_active = False
 
     async def _handle_input(self, transcript: str, item_id: str) -> None:
         tool_running = self._tool_task is not None and not self._tool_task.done()
         if self._turn is None:
+            self._client_interrupt_pending = False
             await self._begin_turn(transcript, item_id)
             return
         if tool_running:
@@ -1398,19 +1999,36 @@ class RealtimeVoiceSession:
                 return
             self.agent._skip_unstarted_tool_calls = True
             self.agent.steer(f"[User voice steer]\n{transcript}")
+            self._client_interrupt_pending = False
+            self._barge_in_during_response = False
             self.broker.publish(
                 "turn.steered",
-                {"during": "tool", "transcript_available": not transcript.startswith("[")},
+                {
+                    "during": "tool",
+                    "transcript_available": not transcript.startswith("["),
+                },
+            )
+            return
+        if self._continuation_pending and self._client_interrupt_pending:
+            self._pending_next_inputs.append((transcript, item_id))
+            self._continuation_pending = False
+            await self._finalize_current_turn(
+                "[Assistant response interrupted by new speech.]",
+                response_id="",
+                interrupted=True,
             )
             return
         self._pending_next_inputs.append((transcript, item_id))
         self.broker.publish(
             "turn.steered",
-            {"during": "response", "transcript_available": not transcript.startswith("[")},
+            {
+                "during": "response",
+                "transcript_available": not transcript.startswith("["),
+            },
         )
 
     async def _begin_turn(self, transcript: str, item_id: str) -> None:
-        if self._closed:
+        if self._closing or self._closed:
             return
         self._set_state("listening")
         history = list(self.messages)
@@ -1448,7 +2066,9 @@ class RealtimeVoiceSession:
         )
         clean = user_message.get("content") if isinstance(user_message, Mapping) else ""
         api_content = (
-            user_message.get("api_content") if isinstance(user_message, Mapping) else None
+            user_message.get("api_content")
+            if isinstance(user_message, Mapping)
+            else None
         )
         suffix = ""
         if (
@@ -1507,6 +2127,7 @@ class RealtimeVoiceSession:
         response = event.get("response")
         response = response if isinstance(response, Mapping) else {}
         response_id = str(response.get("id") or "")
+        self._generation_active_response_ids.discard(response_id)
         metadata = response.get("metadata")
         metadata = metadata if isinstance(metadata, Mapping) else {}
         if (
@@ -1514,14 +2135,14 @@ class RealtimeVoiceSession:
             or response_id in self._status_response_ids
         ):
             self._status_response_ids.discard(response_id)
+            if self._active_status_response_id == response_id:
+                self._active_status_response_id = ""
             self._status_response_active = False
             self._status_response_requested = False
             if self._status_watchdog_task is not None:
                 self._status_watchdog_task.cancel()
                 self._status_watchdog_task = None
-            if self._continuation_pending:
-                self._continuation_pending = False
-                await self._send_response_create()
+            await self._resume_or_hold_continuation()
             return
         if response_id and response_id in self._processed_responses:
             return
@@ -1529,13 +2150,22 @@ class RealtimeVoiceSession:
             self._processed_responses.add(response_id)
 
         await self._record_usage(response.get("usage"))
-        calls = {
-            call.call_id: call for call in function_calls_from_event(event)
-        }
+        status = str(response.get("status") or "completed")
+        calls = {call.call_id: call for call in function_calls_from_event(event)}
         calls.update(self._response_calls.pop(response_id, {}))
-        transcript = (
-            self._response_transcripts.pop(response_id, "")
-            or response_transcript(event)
+        transcript = self._response_transcripts.pop(
+            response_id, ""
+        ) or response_transcript(event)
+        response_interrupted = response_id in self._interrupted_response_ids or (
+            status in {"cancelled", "canceled"}
+            and (self._barge_in_during_response or bool(self._pending_next_inputs))
+        )
+        if response_interrupted:
+            transcript = "[Assistant response interrupted by user.]"
+        active_audio_item_id = (
+            self._active_audio_item_id
+            if self._active_response_id == response_id
+            else ""
         )
         if calls:
             if self._turn is None:
@@ -1564,14 +2194,39 @@ class RealtimeVoiceSession:
             )
             return
 
-        status = str(response.get("status") or "completed")
-        interrupted = status in {"cancelled", "canceled"} and (
-            self._barge_in_during_response or bool(self._pending_next_inputs)
-        )
+        if (
+            not response_interrupted
+            and active_audio_item_id
+            and response_id in self._playback_started_response_ids
+        ):
+            self._pending_terminal_response = _PendingTerminalResponse(
+                response_id=response_id,
+                transcript=transcript or "[Assistant audio transcript unavailable]",
+                failed=status != "completed",
+            )
+            self.broker.publish(
+                "response.generated",
+                {
+                    "provider_response_id": response_id,
+                    "awaiting_playback_completion": True,
+                },
+            )
+            if response_id in self._output_drained_response_ids:
+                self._schedule_playback_finalization(
+                    response_id,
+                    delay=PLAYBACK_COMPLETION_GRACE_SECONDS,
+                )
+            return
+
+        self._interrupted_response_ids.discard(response_id)
+        if self._active_response_id == response_id:
+            self._active_response_id = ""
+            self._generation_active_response_ids.clear()
+            self._active_audio_item_id = ""
         await self._finalize_current_turn(
             transcript or "[Assistant audio transcript unavailable]",
             response_id=response_id,
-            interrupted=interrupted,
+            interrupted=response_interrupted,
             failed=status == "failed",
         )
 
@@ -1678,6 +2333,17 @@ class RealtimeVoiceSession:
                         raise RuntimeError(
                             f"Tool {call.name} produced no durable result"
                         )
+                    if db is not None:
+                        updated = await asyncio.to_thread(
+                            db.update_tool_result_by_call_id,
+                            self.session_id,
+                            call.call_id,
+                            result_row.get("content", ""),
+                        )
+                        if not updated:
+                            raise RuntimeError(
+                                f"Tool {call.name} final result could not be persisted"
+                            )
                     outputs[call.call_id] = _tool_output_text(
                         result_row.get("content", "")
                     )
@@ -1692,8 +2358,9 @@ class RealtimeVoiceSession:
                         else None
                     )
                     output = _tool_output_text(
-                        durable.get("content", "") if durable else
-                        "[Duplicate tool call was suppressed without a recoverable result.]"
+                        durable.get("content", "")
+                        if durable
+                        else "[Duplicate tool call was suppressed without a recoverable result.]"
                     )
                 if self._closed:
                     return
@@ -1707,16 +2374,24 @@ class RealtimeVoiceSession:
 
             if skip_unstarted:
                 await self._finalize_current_turn(
-                    spoken_preamble or "[Assistant response interrupted by new speech.]",
+                    spoken_preamble
+                    or "[Assistant response interrupted by new speech.]",
                     response_id=response_id,
                     interrupted=True,
                 )
                 return
-            if self._status_response_active or self._status_response_requested:
+            if self._client_interrupt_pending:
+                self._continuation_pending = True
+                self._schedule_interrupt_handoff_timeout()
+            elif self._status_response_active or self._status_response_requested:
                 self._continuation_pending = True
             else:
                 await self._send_response_create()
         except asyncio.CancelledError:
+            raise
+        except RealtimeProtocolError as exc:
+            if exc.code == "turn_persistence_failed":
+                return
             raise
         except Exception as exc:
             logger.exception("Realtime tool batch failed for %s", self.session_id)
@@ -1754,7 +2429,12 @@ class RealtimeVoiceSession:
         tokens = self._bind_session_context()
         set_approval_callback(None)
         set_sudo_password_callback(self._secret_sync)
-        self.agent._skip_unstarted_tool_calls = skip_unstarted
+        effective_skip = (
+            skip_unstarted
+            or self._skip_current_tool_batch
+            or self._client_interrupt_pending
+        )
+        self.agent._skip_unstarted_tool_calls = effective_skip
         try:
             # Realtime batches stay sequential so a barge-in can suppress calls
             # that have not started without cancelling the operation already in
@@ -1803,9 +2483,8 @@ class RealtimeVoiceSession:
 
     async def _status_response_watchdog(self) -> None:
         await asyncio.sleep(max(5.0, self.config.intermediate_speech_delay_seconds * 4))
-        if (
-            self._closed
-            or not (self._status_response_active or self._status_response_requested)
+        if self._closed or not (
+            self._status_response_active or self._status_response_requested
         ):
             return
         self.broker.publish(
@@ -1817,16 +2496,156 @@ class RealtimeVoiceSession:
         )
         try:
             await self.sideband.send(
-                {"type": "response.cancel", "event_id": self._event_id("cancel")}
+                response_cancel_event(
+                    response_id=self._active_status_response_id or None,
+                    event_id=self._event_id("cancel"),
+                )
             )
         except Exception:
             logger.debug("Could not cancel stalled status response", exc_info=True)
         self._status_response_active = False
         self._status_response_requested = False
         self._status_response_ids.clear()
-        if self._continuation_pending:
+        self._active_status_response_id = ""
+        await self._resume_or_hold_continuation()
+
+    async def _resume_or_hold_continuation(self) -> None:
+        if not self._continuation_pending:
+            return
+        if self._client_interrupt_pending:
+            self._schedule_interrupt_handoff_timeout()
+        else:
             self._continuation_pending = False
             await self._send_response_create()
+
+    def _schedule_playback_finalization(
+        self,
+        response_id: str,
+        *,
+        delay: float,
+    ) -> None:
+        current = self._playback_finalize_task
+        if current is not None:
+            current.cancel()
+        self._playback_finalize_task = asyncio.create_task(
+            self._finalize_playback_after(
+                response_id,
+                delay=delay,
+            ),
+            name=f"realtime-playback-{self.session_id}",
+        )
+
+    def _schedule_interrupt_handoff_timeout(self) -> None:
+        current = self._interrupt_handoff_task
+        if current is not None:
+            current.cancel()
+        delay = max(
+            1.0,
+            self.config.preroll_timeout_seconds
+            + self.config.transcription_timeout_seconds,
+        )
+        self._interrupt_handoff_task = asyncio.create_task(
+            self._expire_interrupt_handoff(delay),
+            name=f"realtime-interrupt-handoff-{self.session_id}",
+        )
+
+    async def _expire_interrupt_handoff(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            async with self._event_lock:
+                if (
+                    self._turn is None
+                    or not self._continuation_pending
+                    or not self._client_interrupt_pending
+                ):
+                    return
+                self._continuation_pending = False
+                await self._finalize_current_turn(
+                    "[Assistant response interrupted; replacement audio did not arrive.]",
+                    response_id="",
+                    interrupted=True,
+                )
+        except asyncio.CancelledError:
+            return
+
+    def _cancel_interrupt_handoff_timeout(self) -> None:
+        task, self._interrupt_handoff_task = self._interrupt_handoff_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _finalize_playback_after(
+        self,
+        response_id: str,
+        *,
+        delay: float,
+    ) -> None:
+        try:
+            await asyncio.sleep(delay)
+            async with self._event_lock:
+                pending = self._pending_terminal_response
+                if pending is None or pending.response_id != response_id:
+                    return
+                await self._finalize_pending_terminal_response(interrupted=False)
+        except asyncio.CancelledError:
+            return
+
+    def _cancel_playback_finalization(self) -> None:
+        task, self._playback_finalize_task = self._playback_finalize_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _mark_response_transcript_interrupted(self, response_id: str) -> None:
+        turn = self._turn
+        if turn is None or not response_id:
+            return
+        for message in reversed(turn.messages):
+            external_id = message.get("platform_message_id") or message.get(
+                "message_id"
+            )
+            if message.get("role") != "assistant" or external_id != response_id:
+                continue
+            message["content"] = "[Assistant response interrupted by user.]"
+            message["finish_reason"] = "interrupted"
+            metadata = message.get("display_metadata")
+            metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+            metadata["interrupted"] = True
+            message["display_metadata"] = metadata
+            message.pop("_db_persisted", None)
+            return
+
+    async def _finalize_pending_terminal_response(
+        self,
+        *,
+        interrupted: bool,
+    ) -> bool:
+        pending = self._pending_terminal_response
+        if pending is None:
+            return False
+        self._pending_terminal_response = None
+        self._cancel_playback_finalization()
+        self._playback_started_response_ids.discard(pending.response_id)
+        self._output_drained_response_ids.discard(pending.response_id)
+        self._client_playback_completed_response_ids.discard(pending.response_id)
+        if self._active_output_audio_response_id == pending.response_id:
+            self._active_output_audio_response_id = ""
+        if self._active_response_id == pending.response_id:
+            self._active_response_id = ""
+            self._generation_active_response_ids.clear()
+            self._active_audio_item_id = ""
+        self._interrupted_response_ids.discard(pending.response_id)
+        if interrupted:
+            self._mark_response_transcript_interrupted(pending.response_id)
+        await self._finalize_current_turn(
+            (
+                "[Assistant response interrupted by user.]"
+                if interrupted
+                else pending.transcript
+            ),
+            response_id=pending.response_id,
+            interrupted=interrupted,
+            failed=pending.failed,
+        )
+        return True
 
     async def _finalize_current_turn(
         self,
@@ -1836,46 +2655,154 @@ class RealtimeVoiceSession:
         interrupted: bool = False,
         failed: bool = False,
     ) -> None:
+        if self._turn is None or self._finalizing_turn:
+            return
+        self._finalizing_turn = True
+        try:
+            await self._finalize_current_turn_body(
+                transcript,
+                response_id=response_id,
+                interrupted=interrupted,
+                failed=failed,
+            )
+        finally:
+            self._finalizing_turn = False
+
+    async def _finalize_current_turn_body(
+        self,
+        transcript: str,
+        *,
+        response_id: str,
+        interrupted: bool,
+        failed: bool,
+    ) -> None:
         turn = self._turn
         if turn is None:
             return
-        turn.messages.append(
-            {
-                "role": "assistant",
-                "content": transcript,
-                "finish_reason": "interrupted" if interrupted else "stop",
-                "platform_message_id": response_id or None,
-                "display_kind": "realtime_voice",
-                "display_metadata": {
-                    "provider_response_id": response_id,
-                    "interrupted": interrupted,
-                },
-            }
-        )
+        turn.messages.append({
+            "role": "assistant",
+            "content": transcript,
+            "finish_reason": "interrupted" if interrupted else "stop",
+            "platform_message_id": response_id or None,
+            "display_kind": "realtime_voice",
+            "display_metadata": {
+                "provider_response_id": response_id,
+                "interrupted": interrupted,
+            },
+        })
         self.agent._turn_received_provider_response = True
-        result = await asyncio.to_thread(
-            self._run_in_session_context,
-            finalize_host_turn,
-            self.agent,
-            turn,
-            final_response=transcript,
-            api_call_count=self._turn_response_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=(
-                "realtime_interrupted"
-                if interrupted
-                else "realtime_failed"
-                if failed
-                else "text_response(realtime_voice)"
-            ),
+        deferred_reviews: list[dict[str, Any]] = []
+        review_dispatch = getattr(self.agent, "_background_review_dispatch", None)
+
+        def defer_review(**request: Any) -> None:
+            deferred_reviews.append(dict(request))
+
+        self.agent._background_review_dispatch = defer_review
+        try:
+            result = await asyncio.to_thread(
+                self._run_in_session_context,
+                finalize_host_turn,
+                self.agent,
+                turn,
+                final_response=transcript,
+                api_call_count=self._turn_response_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=(
+                    "realtime_interrupted"
+                    if interrupted
+                    else "realtime_failed"
+                    if failed
+                    else "text_response(realtime_voice)"
+                ),
+            )
+        finally:
+            self.agent._background_review_dispatch = review_dispatch
+        try:
+            persist = getattr(self.agent, "_flush_messages_to_session_db", None)
+            if not callable(persist):
+                raise RuntimeError("SessionDB persistence is unavailable")
+            persisted = await asyncio.to_thread(
+                self._run_in_session_context,
+                persist,
+                turn.messages,
+                turn.conversation_history,
+            )
+            if persisted is False:
+                raise RuntimeError("SessionDB rejected the finalized voice turn")
+            self.agent._incremental_persistence_failed = False
+        except Exception as exc:
+            self._renewal_required = True
+            self._set_state("degraded", reason="turn_persistence_failed")
+            self.broker.publish(
+                "error",
+                {
+                    "fatal": True,
+                    "code": "turn_persistence_failed",
+                    "message": "The completed voice turn could not be persisted.",
+                },
+            )
+            try:
+                await self._persist_runtime_state("renewal_required")
+            except Exception:
+                logger.warning(
+                    "Could not persist realtime failure state for %s",
+                    self.session_id,
+                    exc_info=True,
+                )
+            raise RealtimeProtocolError(
+                "The completed voice turn could not be persisted",
+                code="turn_persistence_failed",
+            ) from exc
+        review_scheduler = (
+            review_dispatch
+            if callable(review_dispatch)
+            else self._schedule_background_review_sync
         )
+        for request in deferred_reviews:
+            try:
+                await asyncio.to_thread(
+                    self._run_in_session_context,
+                    review_scheduler,
+                    **request,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not enqueue background review for %s",
+                    self.session_id,
+                    exc_info=True,
+                )
+                self.broker.publish(
+                    "warning",
+                    {
+                        "code": "background_review_enqueue_failed",
+                        "message": "Background memory or skill review could not be queued.",
+                    },
+                )
+        await self._persist_runtime_state("ready")
         self.messages = list(result.get("messages") or turn.messages)
         self._turn = None
         self._turn_response_count = 0
         self._tool_task = None
+        active_response_id = self._active_response_id
+        self._active_response_id = ""
+        self._active_audio_item_id = ""
+        if self._active_output_audio_response_id == active_response_id:
+            self._active_output_audio_response_id = ""
+        for tracked_response_id in {response_id, active_response_id}:
+            if not tracked_response_id:
+                continue
+            self._playback_started_response_ids.discard(tracked_response_id)
+            self._output_drained_response_ids.discard(tracked_response_id)
+            self._client_playback_completed_response_ids.discard(tracked_response_id)
+            self._interrupted_response_ids.discard(tracked_response_id)
         self._barge_in_during_response = False
         self._skip_current_tool_batch = False
+        self.agent._skip_unstarted_tool_calls = False
+        self._client_interrupt_pending = False
+        self._pending_interrupt_audio_end_ms = None
+        self._cancel_interrupt_handoff_timeout()
+        self._set_state("ready")
         self.broker.publish(
             "turn.completed",
             {
@@ -1884,8 +2811,6 @@ class RealtimeVoiceSession:
                 "failed": failed,
             },
         )
-        self._set_state("ready")
-        await self._persist_runtime_state("ready")
         if self._pending_next_inputs:
             transcript_parts: list[str] = []
             item_id = ""
@@ -1981,6 +2906,19 @@ class RealtimeVoiceSession:
         sideband: OpenAIRealtimeSideband,
         call_id: str,
     ) -> None:
+        async with self._event_lock:
+            async with self._close_lock:
+                await self._replace_sideband_locked(
+                    sideband=sideband,
+                    call_id=call_id,
+                )
+
+    async def _replace_sideband_locked(
+        self,
+        *,
+        sideband: OpenAIRealtimeSideband,
+        call_id: str,
+    ) -> None:
         if not self.can_renew:
             raise RealtimeProtocolError(
                 "Session is busy and cannot rotate yet", code="session_busy"
@@ -1990,11 +2928,47 @@ class RealtimeVoiceSession:
         if old_task is not None:
             old_task.cancel()
         await self.sideband.close()
+        if self._closing or self._closed:
+            await sideband.close()
+            raise RealtimeProtocolError(
+                "Session closed during provider renewal",
+                code="session_closed",
+            )
         self.sideband = sideband
         self.call_id = call_id
         self._preroll_requests.clear()
+        self._active_response_id = ""
+        self._active_audio_item_id = ""
+        self._active_output_audio_response_id = ""
+        self._playback_started_response_ids.clear()
+        self._output_drained_response_ids.clear()
+        self._client_playback_completed_response_ids.clear()
+        self._pending_terminal_response = None
+        self._cancel_playback_finalization()
+        self._cancel_interrupt_handoff_timeout()
+        self._playback_completion_requests.clear()
+        self._active_status_response_id = ""
+        self._client_interrupt_pending = False
+        self._pending_interrupt_audio_end_ms = None
+        self._interrupted_response_ids.clear()
+        self._interrupt_cancels_sent.clear()
+        self._interrupt_truncations_sent.clear()
+        self._interrupt_output_clears_sent.clear()
+        self._interrupt_requests.clear()
         await self.sideband.connect()
+        if self._closing or self._closed:
+            await self.sideband.close()
+            raise RealtimeProtocolError(
+                "Session closed during provider renewal",
+                code="session_closed",
+            )
         await self._seed_history()
+        if self._closing or self._closed:
+            await self.sideband.close()
+            raise RealtimeProtocolError(
+                "Session closed during provider renewal",
+                code="session_closed",
+            )
         self.call_started_at = time.time()
         self._provider_input_tokens = 0
         self._rotation_notified = False
@@ -2077,28 +3051,46 @@ class RealtimeVoiceSession:
                 )
                 seeded_call_ids.add(call_id)
 
+    async def suspend(self, *, reason: str = "client_suspended") -> None:
+        """Release provider resources without ending the logical session."""
+
+        async with self._event_lock:
+            if not self.can_suspend:
+                raise RealtimeProtocolError(
+                    "Realtime session is busy; wait for the current turn to settle",
+                    code="session_busy",
+                )
+            self._closing = True
+        self.broker.publish("session.suspended", {"reason": reason})
+        await self.close(
+            reason=reason,
+            end_session=False,
+            recoverable_state="suspended",
+        )
+
     async def close(
         self,
         *,
         reason: str = "closed",
         end_session: bool = False,
+        recoverable_state: Optional[str] = None,
     ) -> None:
         async with self._close_lock:
             if self._closed:
                 return
             self._closing = True
             self._logical_end = end_session
-            if self._renewal_required or self._preroll_active:
+            if recoverable_state is not None:
+                persisted_state = recoverable_state
+            elif self._renewal_required or self._preroll_active:
                 # The provider may currently have VAD disabled. A fresh call is
                 # required because shutdown cancels the acknowledgment sequence.
-                recoverable_state = "renewal_required"
+                persisted_state = "renewal_required"
             else:
-                recoverable_state = (
-                    "turn_active" if self._turn is not None else "ready"
-                )
+                persisted_state = "turn_active" if self._turn is not None else "ready"
             if not end_session:
                 try:
-                    await self._persist_runtime_state(recoverable_state)
+                    await self._persist_runtime_state(persisted_state)
                 except Exception:
                     logger.warning(
                         "Could not persist recoverable realtime state for %s",
@@ -2110,6 +3102,7 @@ class RealtimeVoiceSession:
             from tools.approval import unregister_gateway_notify
 
             unregister_gateway_notify(self.session_id)
+            self._pending_approval_events.clear()
             with self._pending_prompts_lock:
                 prompts = list(self._pending_prompts.values())
                 self._pending_prompts.clear()
@@ -2120,6 +3113,8 @@ class RealtimeVoiceSession:
                 self._rotation_task,
                 self._intermediate_task,
                 self._status_watchdog_task,
+                self._playback_finalize_task,
+                self._interrupt_handoff_task,
                 *self._preroll_tasks,
                 *self._transcript_wait_tasks.values(),
             ):
@@ -2133,6 +3128,8 @@ class RealtimeVoiceSession:
                     self._rotation_task,
                     self._intermediate_task,
                     self._status_watchdog_task,
+                    self._playback_finalize_task,
+                    self._interrupt_handoff_task,
                     *self._preroll_tasks,
                     *self._transcript_wait_tasks.values(),
                 )
@@ -2160,9 +3157,7 @@ class RealtimeVoiceSession:
                         await asyncio.to_thread(
                             db.delete_realtime_session_state, self.session_id
                         )
-                        await asyncio.to_thread(
-                            db.end_session, self.session_id, reason
-                        )
+                        await asyncio.to_thread(db.end_session, self.session_id, reason)
                     except Exception:
                         logger.warning(
                             "Could not end realtime session %s",

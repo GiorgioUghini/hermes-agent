@@ -107,6 +107,8 @@ POST /v1/realtime/sessions/{id}/audio/preroll
                                  Commit a wake-word client's first utterance
 POST /v1/realtime/sessions/{id}/renew
                                  Rotate the provider call with a new SDP offer
+POST /v1/realtime/sessions/{id}/suspend
+                                 Release the provider call but preserve history
 POST /v1/realtime/sessions/{id}/approval
                                  HTTP approval fallback
 DELETE /v1/realtime/sessions/{id}
@@ -174,6 +176,8 @@ sequenceDiagram
     OAI-->>Actor: Committed input, function calls, response events
     Actor->>Core: Persist, authorize, and execute tools
     Actor->>OAI: Function outputs and one continuation response
+    App->>API: POST suspend after local playout drains
+    API->>Actor: Close provider resources, preserve logical session
 ```
 
 #### Prerequisites
@@ -221,6 +225,7 @@ Raw `application/sdp` request bodies are also accepted. JSON is always returned:
   "control_url": "/v1/realtime/sessions/rt_123/control",
   "preroll_url": "/v1/realtime/sessions/rt_123/audio/preroll",
   "renew_url": "/v1/realtime/sessions/rt_123/renew",
+  "suspend_url": "/v1/realtime/sessions/rt_123/suspend",
   "provider_call_max_seconds": 3300
 }
 ```
@@ -242,8 +247,9 @@ server-mediated handoff. Use it when the app starts a provider call only after
 local wake detection and cannot inject historical PCM into its WebRTC audio
 source.
 
-The upload represents one **complete first utterance**, not an unfinished
-prefix that continues over RTP:
+The upload represents one **complete utterance**, not an unfinished prefix
+that continues over RTP. It is reusable for every locally captured turn on
+the active provider call:
 
 1. Keep one local `AudioRecord` stream feeding both the wake detector and a
    rolling buffer.
@@ -251,12 +257,14 @@ prefix that continues over RTP:
    stream.
 3. Run local end-of-speech detection. Retain audio from the desired pre-wake
    boundary through the end of the command.
-4. Stop/release that capture source. Keep the WebRTC microphone sender
+4. Freeze that utterance while keeping the shared local capture source
+   available for future wake detection. Keep the WebRTC microphone sender
    inactive.
 5. Apply the SDP answer, then upload the complete utterance to the returned
    `preroll_url`.
-6. Enable the normal WebRTC microphone only after Hermes returns
-   `status: "committed"`.
+6. Wait for Hermes to return `status: "committed"`. A client that uses local
+   capture for every turn may keep WebRTC receive-only and repeat this upload
+   with a new idempotency key.
 
 ```http
 POST /v1/realtime/sessions/rt_123/audio/preroll HTTP/1.1
@@ -287,19 +295,21 @@ response path then handles that provider item.
 
 Do not upload a partial utterance and immediately continue it over WebRTC:
 cross-transport ordering cannot make that one coherent VAD turn. Do not run a
-wake-word `AudioRecord` and a second WebRTC-owned `AudioRecord` concurrently;
-either share a custom audio device or release local capture before enabling the
-WebRTC source. On an ambiguous timeout or provider error, keep the microphone
-inactive and renew/recreate the provider call rather than submitting the audio
-under a new idempotency key.
+wake-word `AudioRecord` and a second WebRTC-owned `AudioRecord` concurrently.
+Either keep one shared local source and a receive-only WebRTC connection, or
+release local capture before enabling a WebRTC microphone sender. On an
+ambiguous timeout or provider error, keep the microphone sender inactive and
+renew/recreate the provider call rather than submitting the audio under a new
+idempotency key.
 
 #### 2. Attach the control WebSocket
 
-Upgrade the returned `control_url` using the same bearer header. Preserve the
-largest processed `sequence`, and include it on reconnect:
+Upgrade the returned `control_url` using the same bearer header. Preserve both
+the latest `stream_id` and largest processed `sequence`, and include them on
+reconnect:
 
 ```text
-wss://hermes.example/v1/realtime/sessions/rt_123/control?after=42
+wss://hermes.example/v1/realtime/sessions/rt_123/control?stream_id=8f2a...&after=42
 Authorization: Bearer <API_SERVER_KEY>
 ```
 
@@ -308,6 +318,7 @@ Every server event has this envelope:
 ```json
 {
   "version": 1,
+  "stream_id": "8f2a...",
   "sequence": 43,
   "session_id": "rt_123",
   "type": "tool.started",
@@ -326,24 +337,30 @@ usage, and recovery UI. Important event families include:
 
 | Events | Client behavior |
 |--------|-----------------|
-| `session.state`, `session.reconnected`, `session.rotated` | Update connection/lifecycle UI; `session.state` carries closing and closed states |
+| `session.state`, `session.reconnected`, `session.rotated`, `session.suspended` | Update connection/lifecycle UI; `session.state` carries closing and closed states |
 | `vad.speech_started`, `vad.speech_stopped` | Show microphone/turn state |
 | `audio.preroll_started`, `audio.preroll_committed` | Keep the initial WebRTC microphone inactive until the upload is committed |
-| `turn.input_committed`, `turn.steered`, `turn.completed` | Reconcile logical voice-turn state without rendering assistant text |
+| `turn.input_committed`, `turn.steered`, `turn.completed` | Reconcile logical voice-turn state without rendering assistant text; `turn.completed` is emitted only after playout is confirmed or the bounded fallback expires |
 | `tool.started`, `tool.completed` | Render tool activity; arguments are reduced to key names |
 | `approval.request`, `approval.resolved` | Show and resolve a privileged-action decision |
 | `clarification.request`, `secret.request` | Render structured input; treat secret values as sensitive |
-| `response.interrupted` | Stop local response UI after barge-in |
+| `response.started`, `response.audio_started`, `response.playback_started` | Reset per-response local playout accounting |
+| `response.generated`, `response.output_drained`, `response.playback_confirmed` | Distinguish provider generation from RTP drain and client-render completion |
+| `response.interrupted`, `response.truncated` | Stop local response UI and reconcile barge-in |
 | `usage.updated`, `rate_limits.updated` | Update diagnostics or metering |
 | `warning`, `error`, `control.error` | Surface redacted degraded/failure state |
 | `session.rotation_required` | Renegotiate using `/renew` |
-| `control.resync_required` | Discard stale transient UI and rebuild from subsequent state |
+| `control.resync_required` | Replace stale transient UI from `data.snapshot` |
 | `control.ack`, `session.pong` | Correlate client commands and liveness checks |
 
 Control buffers and per-subscriber queues are bounded. Reconnect promptly with
-the last applied cursor. A `control.resync_required` event means the requested
-cursor predates the replay buffer; do not infer that missing tool or approval
-events never happened.
+the last stream/cursor pair. A `control.resync_required` event means the cursor
+predates the replay buffer, is ahead of the active broker, or belongs to a
+previous broker epoch. Reset transient UI, adopt the event's `stream_id`, and
+replace connection, response, and pending approval/clarification/secret state
+from the authoritative `data.snapshot`. The resync is private to that control
+socket; it does not disturb healthy subscribers. Do not infer that missing tool
+or approval events never happened.
 
 #### 3. Send structured commands
 
@@ -365,6 +382,8 @@ Supported commands:
 |------|---------------|
 | `session.ping` | none; produces `session.pong` |
 | `session.close` | none; closes the logical session |
+| `response.interrupt` | required unique `request_id` and `audio_end_ms`, the number of current-response milliseconds actually rendered locally |
+| `response.playback_completed` | required unique `request_id` and current `response_id`; send only after the local decoder/render queue has drained |
 | `approval.respond` | `choice`: `once`, `session`, `always`, or `deny`; include the current `approval_id` |
 | `clarification.respond` | current `prompt_id` and string `value` |
 | `secret.respond` | current `prompt_id` and string `value` |
@@ -415,15 +434,55 @@ silent past the configured delay, Hermes may request one short
 `conversation: "none"` status response with no tools. Status speech is
 rate-limited, canceled by barge-in, and excluded from canonical history.
 
-On barge-in:
+Live WebRTC microphone input uses OpenAI VAD for automatic barge-in. A
+receive-only, locally buffered client uses the structured path instead:
 
-- OpenAI interrupts/truncates current output audio.
-- A function call that has not begun is skipped if its response was
-  superseded.
-- A started tool continues to a persisted result; voice input never kills a
-  side effect mid-operation.
-- The steering transcript is attached at the next durable tool boundary and
-  the model reevaluates.
+1. On a confirmed wake word, stop local playback immediately.
+2. Send `response.interrupt` with the decoded audio duration that was actually
+   rendered for the current response. Use `0` if no response audio played.
+3. Hermes sends `response.cancel` when generation is still active. While the
+   WebRTC output buffer is active it sends `output_audio_buffer.clear`, which
+   stops queued RTP and makes OpenAI truncate conversation audio at its
+   synchronized playback cursor. If the provider buffer already drained but
+   device audio remains, Hermes sends `conversation.item.truncate` with the
+   client's `audio_end_ms` instead.
+4. Keep recording through local end-of-speech, then upload the complete command
+   to `preroll_url` with a new idempotency key. Hermes accepts this handoff while
+   the interrupted response or a started tool is settling.
+
+`audio_end_ms` is not wall-clock time, RTP-receive time, or session duration.
+Reset the counter for each response and derive it from decoded frames presented
+to the audio renderer. Hermes acknowledges an accepted command with
+`control.ack`, emits `response.interrupted`, and emits `response.truncated`
+after the provider confirms truncation.
+
+A provider `response.done` event means generation finished, not that the device
+finished playing the response. Hermes therefore retains the response and
+assistant item through the playback boundary. `response.interrupt` remains
+valid during this interval, so a wake word detected from the final local audio
+can still truncate the turn correctly.
+
+For a normally completed response, wait for `response.output_drained`, drain
+the device decoder/render queue, then send:
+
+```json
+{
+  "version": 1,
+  "type": "response.playback_completed",
+  "request_id": "played-018f3c0d",
+  "data": {"response_id": "response_abc"}
+}
+```
+
+Hermes emits `response.playback_confirmed` and then durably finalizes the turn
+as `turn.completed`. A bounded fallback prevents a legacy or disconnected
+client from holding the turn forever, but production clients should send this
+command promptly so suspension is immediate and playout accounting is exact.
+
+A function call that has not begun is skipped if its response was superseded.
+A started tool continues to a persisted result; voice input never kills a side
+effect mid-operation. The replacement transcript is applied at the next durable
+tool boundary and the model reevaluates.
 
 #### SOUL, skills, memory, and self-improvement
 
@@ -445,7 +504,38 @@ function output or audio, and successful maintenance is silent by default.
 Capability discovery reports review as unavailable rather than inheriting
 `gpt-realtime` when no text runtime is configured.
 
-#### Recovery, renewal, and shutdown
+#### Suspension, recovery, renewal, and shutdown
+
+Do not hold a provider call open throughout an idle 20-minute application
+window. At the end of a normal response:
+
+1. After `response.output_drained`, drain the local decoder/render queue and
+   send `response.playback_completed` for that response.
+2. Wait for `turn.completed`, then
+   `POST /v1/realtime/sessions/{id}/suspend`.
+3. Close the local peer connection.
+4. Keep the logical `session_id` and local wake capture active.
+5. On the next wake, create a new receive-capable peer connection and send its
+   offer to `/renew`.
+6. Upload that turn's complete PCM command to the returned `preroll_url`.
+
+`suspend` returns `204`, closes Hermes' provider sideband, and persists state as
+suspended without ending SessionDB history, memory, or the frozen prompt/tool
+snapshot. It is accepted only at an idle durable boundary. It is idempotent for
+an already suspended logical session. `renew` creates the next provider call
+and replays bounded canonical history.
+
+Suspension emits `session.suspended` and closes the current control WebSocket
+with WebSocket code `1001`. After `/renew`, reconnect using the previous
+`stream_id` and cursor. Hermes emits `control.resync_required` because the
+renewed actor has a new stream epoch; adopt the new stream ID and apply its
+`data.snapshot` before processing later events. A normal in-place provider
+rotation keeps the existing actor and stream ID.
+
+For barge-in, keep the current peer connection long enough to send
+`response.interrupt` and the replacement pre-roll; this avoids renegotiation
+latency. Suspend after the replacement response finishes. Closing and renewing
+mid-response is a recovery fallback, not the cancellation primitive.
 
 Provider calls rotate before `provider_call_max_seconds` or
 `provider_call_max_input_tokens`. On `session.rotation_required`:
@@ -453,7 +543,8 @@ Provider calls rotate before `provider_call_max_seconds` or
 1. Create a replacement peer connection and SDP offer.
 2. `POST` the offer to `/v1/realtime/sessions/{id}/renew`.
 3. Apply the returned SDP answer.
-4. Continue using the same logical `session_id` and control cursor.
+4. Continue using the same logical `session_id`; an in-place renewal keeps the
+   control stream, while renewal after suspension uses the resync flow above.
 
 Hermes opens a new sideband call, reapplies the frozen instructions/tools, and
 replays bounded canonical history including messages, function calls, and
@@ -465,8 +556,15 @@ idle (`ready` or `listening`) and is still within the recovery age. Otherwise
 the control or approval endpoint returns a conflict requiring `/renew`. Active
 tool/response state is never guessed.
 
-Close normally with `DELETE /v1/realtime/sessions/{id}` or `session.close`.
-The HTTP route returns `204` after finalizing local resources.
+Use suspend between turns. Close the logical conversation permanently with
+`DELETE /v1/realtime/sessions/{id}` or `session.close`. The HTTP route returns
+`204` after finalizing local resources and ending the durable session.
+
+Keep the local wake detector on an echo-cancelled microphone stream while the
+assistant speaks. Validate the device AEC with real speaker volume before
+shipping barge-in. Also apply wake confidence/debounce and choose or prompt
+against an assistant-spoken wake phrase; server cancellation cannot prevent a
+false trigger that already happened on the device.
 
 #### Security and compatibility boundaries
 

@@ -61,12 +61,10 @@ class _ResponsivePrerollSideband(_FakeSideband):
         elif event["type"] == "input_audio_buffer.clear":
             await self.handler({"type": "input_audio_buffer.cleared"})
         elif event["type"] == "input_audio_buffer.commit":
-            await self.handler(
-                {
-                    "type": "input_audio_buffer.committed",
-                    "item_id": "input_preroll",
-                }
-            )
+            await self.handler({
+                "type": "input_audio_buffer.committed",
+                "item_id": "input_preroll",
+            })
 
 
 class _DeferredRestoreAckSideband(_ResponsivePrerollSideband):
@@ -175,15 +173,14 @@ async def test_preroll_commits_complete_utterance_once_and_restores_vad():
         )
         assert appended == audio
         updates = [
-            event
-            for event in sideband.sent
-            if event["type"] == "session.update"
+            event for event in sideband.sent if event["type"] == "session.update"
         ]
         assert updates[0]["session"]["audio"]["input"]["turn_detection"] is None
-        assert updates[-1]["session"]["audio"]["input"][
-            "turn_detection"
-        ] == session.config.turn_detection_config()
-        assert session.can_renew is True
+        assert (
+            updates[-1]["session"]["audio"]["input"]["turn_detection"]
+            == session.config.turn_detection_config()
+        )
+        assert session.can_renew is False
 
         with pytest.raises(RealtimeProtocolError) as conflict:
             await session.ingest_preroll_audio(
@@ -221,21 +218,17 @@ async def test_preroll_ignores_stale_vad_acknowledgment():
     )
     try:
         await asyncio.wait_for(sideband.restore_sent.wait(), timeout=1)
-        await session.handle_provider_event(
-            {
-                "type": "session.updated",
-                "session": {"audio": {"input": {"turn_detection": None}}},
-            }
-        )
+        await session.handle_provider_event({
+            "type": "session.updated",
+            "session": {"audio": {"input": {"turn_detection": None}}},
+        })
         await asyncio.sleep(0)
         assert upload.done() is False
 
-        await session.handle_provider_event(
-            {
-                "type": "session.updated",
-                "session": sideband.restore_event["session"],
-            }
-        )
+        await session.handle_provider_event({
+            "type": "session.updated",
+            "session": sideband.restore_event["session"],
+        })
         result = await upload
         assert result["status"] == "committed"
     finally:
@@ -409,6 +402,106 @@ async def test_preroll_blocks_rotation_and_parallel_upload_until_teardown():
 
 
 @pytest.mark.asyncio
+async def test_active_provider_input_blocks_suspend_and_renew():
+    session = RealtimeVoiceSession(
+        session_id="active-input",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            provider_call_max_seconds=3600,
+            transcription_timeout_seconds=30,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_active_input",
+    )
+    session.state = "ready"
+
+    await session.handle_provider_event({"type": "input_audio_buffer.speech_started"})
+    await session.handle_provider_event({
+        "type": "input_audio_buffer.committed",
+        "item_id": "input_pending",
+    })
+
+    assert session.can_suspend is False
+    assert session.can_renew is False
+    with pytest.raises(RealtimeProtocolError) as busy:
+        await session.ingest_preroll_audio(
+            b"\x01\x00" * 7200,
+            idempotency_key="wake:while-input-active",
+        )
+    assert busy.value.code == "session_busy"
+    await session.close(reason="test_complete", end_session=False)
+
+
+def test_new_tool_batch_clears_stale_skip_without_losing_active_interrupt():
+    observed = []
+    agent = SimpleNamespace(
+        tools=[],
+        _session_db=None,
+        _skip_unstarted_tool_calls=True,
+    )
+
+    def execute(*_args):
+        observed.append(agent._skip_unstarted_tool_calls)
+
+    agent._execute_tool_calls_sequential = execute
+    session = RealtimeVoiceSession(
+        session_id="stale-tool-skip",
+        agent=agent,
+        config=RealtimeVoiceConfig(enabled=True),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_stale_tool_skip",
+    )
+    assistant = SimpleNamespace(content="", tool_calls=[])
+
+    session._execute_tools_sync(assistant, [], "task", 1, skip_unstarted=False)
+    session._client_interrupt_pending = True
+    session._execute_tools_sync(assistant, [], "task", 2, skip_unstarted=False)
+
+    assert observed == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_status_interruption_with_pending_continuation_starts_handoff_timeout():
+    sideband = _FakeSideband()
+    agent = SimpleNamespace(
+        tools=[],
+        _session_db=None,
+        _skip_unstarted_tool_calls=False,
+    )
+    session = RealtimeVoiceSession(
+        session_id="status-interrupt",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            preroll_timeout_seconds=0.01,
+            transcription_timeout_seconds=0.01,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_status_interrupt",
+    )
+    session.state = "tool_wait"
+    session._turn = SimpleNamespace(messages=[])
+    session._continuation_pending = True
+    session._status_response_active = True
+    session._active_status_response_id = "status_1"
+
+    await session.interrupt_response(
+        request_id="wake-status",
+        audio_end_ms=0,
+    )
+
+    assert session._interrupt_handoff_task is not None
+    await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
 async def test_recovered_call_rotation_uses_remaining_provider_lifetime():
     session = RealtimeVoiceSession(
         session_id="rotation-age",
@@ -487,40 +580,34 @@ async def test_real_skill_view_pipeline_persists_before_function_output(tmp_path
     )
     await session.start()
     try:
-        await session.handle_provider_event(
-            {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "item_id": "input_1",
-                "transcript": "Use my voice research skill.",
-            }
-        )
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Use my voice research skill.",
+        })
         assert agent._cached_system_prompt == frozen_prompt
         assert json.dumps(agent.tools, sort_keys=True) == frozen_tools
         assert sideband.sent[-1]["type"] == "response.create"
 
-        await session.handle_provider_event(
-            {
-                "type": "response.done",
-                "response": {
-                    "id": "response_1",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "function_call",
-                            "id": "item_1",
-                            "call_id": "tool_call_1",
-                            "name": "skill_view",
-                            "arguments": '{"name":"voice-research"}',
-                        }
-                    ],
-                },
-            }
-        )
+        await session.handle_provider_event({
+            "type": "response.done",
+            "response": {
+                "id": "response_1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "item_1",
+                        "call_id": "tool_call_1",
+                        "name": "skill_view",
+                        "arguments": '{"name":"voice-research"}',
+                    }
+                ],
+            },
+        })
         await session._tool_task
 
-        durable = db.get_tool_result_by_call_id(
-            "voice-session", "tool_call_1"
-        )
+        durable = db.get_tool_result_by_call_id("voice-session", "tool_call_1")
         assert durable is not None
         assert marker in durable["content"]
         output_events = [
@@ -535,26 +622,24 @@ async def test_real_skill_view_pipeline_persists_before_function_output(tmp_path
         assert roles[:3] == ["user", "assistant", "tool"]
         assert messages[1]["tool_calls"][0]["id"] == "tool_call_1"
 
-        await session.handle_provider_event(
-            {
-                "type": "response.done",
-                "response": {
-                    "id": "response_2",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "message",
-                            "content": [
-                                {
-                                    "type": "output_audio",
-                                    "transcript": "I used the saved playbook.",
-                                }
-                            ],
-                        }
-                    ],
-                },
-            }
-        )
+        await session.handle_provider_event({
+            "type": "response.done",
+            "response": {
+                "id": "response_2",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_audio",
+                                "transcript": "I used the saved playbook.",
+                            }
+                        ],
+                    }
+                ],
+            },
+        })
 
         final_messages = db.get_messages("voice-session")
         assert final_messages[-1]["role"] == "assistant"
@@ -600,13 +685,11 @@ async def test_duplicate_provider_response_does_not_repeat_tool_side_effect(
     )
     await session.start()
     try:
-        await session.handle_provider_event(
-            {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "item_id": "input_1",
-                "transcript": "Track one item.",
-            }
-        )
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Track one item.",
+        })
         event = {
             "type": "response.done",
             "response": {
@@ -657,6 +740,7 @@ async def test_transcript_timeout_continues_once_and_ignores_late_transcript(tmp
         quiet_mode=True,
     )
     agent._skill_nudge_interval = 0
+    sideband = _FakeSideband()
     session = RealtimeVoiceSession(
         session_id="transcript-timeout",
         agent=agent,
@@ -668,17 +752,15 @@ async def test_transcript_timeout_continues_once_and_ignores_late_transcript(tmp
         ),
         frozen_instructions=prepare_realtime_agent(agent, []),
         conversation_history=[],
-        sideband=_FakeSideband(),
+        sideband=sideband,
         call_id="call_transcript",
     )
     await session.start()
     try:
-        await session.handle_provider_event(
-            {
-                "type": "input_audio_buffer.committed",
-                "item_id": "input_slow",
-            }
-        )
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_slow",
+        })
         await _wait_until(lambda: bool(session.sideband.sent))
 
         user_rows = [
@@ -690,13 +772,11 @@ async def test_transcript_timeout_continues_once_and_ignores_late_transcript(tmp
         assert "transcript unavailable" in user_rows[0]["content"].lower()
         assert session.sideband.sent[-1]["type"] == "response.create"
 
-        await session.handle_provider_event(
-            {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "item_id": "input_slow",
-                "transcript": "This arrived too late.",
-            }
-        )
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_slow",
+            "transcript": "This arrived too late.",
+        })
         user_rows = [
             message
             for message in db.get_messages("transcript-timeout")
@@ -710,6 +790,831 @@ async def test_transcript_timeout_continues_once_and_ignores_late_transcript(tmp
             for event in events
         )
     finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_interrupt_cancels_truncates_and_accepts_next_preroll(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="structured-barge-in",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    sideband = _ResponsivePrerollSideband()
+    session = RealtimeVoiceSession(
+        session_id="structured-barge-in",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_structured_barge_in",
+    )
+    sideband.handler = session.handle_provider_event
+
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Give me a long answer.",
+        })
+        await session.handle_provider_event({
+            "type": "response.created",
+            "response": {
+                "id": "response_1",
+                "status": "in_progress",
+                "metadata": {},
+            },
+        })
+        await session.handle_provider_event({
+            "type": "response.output_item.added",
+            "response_id": "response_1",
+            "item": {
+                "id": "assistant_1",
+                "type": "message",
+                "role": "assistant",
+            },
+        })
+
+        first = await session.interrupt_response(
+            request_id="wake-2",
+            audio_end_ms=875,
+        )
+        repeated = await session.interrupt_response(
+            request_id="wake-2",
+            audio_end_ms=875,
+        )
+        assert first == repeated
+        with pytest.raises(RealtimeProtocolError) as conflict:
+            await session.interrupt_response(
+                request_id="wake-2",
+                audio_end_ms=900,
+            )
+        assert conflict.value.code == "interrupt_request_conflict"
+        assert first["status"] == "accepted"
+        assert first["truncation_requested"] is True
+        assert [event["type"] for event in sideband.sent].count("response.cancel") == 1
+        truncate = next(
+            event
+            for event in sideband.sent
+            if event["type"] == "conversation.item.truncate"
+        )
+        assert truncate["item_id"] == "assistant_1"
+        assert truncate["audio_end_ms"] == 875
+
+        preroll = await session.ingest_preroll_audio(
+            b"\x01\x00" * 7200,
+            idempotency_key="wake:2",
+        )
+        assert preroll["status"] == "committed"
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_preroll",
+            "transcript": "Actually, answer briefly.",
+        })
+        await session.handle_provider_event({
+            "type": "response.output_audio_transcript.done",
+            "response_id": "response_1",
+            "transcript": "This tail was generated but not heard.",
+        })
+        await session.handle_provider_event({
+            "type": "response.done",
+            "response": {
+                "id": "response_1",
+                "status": "cancelled",
+                "output": [],
+            },
+        })
+
+        messages = db.get_messages("structured-barge-in")
+        assert [message["role"] for message in messages[-3:]] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert messages[-2]["content"] == "[Assistant response interrupted by user.]"
+        assert messages[-2]["finish_reason"] == "interrupted"
+        assert messages[-1]["content"] == "Actually, answer briefly."
+        assert session.state == "responding"
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_interrupt_clears_active_webrtc_output_buffer():
+    sideband = _FakeSideband()
+    agent = SimpleNamespace(
+        tools=[],
+        _session_db=None,
+        _skip_unstarted_tool_calls=False,
+    )
+    session = RealtimeVoiceSession(
+        session_id="active-output-interrupt",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_active_output",
+    )
+    session.state = "responding"
+    session._turn = SimpleNamespace(messages=[])
+    session._active_response_id = "response_1"
+    session._generation_active_response_ids.add("response_1")
+    session._active_audio_item_id = "assistant_1"
+    session._active_output_audio_response_id = "response_1"
+
+    try:
+        result = await session.interrupt_response(
+            request_id="wake-active-output",
+            audio_end_ms=420,
+        )
+
+        assert result["output_clear_requested"] is True
+        assert result["truncation_requested"] is True
+        assert [event["type"] for event in sideband.sent] == [
+            "response.cancel",
+            "output_audio_buffer.clear",
+        ]
+    finally:
+        session._turn = None
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_late_playback_start_is_cleared_after_interrupt():
+    sideband = _FakeSideband()
+    agent = SimpleNamespace(
+        tools=[],
+        _session_db=None,
+        _skip_unstarted_tool_calls=False,
+    )
+    session = RealtimeVoiceSession(
+        session_id="late-output-start",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_late_output",
+    )
+    session.state = "responding"
+    session._turn = SimpleNamespace(messages=[])
+    session._active_response_id = "response_1"
+    session._generation_active_response_ids.add("response_1")
+    session._active_audio_item_id = "assistant_1"
+
+    try:
+        await session.interrupt_response(
+            request_id="wake-before-playback",
+            audio_end_ms=0,
+        )
+        await session.handle_provider_event({
+            "type": "output_audio_buffer.started",
+            "response_id": "response_1",
+        })
+
+        assert [event["type"] for event in sideband.sent] == [
+            "response.cancel",
+            "conversation.item.truncate",
+            "output_audio_buffer.clear",
+        ]
+    finally:
+        session._turn = None
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_completed_generation_waits_for_client_playback_before_turn_finalizes(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="playback-boundary",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="playback-boundary",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_playback",
+    )
+
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Tell me something.",
+        })
+        await session.handle_provider_event({
+            "type": "response.created",
+            "response": {"id": "response_1", "status": "in_progress"},
+        })
+        await session.handle_provider_event({
+            "type": "response.output_item.added",
+            "response_id": "response_1",
+            "item": {
+                "id": "assistant_1",
+                "type": "message",
+                "role": "assistant",
+            },
+        })
+        await session.handle_provider_event({
+            "type": "output_audio_buffer.started",
+            "response_id": "response_1",
+        })
+        await session.handle_provider_event({
+            "type": "response.done",
+            "response": {
+                "id": "response_1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_audio",
+                                "transcript": "The complete spoken answer.",
+                            }
+                        ],
+                    }
+                ],
+            },
+        })
+
+        assert session.state == "responding"
+        assert session._turn is not None
+        assert session._playback_finalize_task is None
+        assert [row["role"] for row in db.get_messages("playback-boundary")] == ["user"]
+
+        first = await session.complete_playback(
+            request_id="played-1",
+            response_id="response_1",
+        )
+        assert first["provider_output_drained"] is False
+        assert session.state == "responding"
+
+        await session.handle_provider_event({
+            "type": "output_audio_buffer.stopped",
+            "response_id": "response_1",
+        })
+        repeated = await session.complete_playback(
+            request_id="played-1",
+            response_id="response_1",
+        )
+
+        assert first == repeated
+        assert session.state == "ready"
+        messages = db.get_messages("playback-boundary")
+        assert messages[-1]["content"] == "The complete spoken answer."
+        events = session.broker.subscribe(after_sequence=0).backlog
+        assert any(event["type"] == "response.generated" for event in events)
+        assert any(event["type"] == "response.output_drained" for event in events)
+        assert any(event["type"] == "turn.completed" for event in events)
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_response_waits_for_partial_audio_playback_boundary(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="failed-playback-boundary",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    session = RealtimeVoiceSession(
+        session_id="failed-playback-boundary",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_failed_playback",
+    )
+
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Start an answer.",
+        })
+        await session.handle_provider_event({
+            "type": "response.created",
+            "response": {"id": "response_1", "status": "in_progress"},
+        })
+        await session.handle_provider_event({
+            "type": "response.output_item.added",
+            "response_id": "response_1",
+            "item": {
+                "id": "assistant_1",
+                "type": "message",
+                "role": "assistant",
+            },
+        })
+        await session.handle_provider_event({
+            "type": "output_audio_buffer.started",
+            "response_id": "response_1",
+        })
+        await session.handle_provider_event({
+            "type": "response.done",
+            "response": {
+                "id": "response_1",
+                "status": "failed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_audio",
+                                "transcript": "This partial audio was rendered.",
+                            }
+                        ],
+                    }
+                ],
+            },
+        })
+
+        assert session.state == "responding"
+        assert session._turn is not None
+        await session.complete_playback(
+            request_id="played-failed",
+            response_id="response_1",
+        )
+        await session.handle_provider_event({
+            "type": "output_audio_buffer.stopped",
+            "response_id": "response_1",
+        })
+
+        assert session.state == "ready"
+        completed = [
+            event
+            for event in session.broker.subscribe(after_sequence=0).backlog
+            if event["type"] == "turn.completed"
+        ][-1]
+        assert completed["data"]["failed"] is True
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_completion_requires_durable_sessiondb_flush(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="persistence-boundary",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    session = RealtimeVoiceSession(
+        session_id="persistence-boundary",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_persistence_boundary",
+    )
+
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Answer this.",
+        })
+        with (
+            patch.object(agent, "_flush_messages_to_session_db", return_value=False),
+            pytest.raises(RealtimeProtocolError) as persistence_error,
+        ):
+            await session.handle_provider_event({
+                "type": "response.done",
+                "response": {
+                    "id": "response_1",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "text", "text": "The answer."}],
+                        }
+                    ],
+                },
+            })
+
+        assert persistence_error.value.code == "turn_persistence_failed"
+        assert session._turn is not None
+        assert session.state == "degraded"
+        assert session.can_suspend is False
+        assert not any(
+            event["type"] == "turn.completed" for event in session.broker.snapshot()
+        )
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_batch_does_not_mask_turn_persistence_failure(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="tool-persistence-boundary",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    session = RealtimeVoiceSession(
+        session_id="tool-persistence-boundary",
+        agent=agent,
+        config=RealtimeVoiceConfig(enabled=True),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_tool_persistence",
+    )
+
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Run the tool.",
+        })
+        with patch.object(agent, "_flush_messages_to_session_db", return_value=False):
+            await session._execute_tool_batch(
+                [],
+                response_id="response_tools",
+                spoken_preamble="Interrupted preamble.",
+                skip_unstarted=True,
+            )
+
+        assert session.state == "degraded"
+        assert session._turn is not None
+        assistants = [
+            message
+            for message in session._turn.messages
+            if message.get("role") == "assistant"
+        ]
+        assert [message["content"] for message in assistants] == [
+            "Interrupted preamble."
+        ]
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_review_enqueue_failure_does_not_block_durable_turn_completion(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="review-enqueue-failure",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    session = RealtimeVoiceSession(
+        session_id="review-enqueue-failure",
+        agent=agent,
+        config=RealtimeVoiceConfig(enabled=True),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_review_enqueue_failure",
+    )
+
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Remember this.",
+        })
+        assert session._turn is not None
+        session._turn.should_review_memory = True
+
+        def fail_review_enqueue(**_kwargs):
+            raise RuntimeError("review queue unavailable")
+
+        agent._background_review_dispatch = fail_review_enqueue
+        await session.handle_provider_event({
+            "type": "response.done",
+            "response": {
+                "id": "response_1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "text", "text": "Remembered."}],
+                    }
+                ],
+            },
+        })
+
+        assert session.state == "ready"
+        assert session._turn is None
+        events = session.broker.snapshot()
+        assert any(event["type"] == "turn.completed" for event in events)
+        assert any(
+            event["type"] == "warning"
+            and event["data"]["code"] == "background_review_enqueue_failed"
+            for event in events
+        )
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_after_generation_done_truncates_unplayed_tail(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="late-barge-in",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="late-barge-in",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_late_barge_in",
+    )
+
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Give me a long answer.",
+        })
+        await session.handle_provider_event({
+            "type": "response.created",
+            "response": {"id": "response_1", "status": "in_progress"},
+        })
+        await session.handle_provider_event({
+            "type": "response.output_item.added",
+            "response_id": "response_1",
+            "item": {
+                "id": "assistant_1",
+                "type": "message",
+                "role": "assistant",
+            },
+        })
+        await session.handle_provider_event({
+            "type": "output_audio_buffer.started",
+            "response_id": "response_1",
+        })
+        await session.handle_provider_event({
+            "type": "response.done",
+            "response": {
+                "id": "response_1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_audio",
+                                "transcript": "Generated words the user did not hear.",
+                            }
+                        ],
+                    }
+                ],
+            },
+        })
+        await session.handle_provider_event({
+            "type": "output_audio_buffer.stopped",
+            "response_id": "response_1",
+        })
+
+        result = await session.interrupt_response(
+            request_id="wake-after-done",
+            audio_end_ms=640,
+        )
+
+        assert result["status"] == "accepted"
+        assert result["truncation_requested"] is True
+        assert not any(event["type"] == "response.cancel" for event in sideband.sent)
+        truncate = next(
+            event
+            for event in sideband.sent
+            if event["type"] == "conversation.item.truncate"
+        )
+        assert truncate["item_id"] == "assistant_1"
+        assert truncate["audio_end_ms"] == 640
+        messages = db.get_messages("late-barge-in")
+        assert messages[-1]["content"] == "[Assistant response interrupted by user.]"
+        assert messages[-1]["finish_reason"] == "interrupted"
+        assert session.state == "ready"
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_interrupt_before_tool_worker_start_skips_side_effects(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="pre-worker-interrupt",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="pre-worker-interrupt",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_pre_worker",
+    )
+    worker_waiting = threading.Event()
+    release_worker = threading.Event()
+    executed = []
+    original_execute = session._execute_tools_sync
+
+    def delayed_execute(*args, **kwargs):
+        worker_waiting.set()
+        release_worker.wait(timeout=5)
+        return original_execute(*args, **kwargs)
+
+    def fake_handle(_name, _args, _task_id, **kwargs):
+        executed.append(kwargs["tool_call_id"])
+        return json.dumps({"success": True})
+
+    session._execute_tools_sync = delayed_execute
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Create a todo.",
+        })
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            await session.handle_provider_event({
+                "type": "response.created",
+                "response": {"id": "response_tools", "status": "in_progress"},
+            })
+            await session.handle_provider_event({
+                "type": "response.output_item.added",
+                "response_id": "response_tools",
+                "item": {
+                    "id": "assistant_tools",
+                    "type": "message",
+                    "role": "assistant",
+                },
+            })
+            await session.handle_provider_event({
+                "type": "response.done",
+                "response": {
+                    "id": "response_tools",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "todo_1",
+                            "name": "todo",
+                            "arguments": '{"todos":[{"id":"one","content":"one"}]}',
+                        }
+                    ],
+                },
+            })
+            tool_task = session._tool_task
+            assert tool_task is not None
+            assert await asyncio.to_thread(worker_waiting.wait, 2)
+            await session.interrupt_response(
+                request_id="wake-before-worker",
+                audio_end_ms=0,
+            )
+            await session.handle_provider_event({
+                "type": "output_audio_buffer.started",
+                "response_id": "response_tools",
+            })
+            release_worker.set()
+            await tool_task
+
+        assert executed == []
+        assert any(
+            event["type"] == "output_audio_buffer.clear" for event in sideband.sent
+        )
+        result = db.get_tool_result_by_call_id("pre-worker-interrupt", "todo_1")
+        assert result is not None
+        assert "skipped" in result["content"].lower()
+    finally:
+        release_worker.set()
         await session.close(reason="test_complete", end_session=False)
         db.close()
 
@@ -746,46 +1651,40 @@ async def test_barge_in_before_tool_start_skips_entire_batch(tmp_path):
     )
     await session.start()
     try:
-        await session.handle_provider_event(
-            {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "item_id": "input_1",
-                "transcript": "Create both todos.",
-            }
-        )
-        await session.handle_provider_event(
-            {"type": "input_audio_buffer.speech_started"}
-        )
-        await session.handle_provider_event(
-            {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "item_id": "input_2",
-                "transcript": "Actually, do neither.",
-            }
-        )
-        await session.handle_provider_event(
-            {
-                "type": "response.done",
-                "response": {
-                    "id": "response_tools",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "function_call",
-                            "call_id": "todo_1",
-                            "name": "todo",
-                            "arguments": '{"todos":[{"id":"one","content":"one"}]}',
-                        },
-                        {
-                            "type": "function_call",
-                            "call_id": "todo_2",
-                            "name": "todo",
-                            "arguments": '{"todos":[{"id":"two","content":"two"}]}',
-                        },
-                    ],
-                },
-            }
-        )
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Create both todos.",
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_started"
+        })
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_2",
+            "transcript": "Actually, do neither.",
+        })
+        await session.handle_provider_event({
+            "type": "response.done",
+            "response": {
+                "id": "response_tools",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "todo_1",
+                        "name": "todo",
+                        "arguments": '{"todos":[{"id":"one","content":"one"}]}',
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "todo_2",
+                        "name": "todo",
+                        "arguments": '{"todos":[{"id":"two","content":"two"}]}',
+                    },
+                ],
+            },
+        })
         tool_task = session._tool_task
         assert tool_task is not None
         await tool_task
@@ -797,7 +1696,9 @@ async def test_barge_in_before_tool_start_skips_entire_batch(tmp_path):
             "todo_2",
         ]
         assert all("skipped" in message["content"].lower() for message in tool_rows)
-        assert [message["content"] for message in messages if message["role"] == "user"] == [
+        assert [
+            message["content"] for message in messages if message["role"] == "user"
+        ] == [
             "Create both todos.",
             "Actually, do neither.",
         ]
@@ -853,64 +1754,268 @@ async def test_barge_in_during_tool_preserves_started_call_and_skips_later_calls
 
     await session.start()
     try:
-        await session.handle_provider_event(
-            {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "item_id": "input_1",
-                "transcript": "Read both skills.",
-            }
-        )
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Read both skills.",
+        })
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
-            await session.handle_provider_event(
-                {
-                    "type": "response.done",
-                    "response": {
-                        "id": "response_tools",
-                        "status": "completed",
-                        "output": [
-                            {
-                                "type": "function_call",
-                                "call_id": "skill_1",
-                                "name": "skill_view",
-                                "arguments": '{"name":"one"}',
-                            },
-                            {
-                                "type": "function_call",
-                                "call_id": "skill_2",
-                                "name": "skill_view",
-                                "arguments": '{"name":"two"}',
-                            },
-                        ],
-                    },
-                }
-            )
+            await session.handle_provider_event({
+                "type": "response.done",
+                "response": {
+                    "id": "response_tools",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "skill_1",
+                            "name": "skill_view",
+                            "arguments": '{"name":"one"}',
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "skill_2",
+                            "name": "skill_view",
+                            "arguments": '{"name":"two"}',
+                        },
+                    ],
+                },
+            })
             tool_task = session._tool_task
             assert tool_task is not None
             assert await asyncio.to_thread(started.wait, 2)
-            await session.handle_provider_event(
-                {"type": "input_audio_buffer.speech_started"}
-            )
-            await session.handle_provider_event(
-                {
-                    "type": "conversation.item.input_audio_transcription.completed",
-                    "item_id": "input_2",
-                    "transcript": "Only use the first result.",
-                }
-            )
+            await session.handle_provider_event({
+                "type": "input_audio_buffer.speech_started"
+            })
             release.set()
             await tool_task
+            assert executed == ["skill_1"]
+            assert session._continuation_pending is True
+            await session.handle_provider_event({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "input_2",
+                "transcript": "Only use the first result.",
+            })
 
         assert executed == ["skill_1"]
         messages = db.get_messages("in-tool-barge-in")
         second = next(
-            message
-            for message in messages
-            if message.get("tool_call_id") == "skill_2"
+            message for message in messages if message.get("tool_call_id") == "skill_2"
         )
         assert "skipped" in second["content"].lower()
-        assert "Only use the first result." in second["content"]
-        assert len([message for message in messages if message["role"] == "user"]) == 1
+        assert [
+            message["content"] for message in messages if message["role"] == "user"
+        ] == ["Read both skills.", "Only use the first result."]
         assert sideband.sent[-1]["type"] == "response.create"
+    finally:
+        release.set()
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_replacement_speech_during_last_tool_is_durable_and_allows_next_tool(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["skills"],
+        session_id="durable-tool-steer",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="durable-tool-steer",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_durable_tool_steer",
+    )
+    started = threading.Event()
+    release = threading.Event()
+    executed = []
+
+    def fake_handle(_name, _args, _task_id, **kwargs):
+        call_id = kwargs["tool_call_id"]
+        executed.append(call_id)
+        if call_id == "skill_1":
+            started.set()
+            release.wait(timeout=5)
+        return json.dumps({"success": True, "call_id": call_id})
+
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Read the first skill.",
+        })
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            await session.handle_provider_event({
+                "type": "response.created",
+                "response": {"id": "response_tools_1", "status": "in_progress"},
+            })
+            await session.handle_provider_event({
+                "type": "response.done",
+                "response": {
+                    "id": "response_tools_1",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "skill_1",
+                            "name": "skill_view",
+                            "arguments": '{"name":"one"}',
+                        }
+                    ],
+                },
+            })
+            first_task = session._tool_task
+            assert first_task is not None
+            assert await asyncio.to_thread(started.wait, 2)
+            await session.interrupt_response(
+                request_id="wake-durable-steer",
+                audio_end_ms=0,
+            )
+            await session.handle_provider_event({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "input_2",
+                "transcript": "Use the second skill next.",
+            })
+            assert session._barge_in_during_response is False
+            release.set()
+            await first_task
+
+            durable = db.get_tool_result_by_call_id(
+                "durable-tool-steer",
+                "skill_1",
+            )
+            assert durable is not None
+            assert "Use the second skill next." in durable["content"]
+
+            await session.handle_provider_event({
+                "type": "response.created",
+                "response": {"id": "response_tools_2", "status": "in_progress"},
+            })
+            await session.handle_provider_event({
+                "type": "response.done",
+                "response": {
+                    "id": "response_tools_2",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "skill_2",
+                            "name": "skill_view",
+                            "arguments": '{"name":"two"}',
+                        }
+                    ],
+                },
+            })
+            second_task = session._tool_task
+            assert second_task is not None
+            await second_task
+
+        assert executed == ["skill_1", "skill_2"]
+    finally:
+        release.set()
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_tool_turn_expires_when_replacement_audio_never_arrives(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["skills"],
+        session_id="tool-handoff-timeout",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    session = RealtimeVoiceSession(
+        session_id="tool-handoff-timeout",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+            preroll_timeout_seconds=0.01,
+            transcription_timeout_seconds=0.01,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_tool_handoff",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_handle(_name, _args, _task_id, **_kwargs):
+        started.set()
+        release.wait(timeout=5)
+        return json.dumps({"success": True})
+
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "Read the skill.",
+        })
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            await session.handle_provider_event({
+                "type": "response.done",
+                "response": {
+                    "id": "response_tools",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "skill_1",
+                            "name": "skill_view",
+                            "arguments": '{"name":"one"}',
+                        }
+                    ],
+                },
+            })
+            tool_task = session._tool_task
+            assert tool_task is not None
+            assert await asyncio.to_thread(started.wait, 2)
+            await session.interrupt_response(
+                request_id="wake-without-handoff",
+                audio_end_ms=0,
+            )
+            release.set()
+            await tool_task
+
+        await _wait_until(lambda: session.state == "ready", timeout=2)
+        assert session.can_suspend is True
+        messages = db.get_messages("tool-handoff-timeout")
+        assert messages[-1]["finish_reason"] == "interrupted"
+        assert "replacement audio did not arrive" in messages[-1]["content"]
     finally:
         release.set()
         await session.close(reason="test_complete", end_session=False)
@@ -952,16 +2057,15 @@ async def test_background_reviews_are_single_flight_and_coalesce_boundaries(tmp_
 
     def fake_spawn(_agent, snapshot, *, review_memory, review_skills):
         def target():
-            calls.append(
-                {
-                    "last": snapshot[-1]["content"],
-                    "memory": review_memory,
-                    "skills": review_skills,
-                }
-            )
+            calls.append({
+                "last": snapshot[-1]["content"],
+                "memory": review_memory,
+                "skills": review_skills,
+            })
             if len(calls) == 1:
                 first_started.set()
                 release.wait(timeout=5)
+                return False
             return True
 
         return target, "review"
@@ -979,6 +2083,22 @@ async def test_background_reviews_are_single_flight_and_coalesce_boundaries(tmp_
                 review_memory=True,
             )
             assert await asyncio.to_thread(first_started.wait, 2)
+            first_thread = session._review_thread
+            assert first_thread is not None
+
+            recovered_session = RealtimeVoiceSession(
+                session_id="review-coalesce",
+                agent=agent,
+                config=session.config,
+                frozen_instructions=session.frozen_instructions,
+                conversation_history=[],
+                sideband=_FakeSideband(),
+                call_id="call_review_recovered",
+            )
+            await recovered_session._recover_due_review()
+            recovered_thread = recovered_session._review_thread
+            assert recovered_thread is not None
+            assert recovered_thread.is_alive()
 
             second_boundary = db.append_message(
                 "review-coalesce", role="assistant", content="second"
@@ -988,11 +2108,12 @@ async def test_background_reviews_are_single_flight_and_coalesce_boundaries(tmp_
                 review_skills=True,
             )
             release.set()
-            await asyncio.to_thread(session._review_thread.join, 5)
+            await asyncio.to_thread(first_thread.join, 5)
+            await asyncio.to_thread(recovered_thread.join, 5)
 
         assert calls == [
             {"last": "first", "memory": True, "skills": False},
-            {"last": "second", "memory": False, "skills": True},
+            {"last": "second", "memory": True, "skills": True},
         ]
         state = db.get_realtime_session_state("review-coalesce")
         assert state["review_state"] == "completed"
@@ -1004,5 +2125,80 @@ async def test_background_reviews_are_single_flight_and_coalesce_boundaries(tmp_
         )
     finally:
         release.set()
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_review_recovery_preserves_stored_snapshot_boundary(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["skills"],
+        session_id="review-boundary",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    session = RealtimeVoiceSession(
+        session_id="review-boundary",
+        agent=agent,
+        config=RealtimeVoiceConfig(enabled=True),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_review_boundary",
+    )
+    snapshots = []
+
+    def fake_spawn(_agent, snapshot, *, review_memory, review_skills):
+        def target():
+            snapshots.append((
+                [message["content"] for message in snapshot],
+                review_memory,
+                review_skills,
+            ))
+            return True
+
+        return target, "review"
+
+    await session.start()
+    try:
+        boundary = db.append_message(
+            "review-boundary",
+            role="user",
+            content="included",
+        )
+        db.mark_realtime_review_due(
+            "review-boundary",
+            boundary_message_id=boundary,
+            review_memory=True,
+            review_skills=False,
+        )
+        db.append_message(
+            "review-boundary",
+            role="assistant",
+            content="not included",
+        )
+
+        with patch(
+            "agent.background_review.spawn_background_review_thread",
+            side_effect=fake_spawn,
+        ):
+            await session._recover_due_review()
+            thread = session._review_thread
+            assert thread is not None
+            await asyncio.to_thread(thread.join, 5)
+
+        assert snapshots == [(["included"], True, False)]
+        state = db.get_realtime_session_state("review-boundary")
+        assert state["review_state"] == "completed"
+        assert state["review_boundary_message_id"] == boundary
+    finally:
         await session.close(reason="test_complete", end_session=False)
         db.close()

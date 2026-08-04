@@ -55,7 +55,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -1815,11 +1815,36 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("POST", "/v1/realtime/sessions", self._handle_realtime_session_create),
-            ("GET", "/v1/realtime/sessions/{session_id}/control", self._handle_realtime_control),
-            ("POST", "/v1/realtime/sessions/{session_id}/audio/preroll", self._handle_realtime_preroll),
-            ("POST", "/v1/realtime/sessions/{session_id}/approval", self._handle_realtime_approval),
-            ("POST", "/v1/realtime/sessions/{session_id}/renew", self._handle_realtime_session_renew),
-            ("DELETE", "/v1/realtime/sessions/{session_id}", self._handle_realtime_session_delete),
+            (
+                "GET",
+                "/v1/realtime/sessions/{session_id}/control",
+                self._handle_realtime_control,
+            ),
+            (
+                "POST",
+                "/v1/realtime/sessions/{session_id}/audio/preroll",
+                self._handle_realtime_preroll,
+            ),
+            (
+                "POST",
+                "/v1/realtime/sessions/{session_id}/approval",
+                self._handle_realtime_approval,
+            ),
+            (
+                "POST",
+                "/v1/realtime/sessions/{session_id}/renew",
+                self._handle_realtime_session_renew,
+            ),
+            (
+                "POST",
+                "/v1/realtime/sessions/{session_id}/suspend",
+                self._handle_realtime_session_suspend,
+            ),
+            (
+                "DELETE",
+                "/v1/realtime/sessions/{session_id}",
+                self._handle_realtime_session_delete,
+            ),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -1827,11 +1852,23 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
-            ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            (
+                "GET",
+                "/api/sessions/{session_id}/messages",
+                self._handle_session_messages,
+            ),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
-            ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
-            ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            (
+                "POST",
+                "/api/sessions/{session_id}/chat/stream",
+                self._handle_session_chat_stream,
+            ),
+            (
+                "POST",
+                "/api/sessions/{session_id}/model",
+                self._handle_session_model_lock,
+            ),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -1839,7 +1876,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # Generic platform HTTP event callback ingress. Authenticated by
             # the target adapter's own verifier (platform-signed bearer), NOT
             # API_SERVER_KEY — external platforms hold no API server key.
-            ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
+            (
+                "POST",
+                "/api/platforms/{platform}/events",
+                self._handle_platform_event_callback,
+            ),
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
@@ -3148,19 +3189,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model": config.model,
                 "voice": config.voice,
                 "control_url": (
-                    f"/v1/realtime/sessions/"
-                    f"{created.session.session_id}/control"
+                    f"/v1/realtime/sessions/{created.session.session_id}/control"
                 ),
                 "renew_url": (
-                    f"/v1/realtime/sessions/"
-                    f"{created.session.session_id}/renew"
+                    f"/v1/realtime/sessions/{created.session.session_id}/renew"
+                ),
+                "suspend_url": (
+                    f"/v1/realtime/sessions/{created.session.session_id}/suspend"
                 ),
                 "provider_call_max_seconds": config.provider_call_max_seconds,
             }
             if config.preroll_enabled:
                 payload["preroll_url"] = (
-                    f"/v1/realtime/sessions/"
-                    f"{created.session.session_id}/audio/preroll"
+                    f"/v1/realtime/sessions/{created.session.session_id}/audio/preroll"
                 )
             return web.json_response(payload)
         except Exception as exc:
@@ -3213,16 +3254,42 @@ class APIServerAdapter(BasePlatformAdapter):
                 "sdp": created.answer_sdp,
                 "model": config.model,
                 "voice": config.voice,
+                "suspend_url": (
+                    f"/v1/realtime/sessions/{created.session.session_id}/suspend"
+                ),
                 "provider_call_max_seconds": config.provider_call_max_seconds,
             }
             if config.preroll_enabled:
                 payload["preroll_url"] = (
-                    f"/v1/realtime/sessions/"
-                    f"{created.session.session_id}/audio/preroll"
+                    f"/v1/realtime/sessions/{created.session.session_id}/audio/preroll"
                 )
             return web.json_response(payload)
         except Exception as exc:
             logger.warning("Realtime session renewal failed: %s", exc)
+            return self._realtime_error_response(exc)
+
+    async def _handle_realtime_session_suspend(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            manager = self._ensure_realtime_manager()
+            suspended = await manager.suspend_session(
+                request.match_info["session_id"],
+                reason="client_suspended",
+            )
+            if not suspended:
+                return web.json_response(
+                    _openai_error(
+                        "Realtime session was not found",
+                        code="session_not_found",
+                    ),
+                    status=404,
+                )
+            return web.Response(status=204)
+        except Exception as exc:
             return self._realtime_error_response(exc)
 
     async def _handle_realtime_session_delete(
@@ -3282,6 +3349,7 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> "web.StreamResponse":
         from gateway.realtime.protocol import (
             RealtimeProtocolError,
+            control_event,
             validate_control_command,
         )
 
@@ -3298,6 +3366,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "after must be a non-negative integer",
                     code="invalid_control_cursor",
                 )
+            requested_stream_id = str(request.query.get("stream_id") or "").strip()
+            requested_after_sequence = after_sequence
+            stream_changed = bool(
+                requested_stream_id
+                and requested_stream_id != session.broker.stream_id
+            )
+            cursor_ahead = after_sequence > session.broker.latest_sequence
         except Exception as exc:
             return self._realtime_error_response(exc)
 
@@ -3306,23 +3381,78 @@ class APIServerAdapter(BasePlatformAdapter):
             max_msg_size=manager.config.max_control_event_bytes,
         )
         await ws.prepare(request)
+
+        def build_resync_event(reason: str) -> dict[str, Any]:
+            snapshot_factory = getattr(session, "control_snapshot", None)
+            snapshot = (
+                snapshot_factory()
+                if callable(snapshot_factory)
+                else {
+                    "session": {"state": getattr(session, "state", "ready")},
+                    "response": {},
+                    "pending_controls": [],
+                }
+            )
+            latest_sequence = session.broker.latest_sequence
+            return control_event(
+                sequence=max(1, latest_sequence),
+                session_id=session.session_id,
+                stream_id=session.broker.stream_id,
+                event_type="control.resync_required",
+                data={
+                    "reason": reason,
+                    "requested_after": requested_after_sequence,
+                    "requested_stream_id": requested_stream_id,
+                    "latest_sequence": latest_sequence,
+                    "stream_id": session.broker.stream_id,
+                    "snapshot": snapshot,
+                },
+            )
+
+        resync_event = None
+        if stream_changed or cursor_ahead:
+            after_sequence = session.broker.latest_sequence
+            resync_event = build_resync_event(
+                "stream_changed" if stream_changed else "cursor_ahead",
+            )
         subscription = session.broker.subscribe(after_sequence=after_sequence)
+        if subscription.cursor_expired:
+            session.broker.unsubscribe(subscription)
+            after_sequence = session.broker.latest_sequence
+            resync_event = build_resync_event("cursor_expired")
+            subscription = session.broker.subscribe(after_sequence=after_sequence)
+
+        def is_terminal_event(event: Mapping[str, Any]) -> bool:
+            return event.get("type") == "session.suspended" or (
+                event.get("type") == "session.state"
+                and event.get("data", {}).get("state") == "closed"
+            )
+
+        async def send_control_event(event: Mapping[str, Any]) -> bool:
+            await ws.send_json(event)
+            if is_terminal_event(event):
+                await ws.close(code=1001, message=b"session transport closed")
+                return True
+            return False
+
         try:
+            if resync_event is not None:
+                await ws.send_json(resync_event)
+                if session.closed:
+                    await ws.close(
+                        code=1001,
+                        message=b"session transport closed",
+                    )
+                    return ws
             for event in subscription.backlog:
-                await ws.send_json(event)
-            if subscription.cursor_expired:
-                session.broker.publish(
-                    "control.resync_required",
-                    {
-                        "requested_after": after_sequence,
-                        "latest_sequence": session.broker.latest_sequence,
-                    },
-                )
+                if await send_control_event(event):
+                    return ws
 
             async def send_events() -> None:
                 while not ws.closed:
                     event = await subscription.queue.get()
-                    await ws.send_json(event)
+                    if await send_control_event(event):
+                        return
 
             sender = asyncio.create_task(
                 send_events(), name=f"realtime-control-{session.session_id}"
@@ -3400,7 +3530,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "barge_in": {
                     "interrupts_audio": True,
                     "cancels_started_tools": False,
+                    "control_command": "response.interrupt",
+                    "requires_audio_end_ms": True,
+                    "accepts_preroll_after_interrupt": True,
+                    "supports_post_generation_interrupt": True,
                 },
+                "playback_completion_command": "response.playback_completed",
+                "turn_completed_after_playback": True,
+                "idle_provider_suspension": True,
                 "max_active_sessions": realtime_config.max_active_sessions,
                 "provider_call_max_seconds": (
                     realtime_config.provider_call_max_seconds
@@ -3420,6 +3557,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "sample_width_bytes": PREROLL_SAMPLE_WIDTH_BYTES,
                     "max_seconds": realtime_config.preroll_max_seconds,
                     "requires_idempotency_key": True,
+                    "reusable_per_provider_call": True,
                     "webrtc_handoff": "unmute_after_committed",
                 },
                 "background_self_improvement": {
@@ -3429,9 +3567,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
             }
             if realtime_config.enabled and not realtime_key:
-                realtime_details["unavailable_reason"] = (
-                    "openai_credentials_missing"
-                )
+                realtime_details["unavailable_reason"] = "openai_credentials_missing"
             elif realtime_available and not review_configured:
                 realtime_details["background_self_improvement"][
                     "unavailable_reason"
@@ -3502,26 +3638,72 @@ class APIServerAdapter(BasePlatformAdapter):
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
-                "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
+                "run_approval": {
+                    "method": "POST",
+                    "path": "/v1/runs/{run_id}/approval",
+                },
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
-                "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
-                "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
-                "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
-                "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
-                "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
-                "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
-                "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
-                "realtime_session_create": {"method": "POST", "path": "/v1/realtime/sessions"},
-                "realtime_control": {"method": "GET", "path": "/v1/realtime/sessions/{session_id}/control"},
-                "realtime_preroll": {"method": "POST", "path": "/v1/realtime/sessions/{session_id}/audio/preroll"},
-                "realtime_approval": {"method": "POST", "path": "/v1/realtime/sessions/{session_id}/approval"},
-                "realtime_renew": {"method": "POST", "path": "/v1/realtime/sessions/{session_id}/renew"},
-                "realtime_close": {"method": "DELETE", "path": "/v1/realtime/sessions/{session_id}"},
+                "session_update": {
+                    "method": "PATCH",
+                    "path": "/api/sessions/{session_id}",
+                },
+                "session_delete": {
+                    "method": "DELETE",
+                    "path": "/api/sessions/{session_id}",
+                },
+                "session_messages": {
+                    "method": "GET",
+                    "path": "/api/sessions/{session_id}/messages",
+                },
+                "session_fork": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/fork",
+                },
+                "session_chat": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/chat",
+                },
+                "session_chat_stream": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/chat/stream",
+                },
+                "session_model_lock": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/model",
+                },
+                "realtime_session_create": {
+                    "method": "POST",
+                    "path": "/v1/realtime/sessions",
+                },
+                "realtime_control": {
+                    "method": "GET",
+                    "path": "/v1/realtime/sessions/{session_id}/control",
+                },
+                "realtime_preroll": {
+                    "method": "POST",
+                    "path": "/v1/realtime/sessions/{session_id}/audio/preroll",
+                },
+                "realtime_approval": {
+                    "method": "POST",
+                    "path": "/v1/realtime/sessions/{session_id}/approval",
+                },
+                "realtime_renew": {
+                    "method": "POST",
+                    "path": "/v1/realtime/sessions/{session_id}/renew",
+                },
+                "realtime_suspend": {
+                    "method": "POST",
+                    "path": "/v1/realtime/sessions/{session_id}/suspend",
+                },
+                "realtime_close": {
+                    "method": "DELETE",
+                    "path": "/v1/realtime/sessions/{session_id}",
+                },
             },
         })
 

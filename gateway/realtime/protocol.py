@@ -21,31 +21,31 @@ PREROLL_CHANNELS = 1
 PREROLL_SAMPLE_WIDTH_BYTES = 2
 PREROLL_MIN_MILLISECONDS = 100
 PREROLL_APPEND_CHUNK_MILLISECONDS = 1_000
+MAX_INTERRUPT_AUDIO_END_MS = 60 * 60 * 1000
 
-SESSION_STATES = frozenset(
-    {
-        "negotiating",
-        "connecting",
-        "ready",
-        "listening",
-        "responding",
-        "tool_wait",
-        "rotating",
-        "closing",
-        "closed",
-        "degraded",
-    }
-)
+SESSION_STATES = frozenset({
+    "negotiating",
+    "connecting",
+    "ready",
+    "listening",
+    "responding",
+    "tool_wait",
+    "rotating",
+    "suspended",
+    "closing",
+    "closed",
+    "degraded",
+})
 
-CONTROL_COMMAND_TYPES = frozenset(
-    {
-        "approval.respond",
-        "clarification.respond",
-        "secret.respond",
-        "session.close",
-        "session.ping",
-    }
-)
+CONTROL_COMMAND_TYPES = frozenset({
+    "approval.respond",
+    "clarification.respond",
+    "response.interrupt",
+    "response.playback_completed",
+    "secret.respond",
+    "session.close",
+    "session.ping",
+})
 
 APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
 
@@ -384,13 +384,11 @@ class RealtimeVoiceConfig:
             "interrupt_response": True,
         }
         if self.vad_type == "server_vad":
-            turn_detection.update(
-                {
-                    "threshold": self.vad_threshold,
-                    "prefix_padding_ms": self.vad_prefix_padding_ms,
-                    "silence_duration_ms": self.vad_silence_duration_ms,
-                }
-            )
+            turn_detection.update({
+                "threshold": self.vad_threshold,
+                "prefix_padding_ms": self.vad_prefix_padding_ms,
+                "silence_duration_ms": self.vad_silence_duration_ms,
+            })
         return turn_detection
 
     def openai_session(
@@ -709,16 +707,68 @@ def response_create_event(
     if instructions:
         response["instructions"] = instructions
     if status_message:
-        response.update(
-            {
-                "conversation": "none",
-                "output_modalities": ["audio"],
-                "tools": [],
-                "tool_choice": "none",
-                "metadata": {"hermes_kind": "tool_wait_status"},
-            }
-        )
+        response.update({
+            "conversation": "none",
+            "output_modalities": ["audio"],
+            "tools": [],
+            "tool_choice": "none",
+            "metadata": {"hermes_kind": "tool_wait_status"},
+        })
     event: dict[str, Any] = {"type": "response.create", "response": response}
+    if event_id:
+        event["event_id"] = event_id
+    return event
+
+
+def response_cancel_event(
+    *,
+    response_id: Optional[str] = None,
+    event_id: Optional[str] = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": "response.cancel"}
+    if response_id:
+        event["response_id"] = response_id
+    if event_id:
+        event["event_id"] = event_id
+    return event
+
+
+def output_audio_buffer_clear_event(
+    *,
+    event_id: Optional[str] = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": "output_audio_buffer.clear"}
+    if event_id:
+        event["event_id"] = event_id
+    return event
+
+
+def conversation_item_truncate_event(
+    item_id: str,
+    audio_end_ms: int,
+    *,
+    event_id: Optional[str] = None,
+) -> dict[str, Any]:
+    if not _ID_RE.fullmatch(str(item_id or "")):
+        raise RealtimeProtocolError(
+            "Invalid assistant item ID",
+            code="invalid_assistant_item_id",
+        )
+    if (
+        isinstance(audio_end_ms, bool)
+        or not isinstance(audio_end_ms, int)
+        or not 0 <= audio_end_ms <= MAX_INTERRUPT_AUDIO_END_MS
+    ):
+        raise RealtimeProtocolError(
+            "audio_end_ms is outside the supported range",
+            code="invalid_interrupt_audio_end_ms",
+        )
+    event: dict[str, Any] = {
+        "type": "conversation.item.truncate",
+        "item_id": item_id,
+        "content_index": 0,
+        "audio_end_ms": audio_end_ms,
+    }
     if event_id:
         event["event_id"] = event_id
     return event
@@ -754,6 +804,7 @@ def control_event(
     *,
     sequence: int,
     session_id: str,
+    stream_id: str = "",
     event_type: str,
     data: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
@@ -761,7 +812,7 @@ def control_event(
         raise RealtimeProtocolError("Control sequence must be positive")
     if not _ID_RE.fullmatch(session_id):
         raise RealtimeProtocolError("Invalid session ID", code="invalid_session_id")
-    return {
+    event = {
         "version": CONTROL_PROTOCOL_VERSION,
         "sequence": sequence,
         "session_id": session_id,
@@ -769,6 +820,14 @@ def control_event(
         "timestamp": time(),
         "data": dict(data or {}),
     }
+    if stream_id:
+        if not _ID_RE.fullmatch(stream_id):
+            raise RealtimeProtocolError(
+                "Invalid control stream ID",
+                code="invalid_control_stream_id",
+            )
+        event["stream_id"] = stream_id
+    return event
 
 
 def validate_control_command(raw: Any) -> dict[str, Any]:
@@ -809,14 +868,14 @@ def validate_control_command(raw: Any) -> dict[str, Any]:
         )
     request_id = str(raw.get("request_id") or "").strip()
     if request_id and not _ID_RE.fullmatch(request_id):
-        raise RealtimeProtocolError(
-            "request_id is invalid", code="invalid_request_id"
-        )
+        raise RealtimeProtocolError("request_id is invalid", code="invalid_request_id")
     data = raw.get("data")
     if data is None:
         data = {}
     if not isinstance(data, Mapping):
-        raise RealtimeProtocolError("data must be an object", code="invalid_control_data")
+        raise RealtimeProtocolError(
+            "data must be an object", code="invalid_control_data"
+        )
     normalized = {
         "version": CONTROL_PROTOCOL_VERSION,
         "type": command_type,
@@ -831,4 +890,34 @@ def validate_control_command(raw: Any) -> dict[str, Any]:
                 code="invalid_approval_choice",
             )
         normalized["data"]["choice"] = choice
+    elif command_type == "response.interrupt":
+        if not request_id:
+            raise RealtimeProtocolError(
+                "response.interrupt requires request_id",
+                code="invalid_request_id",
+            )
+        audio_end_ms = data.get("audio_end_ms")
+        if (
+            isinstance(audio_end_ms, bool)
+            or not isinstance(audio_end_ms, int)
+            or not 0 <= audio_end_ms <= MAX_INTERRUPT_AUDIO_END_MS
+        ):
+            raise RealtimeProtocolError(
+                "audio_end_ms must be an integer between 0 and 3600000",
+                code="invalid_interrupt_audio_end_ms",
+            )
+        normalized["data"] = {"audio_end_ms": audio_end_ms}
+    elif command_type == "response.playback_completed":
+        if not request_id:
+            raise RealtimeProtocolError(
+                "response.playback_completed requires request_id",
+                code="invalid_request_id",
+            )
+        response_id = str(data.get("response_id") or "").strip()
+        if not _ID_RE.fullmatch(response_id):
+            raise RealtimeProtocolError(
+                "response_id is invalid",
+                code="invalid_response_id",
+            )
+        normalized["data"] = {"response_id": response_id}
     return normalized

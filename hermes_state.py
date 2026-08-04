@@ -5638,6 +5638,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         result["tool_call_id"] = tool_call_id
         return result
 
+    def update_tool_result_by_call_id(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        content: Any,
+    ) -> bool:
+        """Update the latest active durable result for a provider tool call."""
+
+        if not session_id or not tool_call_id:
+            return False
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE messages
+                   SET content = ?
+                   WHERE id = (
+                       SELECT id FROM messages
+                       WHERE session_id = ? AND role = 'tool'
+                         AND tool_call_id = ? AND active = 1
+                       ORDER BY id DESC LIMIT 1
+                   )""",
+                (
+                    self._encode_content(content),
+                    session_id,
+                    tool_call_id,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        return bool(
+            self._execute_write(
+                _do,
+                patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            )
+        )
+
     def save_realtime_session_state(
         self,
         session_id: str,
