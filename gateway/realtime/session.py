@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from collections import OrderedDict, defaultdict, deque
-from dataclasses import dataclass
-import hashlib
+from dataclasses import dataclass, field
 import json
 import logging
 from pathlib import Path
@@ -23,14 +24,13 @@ from gateway.realtime.openai_sideband import (
     OpenAIRealtimeSideband,
 )
 from gateway.realtime.protocol import (
+    AUDIO_UPLINK_CHANNELS,
+    AUDIO_UPLINK_MIN_MILLISECONDS,
+    AUDIO_UPLINK_SAMPLE_RATE_HZ,
+    AUDIO_UPLINK_SAMPLE_WIDTH_BYTES,
     RealtimeFunctionCall,
     RealtimeProtocolError,
     RealtimeVoiceConfig,
-    PREROLL_APPEND_CHUNK_MILLISECONDS,
-    PREROLL_CHANNELS,
-    PREROLL_MIN_MILLISECONDS,
-    PREROLL_SAMPLE_RATE_HZ,
-    PREROLL_SAMPLE_WIDTH_BYTES,
     SESSION_STATES,
     conversation_item_truncate_event,
     conversation_function_call_event,
@@ -44,14 +44,15 @@ from gateway.realtime.protocol import (
     response_cancel_event,
     response_create_event,
     response_transcript,
-    session_turn_detection_update_event,
-    validate_preroll_idempotency_key,
 )
 
 
 logger = logging.getLogger(__name__)
 
 PLAYBACK_COMPLETION_GRACE_SECONDS = 2.0
+PENDING_AUDIO_TRANSCRIPT = (
+    "[Voice transcript pending; use the committed audio input.]"
+)
 _REVIEW_PROCESS_LOCKS_GUARD = threading.Lock()
 _REVIEW_PROCESS_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 
@@ -83,34 +84,46 @@ class _PendingPrompt:
 
 
 @dataclass
-class _PrerollRequest:
-    digest: str
+class _AudioUplink:
+    stream_id: str
     call_id: str
-    task: Optional[asyncio.Task]
+    begin_command: dict[str, Any]
+    preroll_milliseconds: int = 0
+    owner_id: str = ""
+    provider_timeline_start_bytes: int = 0
+    state: str = "active"
+    audio_bytes: int = 0
+    uncommitted_bytes: int = 0
+    committed_audio_bytes: int = 0
+    inflight_audio_bytes: int = 0
+    pending_commit_boundary_bytes: Optional[int] = None
+    fallback_commit_boundary_bytes: Optional[int] = None
+    speech_since_commit: bool = False
+    committed_item_ids: list[str] = field(default_factory=list)
+    transcripts: dict[str, str] = field(default_factory=dict)
+    fallback_commit_sent: bool = False
+    turn_dispatched: bool = False
+    turn: Optional[TurnContext] = None
+    transcript_persistence_settled: bool = False
+    forwarding_audio: bool = False
+    close_requested: bool = False
+    begin_result: Optional[dict[str, Any]] = None
     result: Optional[dict[str, Any]] = None
-    failure: Optional["_PrerollFailure"] = None
-
-
-@dataclass(frozen=True)
-class _PrerollFailure:
-    kind: str
-    message: str
-    code: str
-    status: Optional[int] = None
-    retryable: bool = False
-
-
-@dataclass
-class _PrerollWaiter:
-    event_type: str
-    future: asyncio.Future
-    matches: Optional[Callable[[Mapping[str, Any]], bool]] = None
+    timeout_task: Optional[asyncio.Task] = None
 
 
 @dataclass(frozen=True)
 class _PendingTerminalResponse:
     response_id: str
     transcript: str
+    failed: bool
+
+
+@dataclass(frozen=True)
+class _DeferredTurnFinalization:
+    transcript: str
+    response_id: str
+    interrupted: bool
     failed: bool
 
 
@@ -221,13 +234,13 @@ class RealtimeVoiceSession:
         self._receive_task: Optional[asyncio.Task] = None
         self._rotation_task: Optional[asyncio.Task] = None
         self._event_lock = asyncio.Lock()
-        self._preroll_request_lock = asyncio.Lock()
-        self._preroll_requests: OrderedDict[str, _PrerollRequest] = OrderedDict()
-        self._preroll_tasks: set[asyncio.Task] = set()
-        self._preroll_active = False
-        self._preroll_waiter: Optional[_PrerollWaiter] = None
-        self._preroll_error_future: Optional[asyncio.Future] = None
-        self._preroll_event_ids: set[str] = set()
+        self._audio_uplink_append_lock = asyncio.Lock()
+        self._audio_uplink: Optional[_AudioUplink] = None
+        self._audio_uplinks: OrderedDict[
+            tuple[str, str], _AudioUplink
+        ] = OrderedDict()
+        self._audio_uplink_items: dict[str, _AudioUplink] = {}
+        self._audio_uplink_append_events: dict[str, _AudioUplink] = {}
         self._renewal_required = False
         self._turn: Optional[TurnContext] = None
         self._turn_response_count = 0
@@ -249,11 +262,17 @@ class RealtimeVoiceSession:
         self._active_response_id = ""
         self._generation_active_response_ids: set[str] = set()
         self._active_audio_item_id = ""
+        self._response_audio_items: dict[str, set[str]] = defaultdict(set)
+        self._response_audio_bytes: dict[tuple[str, str], int] = defaultdict(int)
+        self._finalized_response_ids: set[str] = set()
         self._active_output_audio_response_id = ""
         self._playback_started_response_ids: set[str] = set()
         self._output_drained_response_ids: set[str] = set()
         self._client_playback_completed_response_ids: set[str] = set()
         self._pending_terminal_response: Optional[_PendingTerminalResponse] = None
+        self._deferred_turn_finalization: Optional[
+            _DeferredTurnFinalization
+        ] = None
         self._playback_finalize_task: Optional[asyncio.Task] = None
         self._playback_completion_requests: OrderedDict[str, dict[str, Any]] = (
             OrderedDict()
@@ -270,6 +289,10 @@ class RealtimeVoiceSession:
         self._transcript_wait_tasks: dict[str, asyncio.Task] = {}
         self._handled_input_items: set[str] = set()
         self._provider_input_active = False
+        self._provider_input_audio_bytes_sent = 0
+        self._provider_input_timeline_known = call_started_at is None
+        self._quarantine_provider_input = False
+        self._quarantined_input_items: set[str] = set()
         self._provider_input_tokens = 0
         self._rotation_notified = False
         self._barge_in_during_response = False
@@ -300,7 +323,7 @@ class RealtimeVoiceSession:
             not self._closed
             and not self._closing
             and not self._finalizing_turn
-            and not self._preroll_active
+            and self._audio_uplink is None
             and not self._provider_input_active
             and not any(
                 not task.done() for task in self._transcript_wait_tasks.values()
@@ -327,7 +350,7 @@ class RealtimeVoiceSession:
             not self._closed
             and not self._closing
             and not self._finalizing_turn
-            and not self._preroll_active
+            and self._audio_uplink is None
             and not self._provider_input_active
             and not any(
                 not task.done() for task in self._transcript_wait_tasks.values()
@@ -372,6 +395,14 @@ class RealtimeVoiceSession:
                     self._tool_task is not None and not self._tool_task.done()
                 ),
                 "input_active": self._provider_input_active,
+                "audio_uplink": (
+                    {
+                        "stream_id": self._audio_uplink.stream_id,
+                        "state": self._audio_uplink.state,
+                    }
+                    if self._audio_uplink is not None
+                    else None
+                ),
             },
             "response": {
                 "provider_response_id": response_id,
@@ -392,480 +423,740 @@ class RealtimeVoiceSession:
             tools=self.frozen_tools,
         )
 
-    async def ingest_preroll_audio(
+    async def begin_audio_uplink(
         self,
-        audio: bytes,
+        command: Mapping[str, Any],
         *,
-        idempotency_key: str,
+        owner_id: str = "",
     ) -> dict[str, Any]:
-        """Commit one complete, locally endpointed first utterance."""
+        """Reserve one streamed PCM turn and atomically apply barge-in."""
 
-        if not self.config.preroll_enabled:
+        if not self.config.audio_uplink_enabled:
             raise RealtimeProtocolError(
-                "Wake-word pre-roll upload is disabled",
-                code="preroll_disabled",
+                "Realtime audio uplink is disabled",
+                code="audio_uplink_disabled",
             )
-        key = validate_preroll_idempotency_key(idempotency_key)
-        if not isinstance(audio, bytes):
+        if not self._provider_input_timeline_known:
+            self._renewal_required = True
+            self._set_state("degraded", reason="audio_uplink_timeline_unknown")
+            await self._persist_runtime_state("renewal_required")
+            self.broker.publish(
+                "session.rotation_required",
+                {"reason": "audio_uplink_timeline_unknown"},
+            )
             raise RealtimeProtocolError(
-                "Pre-roll audio must be raw PCM bytes",
-                code="invalid_preroll_audio",
+                "Renew the provider call before opening an audio uplink",
+                code="session_renewal_required",
             )
-        frame_bytes = PREROLL_CHANNELS * PREROLL_SAMPLE_WIDTH_BYTES
-        minimum_bytes = (
-            PREROLL_SAMPLE_RATE_HZ * frame_bytes * PREROLL_MIN_MILLISECONDS // 1000
-        )
-        if len(audio) < minimum_bytes:
+        stream_id = str(command.get("stream_id") or "")
+        preroll_milliseconds = int(command.get("preroll_ms") or 0)
+        if preroll_milliseconds > self.config.audio_uplink_max_seconds * 1000:
             raise RealtimeProtocolError(
-                f"Pre-roll audio must contain at least {PREROLL_MIN_MILLISECONDS} ms",
-                code="preroll_audio_too_short",
+                "preroll_ms exceeds the configured stream duration limit",
+                code="invalid_audio_preroll_ms",
             )
-        if len(audio) > self.config.preroll_max_bytes:
-            raise RealtimeProtocolError(
-                "Pre-roll audio exceeds the configured duration limit",
-                code="preroll_audio_too_large",
-            )
-        if len(audio) % frame_bytes:
-            raise RealtimeProtocolError(
-                "Pre-roll PCM contains an incomplete sample frame",
-                code="invalid_preroll_audio",
-            )
-
-        digest = hashlib.sha256(audio).hexdigest()
-        async with self._preroll_request_lock:
-            existing = self._preroll_requests.get(key)
-            if existing is not None and existing.call_id != self.call_id:
-                self._preroll_requests.pop(key, None)
-                existing = None
-            if existing is not None:
-                if existing.digest != digest:
-                    raise RealtimeProtocolError(
-                        "Idempotency-Key was already used with different audio",
-                        code="preroll_idempotency_conflict",
-                    )
-                self._preroll_requests.move_to_end(key)
-                if existing.failure is not None:
-                    self._raise_preroll_failure(existing.failure)
-                if existing.result is not None:
-                    return dict(existing.result)
-                task = existing.task
-                if task is None:
-                    raise RuntimeError("Pre-roll request has no cached outcome")
-            else:
-                if any(
-                    request.task is not None
-                    and not request.task.done()
-                    and request.call_id == self.call_id
-                    for request in self._preroll_requests.values()
-                ):
-                    raise RealtimeProtocolError(
-                        "Another pre-roll upload is already in progress",
-                        code="preroll_in_progress",
-                    )
-                self._prune_preroll_requests()
-                task = asyncio.create_task(
-                    self._run_preroll_upload(audio, key),
-                    name=f"realtime-preroll-{self.session_id}",
-                )
-                self._preroll_tasks.add(task)
-                request = _PrerollRequest(
-                    digest=digest,
-                    call_id=self.call_id,
-                    task=task,
-                )
-                self._preroll_requests[key] = request
-                task.add_done_callback(
-                    lambda completed, request_key=key, record=request: (
-                        self._preroll_task_done(request_key, record, completed)
-                    )
-                )
-        return await asyncio.shield(task)
-
-    def _preroll_task_done(
-        self,
-        key: str,
-        request: _PrerollRequest,
-        task: asyncio.Task,
-    ) -> None:
-        self._preroll_tasks.discard(task)
-        if self._preroll_requests.get(key) is not request:
-            return
-        if task.cancelled():
-            self._preroll_requests.pop(key, None)
-            return
-        try:
-            request.result = dict(task.result())
-        except Exception as exc:
-            request.failure = self._sanitize_preroll_failure(exc)
-        finally:
-            request.task = None
-
-    @staticmethod
-    def _sanitize_preroll_failure(exc: Exception) -> _PrerollFailure:
-        message = str(exc).replace("\r", " ").replace("\n", " ").strip()[:1000]
-        if isinstance(exc, RealtimeProtocolError):
-            return _PrerollFailure(
-                kind="protocol",
-                message=message,
-                code=exc.code,
-            )
-        if isinstance(exc, OpenAIRealtimeError):
-            return _PrerollFailure(
-                kind="provider",
-                message=message,
-                code=exc.code,
-                status=exc.status,
-                retryable=exc.retryable,
-            )
-        return _PrerollFailure(
-            kind="internal",
-            message=message or "Pre-roll upload failed",
-            code="realtime_internal_error",
-        )
-
-    @staticmethod
-    def _raise_preroll_failure(failure: _PrerollFailure) -> None:
-        if failure.kind == "protocol":
-            raise RealtimeProtocolError(failure.message, code=failure.code)
-        if failure.kind == "provider":
-            raise OpenAIRealtimeError(
-                failure.message,
-                code=failure.code,
-                status=failure.status,
-                retryable=failure.retryable,
-            )
-        raise RuntimeError(failure.message)
-
-    def _prune_preroll_requests(self) -> None:
-        while len(self._preroll_requests) >= 16:
-            for key, request in list(self._preroll_requests.items()):
-                if request.task is None or request.task.done():
-                    self._preroll_requests.pop(key)
-                    break
-            else:
-                raise RealtimeProtocolError(
-                    "Pre-roll request capacity is temporarily exhausted",
-                    code="preroll_in_progress",
-                )
-
-    async def _run_preroll_upload(
-        self,
-        audio: bytes,
-        idempotency_key: str,
-    ) -> dict[str, Any]:
+        normalized_command = {
+            "type": "turn.begin",
+            "stream_id": stream_id,
+            "barge_in": bool(command.get("barge_in")),
+            "preroll_ms": preroll_milliseconds,
+            "interrupted": (
+                dict(command["interrupted"])
+                if isinstance(command.get("interrupted"), Mapping)
+                else None
+            ),
+        }
+        key = (self.call_id, stream_id)
         with self._pending_prompts_lock:
             has_pending_prompts = bool(self._pending_prompts)
         async with self._event_lock:
-            tool_running = self._tool_task is not None and not self._tool_task.done()
-            interrupted_handoff = self._client_interrupt_pending and self.state in {
-                "responding",
-                "tool_wait",
-            }
-            if self._renewal_required:
-                raise RealtimeProtocolError(
-                    "The provider call must be renewed before another pre-roll upload",
-                    code="session_renewal_required",
+            existing = self._audio_uplinks.get(key)
+            if existing is not None:
+                if existing.begin_command != normalized_command:
+                    raise RealtimeProtocolError(
+                        "stream_id was already used with different turn metadata",
+                        code="audio_stream_idempotency_conflict",
+                    )
+                self._audio_uplinks.move_to_end(key)
+                if (
+                    existing.state == "active"
+                    and existing.owner_id
+                    and existing.owner_id != owner_id
+                ):
+                    raise RealtimeProtocolError(
+                        "Audio stream is already attached to another socket",
+                        code="audio_stream_already_attached",
+                    )
+                return dict(
+                    existing.result
+                    or existing.begin_result
+                    or {
+                        "status": "accepted",
+                        "stream_id": stream_id,
+                        "call_id": self.call_id,
+                    }
                 )
-            if (
+
+            tool_running = self._tool_task is not None and not self._tool_task.done()
+            barge_in = normalized_command["barge_in"]
+            bargeable = self.state in {"responding", "tool_wait"} or bool(
+                self._active_output_audio_response_id
+                or self._pending_terminal_response
+                or tool_running
+            )
+            busy = (
                 self._closing
                 or self._closed
                 or self._finalizing_turn
+                or self._renewal_required
+                or self._audio_uplink is not None
                 or self._pending_next_inputs
-                or (self.state != "ready" and not interrupted_handoff)
-                or (self._turn is not None and not interrupted_handoff)
-                or (tool_running and not interrupted_handoff)
                 or self._provider_input_active
-                or any(not task.done() for task in self._transcript_wait_tasks.values())
                 or self._pending_approvals
                 or has_pending_prompts
-                or self._preroll_active
-            ):
-                raise RealtimeProtocolError(
-                    (
-                        "Realtime session is busy; pre-roll requires an idle "
-                        "session or an accepted response interruption"
-                    ),
-                    code="session_busy",
+                or (
+                    not barge_in
+                    and (
+                        self.state != "ready"
+                        or self._turn is not None
+                        or tool_running
+                    )
                 )
-            self._preroll_active = True
+                or (barge_in and self.state != "ready" and not bargeable)
+            )
+            if busy:
+                code = (
+                    "session_renewal_required"
+                    if self._renewal_required
+                    else "session_busy"
+                )
+                raise RealtimeProtocolError(
+                    "Realtime session cannot accept a new audio stream",
+                    code=code,
+                )
+
+            self._prune_audio_uplinks()
+            uplink = _AudioUplink(
+                stream_id=stream_id,
+                call_id=self.call_id,
+                begin_command=normalized_command,
+                preroll_milliseconds=preroll_milliseconds,
+                owner_id=owner_id,
+                provider_timeline_start_bytes=self._provider_input_audio_bytes_sent,
+            )
+            uplink.begin_result = {
+                "status": "accepted",
+                "stream_id": stream_id,
+                "call_id": self.call_id,
+                "barge_in": barge_in,
+                "preroll_ms": preroll_milliseconds,
+            }
+            self._audio_uplinks[key] = uplink
+            self._audio_uplink = uplink
             self.last_activity_at = time.time()
 
-        duration_ms = round(
-            len(audio)
-            * 1000
-            / (PREROLL_SAMPLE_RATE_HZ * PREROLL_CHANNELS * PREROLL_SAMPLE_WIDTH_BYTES)
-        )
-        self.broker.publish(
-            "audio.preroll_started",
-            {"duration_ms": duration_ms, "audio_bytes": len(audio)},
-        )
-        self._reset_preroll_provider_signals()
-        self._preroll_error_future = asyncio.get_running_loop().create_future()
-        deadline = (
-            asyncio.get_running_loop().time() + self.config.preroll_timeout_seconds
-        )
-        vad_may_be_disabled = False
-        buffer_may_be_dirty = True
         try:
-            vad_may_be_disabled = True
-            await self._send_preroll_and_wait(
-                session_turn_detection_update_event(
-                    None,
-                    event_id=self._event_id("preroll_vad_off"),
-                ),
-                "session.updated",
-                deadline,
-                matches=lambda event: self._session_update_matches(event, None),
-            )
-            await self._send_preroll_and_wait(
-                input_audio_buffer_clear_event(
-                    event_id=self._event_id("preroll_clear")
-                ),
-                "input_audio_buffer.cleared",
-                deadline,
-            )
-            buffer_may_be_dirty = False
-
-            chunk_bytes = (
-                PREROLL_SAMPLE_RATE_HZ
-                * PREROLL_CHANNELS
-                * PREROLL_SAMPLE_WIDTH_BYTES
-                * PREROLL_APPEND_CHUNK_MILLISECONDS
-                // 1000
-            )
-            for offset in range(0, len(audio), chunk_bytes):
-                buffer_may_be_dirty = True
-                event = input_audio_buffer_append_event(
-                    audio[offset : offset + chunk_bytes],
-                    event_id=self._event_id("preroll_append"),
+            if normalized_command["barge_in"]:
+                interruption = await self.interrupt_for_audio_uplink(
+                    stream_id=stream_id,
+                    interrupted=normalized_command["interrupted"],
                 )
-                self._preroll_event_ids.add(event["event_id"])
-                await self._send_preroll_event(event, deadline)
-                self._raise_preroll_provider_error()
-
-            committed = await self._send_preroll_and_wait(
-                input_audio_buffer_commit_event(
-                    event_id=self._event_id("preroll_commit")
-                ),
-                "input_audio_buffer.committed",
-                deadline,
+                uplink.begin_result["interruption"] = interruption
+        except Exception:
+            await self._fail_audio_uplink(
+                uplink,
+                reason="audio_uplink_interrupt_failed",
             )
-            buffer_may_be_dirty = False
-            await self._restore_preroll_vad(deadline)
-            vad_may_be_disabled = False
-            item_id = str(committed.get("item_id") or "").strip()
-            result = {
-                "version": 1,
-                "session_id": self.session_id,
-                "call_id": self.call_id,
-                "idempotency_key": idempotency_key,
-                "status": "committed",
-                "item_id": item_id,
-                "audio_bytes": len(audio),
-                "duration_ms": duration_ms,
-            }
-            self.broker.publish(
-                "audio.preroll_committed",
-                {
-                    "provider_item_id": item_id,
-                    "duration_ms": duration_ms,
-                    "audio_bytes": len(audio),
-                },
-            )
-            return result
-        except (Exception, asyncio.CancelledError):
-            if vad_may_be_disabled and not self._closed:
-                try:
-                    await self._cleanup_failed_preroll(
-                        buffer_may_be_dirty=buffer_may_be_dirty,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Could not clean provider audio after pre-roll failure for %s",
-                        self.session_id,
-                    )
-                await self._mark_preroll_renewal_required("preroll_upload_failed")
-            raise
-        finally:
-            self._reset_preroll_provider_signals()
             async with self._event_lock:
-                self._preroll_active = False
+                self._audio_uplinks.pop(key, None)
+            raise
 
-    async def _cleanup_failed_preroll(
+        self.broker.publish(
+            "audio.uplink_started",
+            {
+                "stream_id": stream_id,
+                "barge_in": normalized_command["barge_in"],
+                "preroll_ms": preroll_milliseconds,
+            },
+        )
+        return dict(uplink.begin_result)
+
+    async def append_audio_uplink(
+        self,
+        stream_id: str,
+        audio: bytes,
+        *,
+        owner_id: str = "",
+    ) -> None:
+        """Forward raw PCM immediately, splitting only oversized client frames."""
+
+        if not isinstance(audio, bytes) or not audio:
+            raise RealtimeProtocolError(
+                "Audio uplink frames must contain raw PCM bytes",
+                code="invalid_audio_uplink_frame",
+            )
+        frame_bytes = AUDIO_UPLINK_CHANNELS * AUDIO_UPLINK_SAMPLE_WIDTH_BYTES
+        if len(audio) % frame_bytes:
+            raise RealtimeProtocolError(
+                "Audio uplink PCM contains an incomplete sample frame",
+                code="invalid_audio_uplink_frame",
+            )
+
+        chunk_bytes = (
+            AUDIO_UPLINK_SAMPLE_RATE_HZ
+            * AUDIO_UPLINK_CHANNELS
+            * AUDIO_UPLINK_SAMPLE_WIDTH_BYTES
+            * self.config.audio_uplink_append_chunk_milliseconds
+            // 1000
+        )
+        try:
+            async with self._audio_uplink_append_lock:
+                async with self._event_lock:
+                    uplink = self._audio_uplinks.get((self.call_id, stream_id))
+                    self._require_audio_uplink_owner(
+                        uplink,
+                        owner_id=owner_id,
+                        require_active=False,
+                    )
+                    if uplink.state == "dispatched":
+                        return
+                    uplink.forwarding_audio = True
+                for offset in range(0, len(audio), chunk_bytes):
+                    chunk = audio[offset : offset + chunk_bytes]
+                    async with self._event_lock:
+                        self._require_audio_uplink_owner(
+                            uplink,
+                            owner_id=owner_id,
+                            require_active=True,
+                        )
+                        if (
+                            uplink.audio_bytes + len(chunk)
+                            > self.config.audio_uplink_max_bytes
+                        ):
+                            raise RealtimeProtocolError(
+                                (
+                                    "Audio stream exceeds the configured "
+                                    "duration limit"
+                                ),
+                                code="audio_uplink_too_large",
+                            )
+                        uplink.inflight_audio_bytes = (
+                            uplink.audio_bytes + len(chunk)
+                        )
+                    append_event_id = self._event_id("audio_uplink_append")
+                    async with self._event_lock:
+                        self._audio_uplink_append_events[append_event_id] = uplink
+                    await asyncio.wait_for(
+                        self.sideband.send(
+                            input_audio_buffer_append_event(
+                                chunk,
+                                event_id=append_event_id,
+                            )
+                        ),
+                        timeout=self.config.request_timeout_seconds,
+                    )
+                    async with self._event_lock:
+                        uplink.audio_bytes = max(
+                            uplink.audio_bytes,
+                            uplink.inflight_audio_bytes,
+                        )
+                        uplink.inflight_audio_bytes = 0
+                        uplink.uncommitted_bytes = max(
+                            0,
+                            uplink.audio_bytes - uplink.committed_audio_bytes,
+                        )
+                        self._provider_input_audio_bytes_sent += len(chunk)
+                        self.last_activity_at = time.time()
+                        await self._maybe_dispatch_audio_uplink_turn(uplink)
+                        if uplink.state == "dispatched":
+                            uplink.forwarding_audio = False
+                            return
+                await self._finish_audio_uplink_forwarding(uplink)
+        except asyncio.TimeoutError as exc:
+            await self._finish_audio_uplink_forwarding(uplink, dispatch=False)
+            await self._fail_audio_uplink(
+                uplink,
+                reason="audio_uplink_provider_timeout",
+            )
+            raise RealtimeProtocolError(
+                "Timed out forwarding audio to the provider",
+                code="audio_uplink_provider_timeout",
+            ) from exc
+        except RealtimeProtocolError:
+            await self._finish_audio_uplink_forwarding(uplink, dispatch=False)
+            raise
+        except Exception:
+            await self._finish_audio_uplink_forwarding(uplink, dispatch=False)
+            await self._fail_audio_uplink(
+                uplink,
+                reason="audio_uplink_provider_error",
+            )
+            raise
+
+    async def _finish_audio_uplink_forwarding(
+        self,
+        uplink: _AudioUplink,
+        *,
+        dispatch: bool = True,
+    ) -> None:
+        async with self._event_lock:
+            if self._audio_uplink is uplink:
+                uplink.forwarding_audio = False
+                uplink.inflight_audio_bytes = 0
+                if dispatch:
+                    await self._maybe_dispatch_audio_uplink_turn(uplink)
+
+    def _require_audio_uplink_owner(
+        self,
+        uplink: Optional[_AudioUplink],
+        *,
+        owner_id: str,
+        require_active: bool,
+    ) -> None:
+        if self._quarantine_provider_input:
+            raise RealtimeProtocolError(
+                "Renew the provider call before sending more audio",
+                code="session_renewal_required",
+            )
+        if uplink is None or uplink is not self._audio_uplink:
+            raise RealtimeProtocolError(
+                "Audio stream is not active",
+                code="audio_stream_not_active",
+            )
+        if uplink.owner_id != owner_id:
+            raise RealtimeProtocolError(
+                "Audio stream is attached to another socket",
+                code="audio_stream_not_owner",
+            )
+        if require_active and uplink.state != "active":
+            raise RealtimeProtocolError(
+                "Audio stream no longer accepts frames",
+                code="audio_stream_ended",
+            )
+
+    async def end_audio_uplink(
+        self,
+        stream_id: str,
+        *,
+        owner_id: str = "",
+    ) -> dict[str, Any]:
+        """Stop accepting frames; provider VAD remains responsible for commit."""
+
+        async with self._event_lock:
+            uplink = self._audio_uplinks.get((self.call_id, stream_id))
+            if uplink is None:
+                raise RealtimeProtocolError(
+                    "Audio stream was not found",
+                    code="audio_stream_not_found",
+                )
+            if uplink.owner_id != owner_id:
+                raise RealtimeProtocolError(
+                    "Audio stream is attached to another socket",
+                    code="audio_stream_not_owner",
+                )
+            if uplink.state == "dispatched":
+                uplink.state = "committed"
+                self._cancel_audio_uplink_timeout(uplink)
+                if self._audio_uplink is uplink:
+                    self._audio_uplink = None
+                return dict(uplink.result or {"status": "committed"})
+            if uplink.state != "active":
+                return dict(
+                    uplink.result
+                    or {
+                        "status": uplink.state,
+                        "stream_id": stream_id,
+                        "call_id": uplink.call_id,
+                    }
+                )
+            uplink.close_requested = True
+            uplink.state = "ending"
+            uplink.result = {
+                "status": "ending",
+                "stream_id": stream_id,
+                "call_id": uplink.call_id,
+                "audio_bytes": uplink.audio_bytes,
+                "duration_ms": self._audio_duration_ms(uplink.audio_bytes),
+            }
+            self.last_activity_at = time.time()
+            await self._maybe_dispatch_audio_uplink_turn(uplink)
+            if self._audio_uplink is uplink and (
+                not uplink.committed_item_ids
+                or uplink.speech_since_commit
+                or uplink.uncommitted_bytes
+            ):
+                self._schedule_audio_uplink_timeout(uplink)
+
+        self.broker.publish(
+            "audio.uplink_ended",
+            {
+                "stream_id": stream_id,
+                "audio_bytes": uplink.audio_bytes,
+                "duration_ms": self._audio_duration_ms(uplink.audio_bytes),
+            },
+        )
+        return dict(uplink.result or {})
+
+    async def teardown_audio_uplink(
+        self,
+        stream_id: str,
+        *,
+        reason: str,
+        owner_id: str = "",
+    ) -> dict[str, Any]:
+        """Resolve an abnormal stream end without leaving provider input dirty."""
+
+        minimum_bytes = (
+            AUDIO_UPLINK_SAMPLE_RATE_HZ
+            * AUDIO_UPLINK_CHANNELS
+            * AUDIO_UPLINK_SAMPLE_WIDTH_BYTES
+            * AUDIO_UPLINK_MIN_MILLISECONDS
+            // 1000
+        )
+        action = ""
+        async with self._event_lock:
+            uplink = self._audio_uplinks.get((self.call_id, stream_id))
+            if uplink is None:
+                return {"status": "not_found", "stream_id": stream_id}
+            if uplink.owner_id != owner_id:
+                return {
+                    "status": "detached",
+                    "stream_id": stream_id,
+                    "call_id": uplink.call_id,
+                }
+            if uplink.state == "dispatched":
+                uplink.state = "committed"
+                self._cancel_audio_uplink_timeout(uplink)
+                if self._audio_uplink is uplink:
+                    self._audio_uplink = None
+                return dict(uplink.result or {"status": "committed"})
+            if uplink.state in {"committed", "discarded", "failed"}:
+                return dict(uplink.result or {"status": uplink.state})
+            uplink.close_requested = True
+            if uplink.state == "active":
+                uplink.state = "ending"
+                uplink.result = {
+                    "status": "ending",
+                    "stream_id": stream_id,
+                    "call_id": uplink.call_id,
+                    "audio_bytes": uplink.audio_bytes,
+                    "duration_ms": self._audio_duration_ms(uplink.audio_bytes),
+                    "reason": reason,
+                }
+            if uplink.fallback_commit_sent:
+                return dict(uplink.result or {"status": "ending"})
+            if uplink.uncommitted_bytes >= minimum_bytes:
+                uplink.fallback_commit_sent = True
+                uplink.fallback_commit_boundary_bytes = uplink.audio_bytes
+                action = "commit"
+            elif uplink.uncommitted_bytes:
+                uplink.uncommitted_bytes = 0
+                uplink.speech_since_commit = False
+                action = "clear"
+            elif not uplink.committed_item_ids:
+                action = "discard"
+
+        try:
+            if action == "commit":
+                await asyncio.wait_for(
+                    self.sideband.send(
+                        input_audio_buffer_commit_event(
+                            event_id=self._event_id("audio_uplink_fallback_commit")
+                        )
+                    ),
+                    timeout=self.config.request_timeout_seconds,
+                )
+                async with self._event_lock:
+                    if (
+                        self._audio_uplink is uplink
+                        and uplink.fallback_commit_sent
+                    ):
+                        self._schedule_audio_uplink_timeout(uplink)
+            elif action == "clear":
+                await asyncio.wait_for(
+                    self.sideband.send(
+                        input_audio_buffer_clear_event(
+                            event_id=self._event_id("audio_uplink_discard")
+                        )
+                    ),
+                    timeout=self.config.request_timeout_seconds,
+                )
+            elif action == "discard":
+                async with self._event_lock:
+                    self._discard_audio_uplink_locked(uplink, reason=reason)
+        except asyncio.TimeoutError as exc:
+            await self._fail_audio_uplink(
+                uplink,
+                reason="audio_uplink_teardown_timeout",
+            )
+            raise RealtimeProtocolError(
+                "Timed out resolving an interrupted audio stream",
+                code="audio_uplink_provider_timeout",
+            ) from exc
+        except Exception:
+            await self._fail_audio_uplink(
+                uplink,
+                reason="audio_uplink_teardown_failed",
+            )
+            raise
+
+        async with self._event_lock:
+            if action == "clear" and not uplink.committed_item_ids:
+                self._discard_audio_uplink_locked(uplink, reason=reason)
+            elif action != "discard":
+                await self._maybe_dispatch_audio_uplink_turn(uplink)
+            result = dict(
+                uplink.result
+                or {
+                    "status": "ending",
+                    "stream_id": stream_id,
+                    "call_id": uplink.call_id,
+                }
+            )
+        return result
+
+    async def abort_audio_uplink(
+        self,
+        stream_id: str,
+        *,
+        reason: str,
+        owner_id: str = "",
+    ) -> None:
+        """Discard partial client-invalid audio and require a clean provider call."""
+
+        async with self._event_lock:
+            uplink = self._audio_uplinks.get((self.call_id, stream_id))
+            if uplink is None or uplink.owner_id != owner_id:
+                return
+            self._quarantine_provider_input = True
+        try:
+            await asyncio.wait_for(
+                self.sideband.send(
+                    input_audio_buffer_clear_event(
+                        event_id=self._event_id("audio_uplink_abort")
+                    )
+                ),
+                timeout=self.config.request_timeout_seconds,
+            )
+        except Exception:
+            logger.warning(
+                "Could not clear rejected audio stream %s",
+                stream_id,
+                exc_info=True,
+            )
+        await self._fail_audio_uplink(uplink, reason=reason)
+
+    async def _fail_audio_uplink(
+        self,
+        uplink: _AudioUplink,
+        *,
+        reason: str,
+    ) -> None:
+        async with self._event_lock:
+            first_notification = self._fail_audio_uplink_locked(
+                uplink,
+                reason=reason,
+            )
+        await self._persist_audio_uplink_failure(
+            reason=reason,
+            first_notification=first_notification,
+        )
+
+    def _fail_audio_uplink_locked(
+        self,
+        uplink: _AudioUplink,
+        *,
+        reason: str,
+    ) -> bool:
+        first_notification = not self._renewal_required
+        uplink.state = "failed"
+        uplink.result = {
+            "status": "failed",
+            "stream_id": uplink.stream_id,
+            "call_id": uplink.call_id,
+            "reason": reason,
+        }
+        self._cancel_audio_uplink_timeout(uplink)
+        if self._audio_uplink is uplink:
+            self._audio_uplink = None
+        self._provider_input_active = False
+        self._client_interrupt_pending = False
+        self._barge_in_during_response = False
+        self._pending_interrupt_audio_end_ms = None
+        self.agent._skip_unstarted_tool_calls = False
+        self._renewal_required = True
+        self._quarantine_provider_input = True
+        if not self._closed:
+            self._set_state("degraded", reason=reason)
+        return first_notification
+
+    async def _persist_audio_uplink_failure(
         self,
         *,
-        buffer_may_be_dirty: bool,
+        reason: str,
+        first_notification: bool,
     ) -> None:
-        self._reset_preroll_provider_signals()
-        self._preroll_error_future = asyncio.get_running_loop().create_future()
-        deadline = asyncio.get_running_loop().time() + min(
-            5.0, self.config.preroll_timeout_seconds
-        )
-        if buffer_may_be_dirty:
-            await self._send_preroll_and_wait(
-                input_audio_buffer_clear_event(
-                    event_id=self._event_id("preroll_cleanup_clear")
-                ),
-                "input_audio_buffer.cleared",
-                deadline,
-            )
-        await self._restore_preroll_vad(deadline)
-
-    async def _mark_preroll_renewal_required(self, reason: str) -> None:
-        first_notification = not self._renewal_required
-        self._renewal_required = True
-        if self._closed:
-            return
-        self._set_state("degraded", reason=reason)
-        try:
-            await self._persist_runtime_state("renewal_required")
-        except Exception:
-            logger.exception(
-                "Could not persist required pre-roll renewal for %s",
-                self.session_id,
-            )
+        if not self._closed:
+            try:
+                await self._persist_runtime_state("renewal_required")
+            except Exception:
+                logger.exception(
+                    "Could not persist required audio-uplink renewal for %s",
+                    self.session_id,
+                )
         if first_notification:
             self.broker.publish("session.rotation_required", {"reason": reason})
 
-    async def _restore_preroll_vad(
-        self,
-        deadline: float,
-        *,
-        reset_signals: bool = False,
-    ) -> None:
-        turn_detection = self.config.turn_detection_config()
-        if reset_signals:
-            self._reset_preroll_provider_signals()
-            self._preroll_error_future = asyncio.get_running_loop().create_future()
+    def _prune_audio_uplinks(self) -> None:
+        while len(self._audio_uplinks) >= 32:
+            for key, uplink in list(self._audio_uplinks.items()):
+                if uplink is not self._audio_uplink:
+                    self._audio_uplinks.pop(key)
+                    self._audio_uplink_append_events = {
+                        event_id: event_uplink
+                        for event_id, event_uplink
+                        in self._audio_uplink_append_events.items()
+                        if event_uplink is not uplink
+                    }
+                    for item_id in uplink.committed_item_ids:
+                        if self._audio_uplink_items.get(item_id) is uplink:
+                            self._audio_uplink_items.pop(item_id, None)
+                    break
+            else:
+                raise RealtimeProtocolError(
+                    "Audio stream capacity is temporarily exhausted",
+                    code="audio_uplink_in_progress",
+                )
+
+    def _schedule_audio_uplink_timeout(self, uplink: _AudioUplink) -> None:
+        self._cancel_audio_uplink_timeout(uplink)
+        uplink.timeout_task = asyncio.create_task(
+            self._expire_audio_uplink(uplink),
+            name=f"realtime-audio-uplink-{self.session_id}",
+        )
+
+    def _cancel_audio_uplink_timeout(self, uplink: _AudioUplink) -> None:
+        task, uplink.timeout_task = uplink.timeout_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _expire_audio_uplink(self, uplink: _AudioUplink) -> None:
         try:
-            await self._send_preroll_and_wait(
-                session_turn_detection_update_event(
-                    turn_detection,
-                    event_id=self._event_id("preroll_vad_on"),
-                ),
-                "session.updated",
-                deadline,
-                matches=lambda event: self._session_update_matches(
-                    event, turn_detection
-                ),
+            await asyncio.sleep(self.config.audio_uplink_idle_timeout_seconds)
+            async with self._event_lock:
+                if self._audio_uplink is not uplink:
+                    return
+                fallback_sent = uplink.fallback_commit_sent
+            if fallback_sent:
+                await self._fail_audio_uplink(
+                    uplink,
+                    reason="audio_uplink_commit_timeout",
+                )
+            else:
+                await self.teardown_audio_uplink(
+                    uplink.stream_id,
+                    reason="audio_uplink_idle_timeout",
+                    owner_id=uplink.owner_id,
+                )
+        except asyncio.CancelledError:
+            return
+
+    def _discard_audio_uplink_locked(
+        self,
+        uplink: _AudioUplink,
+        *,
+        reason: str,
+    ) -> None:
+        uplink.state = "discarded"
+        uplink.result = {
+            "status": "discarded",
+            "stream_id": uplink.stream_id,
+            "call_id": uplink.call_id,
+            "reason": reason,
+            "audio_bytes": uplink.audio_bytes,
+        }
+        self._cancel_audio_uplink_timeout(uplink)
+        if self._audio_uplink is uplink:
+            self._audio_uplink = None
+        self._provider_input_active = False
+        self.broker.publish(
+            "audio.uplink_discarded",
+            {"stream_id": uplink.stream_id, "reason": reason},
+        )
+
+    async def _maybe_dispatch_audio_uplink_turn(
+        self,
+        uplink: _AudioUplink,
+    ) -> None:
+        preroll_bytes = (
+            uplink.preroll_milliseconds
+            * AUDIO_UPLINK_SAMPLE_RATE_HZ
+            * AUDIO_UPLINK_CHANNELS
+            * AUDIO_UPLINK_SAMPLE_WIDTH_BYTES
+            // 1000
+        )
+        if (
+            self._audio_uplink is not uplink
+            or uplink.state not in {"active", "ending"}
+            or uplink.turn_dispatched
+            or uplink.forwarding_audio
+            or (
+                uplink.audio_bytes < preroll_bytes
+                and not uplink.close_requested
             )
-        except Exception:
-            if self._closed:
-                raise
-            self._reset_preroll_provider_signals()
-            self._preroll_error_future = asyncio.get_running_loop().create_future()
-            await self._send_preroll_and_wait(
-                session_turn_detection_update_event(
-                    turn_detection,
-                    event_id=self._event_id("preroll_vad_retry"),
-                ),
-                "session.updated",
-                asyncio.get_running_loop().time()
-                + min(5.0, self.config.preroll_timeout_seconds),
-                matches=lambda event: self._session_update_matches(
-                    event, turn_detection
-                ),
-            )
+            or not uplink.committed_item_ids
+            or uplink.speech_since_commit
+            or uplink.uncommitted_bytes
+        ):
+            return
+
+        item_id = uplink.committed_item_ids[-1]
+        uplink.state = "dispatched"
+        uplink.turn_dispatched = True
+        uplink.result = {
+            "status": "committed",
+            "stream_id": uplink.stream_id,
+            "call_id": uplink.call_id,
+            "item_ids": list(uplink.committed_item_ids),
+            "audio_bytes": uplink.audio_bytes,
+            "duration_ms": self._audio_duration_ms(uplink.audio_bytes),
+        }
+        self._cancel_audio_uplink_timeout(uplink)
+        self._provider_input_active = False
+        for committed_item_id in uplink.committed_item_ids:
+            self._handled_input_items.add(committed_item_id)
+        transcript, transcript_available = self._audio_uplink_transcript(uplink)
+        self.broker.publish(
+            "audio.uplink_committed",
+            {
+                "stream_id": uplink.stream_id,
+                "provider_item_ids": list(uplink.committed_item_ids),
+                "audio_bytes": uplink.audio_bytes,
+                "duration_ms": self._audio_duration_ms(uplink.audio_bytes),
+                "transcript_available": transcript_available,
+            },
+        )
+        await self._handle_input(transcript, item_id)
+        if transcript_available:
+            uplink.transcript_persistence_settled = True
+            for committed_item_id in uplink.committed_item_ids:
+                self._audio_uplink_items.pop(committed_item_id, None)
+        if uplink.close_requested:
+            uplink.state = "committed"
+            if self._audio_uplink is uplink:
+                self._audio_uplink = None
 
     @staticmethod
-    def _session_update_matches(
-        event: Mapping[str, Any],
-        expected: Optional[Mapping[str, Any]],
-    ) -> bool:
-        session = event.get("session")
-        session = session if isinstance(session, Mapping) else {}
-        audio = session.get("audio")
-        audio = audio if isinstance(audio, Mapping) else {}
-        input_config = audio.get("input")
-        input_config = input_config if isinstance(input_config, Mapping) else {}
-        if "turn_detection" not in input_config:
-            return False
-        actual = input_config.get("turn_detection")
-        if expected is None:
-            return actual is None
-        if not isinstance(actual, Mapping):
-            return False
-        return all(actual.get(key) == value for key, value in expected.items())
-
-    async def _send_preroll_event(
-        self,
-        event: Mapping[str, Any],
-        deadline: float,
-    ) -> None:
-        timeout = deadline - asyncio.get_running_loop().time()
-        event_type = str(event.get("type") or "provider event")
-        if timeout <= 0:
-            raise RealtimeProtocolError(
-                f"Timed out sending {event_type}",
-                code="preroll_provider_timeout",
+    def _audio_duration_ms(audio_bytes: int) -> int:
+        return round(
+            audio_bytes
+            * 1000
+            / (
+                AUDIO_UPLINK_SAMPLE_RATE_HZ
+                * AUDIO_UPLINK_CHANNELS
+                * AUDIO_UPLINK_SAMPLE_WIDTH_BYTES
             )
-        try:
-            await asyncio.wait_for(self.sideband.send(event), timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            raise RealtimeProtocolError(
-                f"Timed out sending {event_type}",
-                code="preroll_provider_timeout",
-            ) from exc
-
-    async def _send_preroll_and_wait(
-        self,
-        event: Mapping[str, Any],
-        expected_event_type: str,
-        deadline: float,
-        *,
-        matches: Optional[Callable[[Mapping[str, Any]], bool]] = None,
-    ) -> Mapping[str, Any]:
-        if self._preroll_waiter is not None:
-            raise RuntimeError("A pre-roll provider acknowledgment is already pending")
-        future = asyncio.get_running_loop().create_future()
-        waiter = _PrerollWaiter(expected_event_type, future, matches)
-        self._preroll_waiter = waiter
-        event_id = str(event.get("event_id") or "")
-        if event_id:
-            self._preroll_event_ids.add(event_id)
-        try:
-            await self._send_preroll_event(event, deadline)
-            timeout = deadline - asyncio.get_running_loop().time()
-            if timeout <= 0:
-                raise asyncio.TimeoutError
-            error_future = self._preroll_error_future
-            futures = {future}
-            if error_future is not None:
-                futures.add(error_future)
-            done, _pending = await asyncio.wait(
-                futures,
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if not done:
-                raise asyncio.TimeoutError
-            if error_future is not None and error_future in done:
-                raise error_future.result()
-            return future.result()
-        except asyncio.TimeoutError as exc:
-            raise RealtimeProtocolError(
-                f"Timed out waiting for {expected_event_type}",
-                code="preroll_provider_timeout",
-            ) from exc
-        finally:
-            if self._preroll_waiter is waiter:
-                self._preroll_waiter = None
-            if not future.done():
-                future.cancel()
-
-    def _raise_preroll_provider_error(self) -> None:
-        future = self._preroll_error_future
-        if future is not None and future.done():
-            raise future.result()
-
-    def _reset_preroll_provider_signals(self) -> None:
-        waiter, self._preroll_waiter = self._preroll_waiter, None
-        if waiter is not None and not waiter.future.done():
-            waiter.future.cancel()
-        error_future, self._preroll_error_future = self._preroll_error_future, None
-        if error_future is not None and not error_future.done():
-            error_future.cancel()
-        self._preroll_event_ids.clear()
+        )
 
     async def start(
         self,
@@ -887,7 +1178,9 @@ class RealtimeVoiceSession:
             self._run_sideband(), name=f"realtime-sideband-{self.session_id}"
         )
         self._set_state("ready")
-        await self._persist_runtime_state("ready")
+        await self._persist_runtime_state(
+            "renewal_required" if self._renewal_required else "ready"
+        )
         self._rotation_task = asyncio.create_task(
             self._rotation_watch(), name=f"realtime-rotation-{self.session_id}"
         )
@@ -1306,6 +1599,124 @@ class RealtimeVoiceSession:
             prompt.event.set()
             return True
 
+    async def interrupt_for_audio_uplink(
+        self,
+        *,
+        stream_id: str,
+        interrupted: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Interrupt the exact response the client silenced before its burst."""
+
+        response_id = str(interrupted.get("response_id") or "")
+        item_id = str(interrupted.get("item_id") or "")
+        requested_audio_end_ms = int(interrupted.get("audio_end_ms") or 0)
+        request_id = f"audio-uplink:{self.call_id}:{stream_id}"
+        async with self._interrupt_lock:
+            cached = self._interrupt_requests.get(request_id)
+            if cached is not None:
+                if (
+                    cached.get("target_response_id") != response_id
+                    or cached.get("target_item_id") != item_id
+                    or cached.get("requested_audio_end_ms")
+                    != requested_audio_end_ms
+                ):
+                    raise RealtimeProtocolError(
+                        "stream_id was already used with another interruption target",
+                        code="audio_stream_idempotency_conflict",
+                    )
+                self._interrupt_requests.move_to_end(request_id)
+                return dict(cached)
+
+            async with self._event_lock:
+                if self._closing or self._closed:
+                    raise RealtimeProtocolError(
+                        "Realtime session is closed",
+                        code="session_closed",
+                    )
+                if self._renewal_required:
+                    raise RealtimeProtocolError(
+                        "The provider call must be renewed before interruption",
+                        code="session_renewal_required",
+                    )
+
+                target_known = (
+                    item_id in self._response_audio_items.get(response_id, set())
+                    and response_id not in self._finalized_response_ids
+                    and item_id not in self._interrupt_truncations_sent
+                )
+                received_audio_ms = (
+                    self._response_audio_bytes.get((response_id, item_id), 0)
+                    * 1000
+                    // (
+                        AUDIO_UPLINK_SAMPLE_RATE_HZ
+                        * AUDIO_UPLINK_CHANNELS
+                        * AUDIO_UPLINK_SAMPLE_WIDTH_BYTES
+                    )
+                )
+                applied_audio_end_ms = min(
+                    requested_audio_end_ms,
+                    received_audio_ms,
+                )
+                generation_active = (
+                    response_id in self._generation_active_response_ids
+                )
+                output_active = self._active_output_audio_response_id == response_id
+                tool_running = (
+                    self._tool_task is not None and not self._tool_task.done()
+                )
+
+                self._client_interrupt_pending = True
+                self._pending_interrupt_audio_end_ms = applied_audio_end_ms
+                if self._turn is not None or tool_running:
+                    self._barge_in_during_response = True
+                    self.agent._skip_unstarted_tool_calls = True
+                if response_id:
+                    self._interrupted_response_ids.add(response_id)
+
+                if target_known:
+                    if generation_active:
+                        await self._send_interrupt_cancel(response_id)
+                    if output_active:
+                        await self._send_interrupt_output_clear(response_id)
+                    await self._send_interrupt_truncate(
+                        item_id,
+                        applied_audio_end_ms,
+                    )
+                    self._mark_response_transcript_interrupted(response_id)
+
+                result = {
+                    "status": "accepted",
+                    "target_status": "targeted" if target_known else "stale",
+                    "provider_response_id": response_id,
+                    "target_response_id": response_id,
+                    "target_item_id": item_id,
+                    "requested_audio_end_ms": requested_audio_end_ms,
+                    "audio_end_ms": applied_audio_end_ms,
+                    "truncation_requested": target_known,
+                    "output_clear_requested": bool(target_known and output_active),
+                }
+                self._cache_interrupt_request(request_id, result)
+                self.broker.publish(
+                    "response.interrupted",
+                    {
+                        "reason": "client_barge_in",
+                        "provider_response_id": response_id,
+                        "provider_item_id": item_id,
+                        "audio_end_ms": applied_audio_end_ms,
+                        "target_status": result["target_status"],
+                    },
+                )
+                pending = self._pending_terminal_response
+                if (
+                    target_known
+                    and pending is not None
+                    and pending.response_id == response_id
+                ):
+                    await self._finalize_pending_terminal_response(interrupted=True)
+                elif self._continuation_pending:
+                    self._schedule_interrupt_handoff_timeout()
+                return result
+
     async def interrupt_response(
         self,
         *,
@@ -1683,15 +2094,44 @@ class RealtimeVoiceSession:
         self.last_activity_at = time.time()
         async with self._event_lock:
             event_type = str(event.get("type") or "")
-            waiter = self._preroll_waiter
-            if (
-                waiter is not None
-                and event_type == waiter.event_type
-                and not waiter.future.done()
-                and (waiter.matches is None or waiter.matches(event))
-            ):
-                waiter.future.set_result(dict(event))
             if event_type in {"session.updated", "input_audio_buffer.cleared"}:
+                return
+            if self._quarantine_provider_input:
+                if event_type == "input_audio_buffer.committed":
+                    item_id = str(event.get("item_id") or "").strip()
+                    if item_id:
+                        self._quarantined_input_items.add(item_id)
+                        self._handled_input_items.add(item_id)
+                    self._provider_input_active = False
+                    return
+                if event_type in {
+                    "input_audio_buffer.speech_started",
+                    "input_audio_buffer.speech_stopped",
+                }:
+                    return
+                if event_type in {
+                    "conversation.item.input_audio_transcription.completed",
+                    "conversation.item.input_audio_transcription.failed",
+                }:
+                    item_id = str(event.get("item_id") or "").strip()
+                    if item_id:
+                        self._quarantined_input_items.add(item_id)
+                    return
+            if event_type in {
+                "response.output_audio.delta",
+                "response.audio.delta",
+            }:
+                response_id = str(event.get("response_id") or "")
+                item_id = str(event.get("item_id") or "")
+                delta = event.get("delta")
+                if response_id and item_id and isinstance(delta, str):
+                    try:
+                        audio_bytes = len(base64.b64decode(delta, validate=True))
+                    except (binascii.Error, ValueError):
+                        audio_bytes = 0
+                    if audio_bytes:
+                        self._response_audio_items[response_id].add(item_id)
+                        self._response_audio_bytes[(response_id, item_id)] += audio_bytes
                 return
             if event_type == "output_audio_buffer.started":
                 response_id = str(event.get("response_id") or "")
@@ -1752,6 +2192,9 @@ class RealtimeVoiceSession:
                 return
             if event_type == "input_audio_buffer.speech_started":
                 self._provider_input_active = True
+                if self._audio_uplink is not None:
+                    uplink = self._audio_uplink
+                    uplink.speech_since_commit = True
                 self.broker.publish("vad.speech_started", {})
                 if self.state in {"responding", "tool_wait"}:
                     self._client_interrupt_pending = True
@@ -1774,6 +2217,38 @@ class RealtimeVoiceSession:
                         await self._finalize_pending_terminal_response(interrupted=True)
                 return
             if event_type == "input_audio_buffer.speech_stopped":
+                uplink = self._audio_uplink
+                if uplink is not None:
+                    audio_end_ms = event.get("audio_end_ms")
+                    if (
+                        not isinstance(audio_end_ms, bool)
+                        and isinstance(audio_end_ms, int)
+                        and audio_end_ms >= 0
+                    ):
+                        provider_boundary_bytes = (
+                            audio_end_ms
+                            * AUDIO_UPLINK_SAMPLE_RATE_HZ
+                            * AUDIO_UPLINK_CHANNELS
+                            * AUDIO_UPLINK_SAMPLE_WIDTH_BYTES
+                            // 1000
+                        )
+                        boundary = max(
+                            0,
+                            provider_boundary_bytes
+                            - uplink.provider_timeline_start_bytes,
+                        )
+                        uplink.pending_commit_boundary_bytes = min(
+                            max(
+                                uplink.audio_bytes,
+                                uplink.inflight_audio_bytes,
+                            ),
+                            boundary,
+                        )
+                    else:
+                        uplink.pending_commit_boundary_bytes = max(
+                            uplink.audio_bytes,
+                            uplink.inflight_audio_bytes,
+                        )
                 self.broker.publish("vad.speech_stopped", {})
                 return
             if event_type == "input_audio_buffer.committed":
@@ -1781,12 +2256,65 @@ class RealtimeVoiceSession:
                 if item_id and item_id in self._handled_input_items:
                     return
                 self._provider_input_active = True
+                uplink = self._audio_uplink
+                if uplink is not None and uplink.state in {"active", "ending"}:
+                    had_commits = bool(uplink.committed_item_ids)
+                    if item_id and item_id not in uplink.committed_item_ids:
+                        uplink.committed_item_ids.append(item_id)
+                        self._audio_uplink_items[item_id] = uplink
+                    fallback_acknowledged = (
+                        uplink.pending_commit_boundary_bytes is None
+                        and uplink.fallback_commit_sent
+                    )
+                    boundary = uplink.pending_commit_boundary_bytes
+                    if boundary is None and fallback_acknowledged:
+                        boundary = uplink.fallback_commit_boundary_bytes
+                    if boundary is None:
+                        boundary = (
+                            uplink.committed_audio_bytes
+                            if had_commits
+                            else max(
+                                uplink.audio_bytes,
+                                uplink.inflight_audio_bytes,
+                            )
+                        )
+                    available_audio_bytes = max(
+                        uplink.audio_bytes,
+                        uplink.inflight_audio_bytes,
+                    )
+                    uplink.committed_audio_bytes = max(
+                        uplink.committed_audio_bytes,
+                        min(available_audio_bytes, boundary),
+                    )
+                    uplink.uncommitted_bytes = max(
+                        0,
+                        uplink.audio_bytes - uplink.committed_audio_bytes,
+                    )
+                    uplink.pending_commit_boundary_bytes = None
+                    uplink.speech_since_commit = False
+                    if fallback_acknowledged:
+                        uplink.fallback_commit_boundary_bytes = None
+                        uplink.fallback_commit_sent = False
+                        self._cancel_audio_uplink_timeout(uplink)
                 if item_id:
                     self._start_transcript_wait(item_id)
+                if uplink is not None:
+                    await self._maybe_dispatch_audio_uplink_turn(uplink)
+                    if (
+                        self._audio_uplink is uplink
+                        and uplink.state == "ending"
+                        and (
+                            uplink.uncommitted_bytes
+                            or uplink.speech_since_commit
+                            or uplink.fallback_commit_sent
+                        )
+                        and uplink.timeout_task is None
+                    ):
+                        self._schedule_audio_uplink_timeout(uplink)
                 return
             if event_type == "conversation.item.input_audio_transcription.completed":
                 transcript = str(event.get("transcript") or "").strip()
-                await self._handle_input_once(
+                await self._handle_input_transcription(
                     transcript or "[Voice transcript was empty]",
                     str(event.get("item_id") or ""),
                 )
@@ -1799,7 +2327,7 @@ class RealtimeVoiceSession:
                         "message": "Input transcription was unavailable; audio may still be understood.",
                     },
                 )
-                await self._handle_input_once(
+                await self._handle_input_transcription(
                     "[Voice transcript unavailable; use the committed audio input.]",
                     str(event.get("item_id") or ""),
                 )
@@ -1864,6 +2392,13 @@ class RealtimeVoiceSession:
                 item_id = str(item.get("id") or "")
                 if (
                     response_id
+                    and item_id
+                    and item.get("type") == "message"
+                    and item.get("role") == "assistant"
+                ):
+                    self._response_audio_items[response_id].add(item_id)
+                if (
+                    response_id
                     and response_id == self._active_response_id
                     and item_id
                     and item.get("type") == "message"
@@ -1918,13 +2453,28 @@ class RealtimeVoiceSession:
                     code=str(error.get("code") or "openai_realtime_error"),
                     retryable=False,
                 )
-                if (
-                    self._preroll_active
-                    and event_id in self._preroll_event_ids
-                    and self._preroll_error_future is not None
-                    and not self._preroll_error_future.done()
-                ):
-                    self._preroll_error_future.set_result(provider_error)
+                append_uplink = self._audio_uplink_append_events.pop(
+                    event_id,
+                    None,
+                )
+                if append_uplink is not None:
+                    first_notification = self._fail_audio_uplink_locked(
+                        append_uplink,
+                        reason="audio_uplink_provider_rejected_append",
+                    )
+                    current_uplink = self._audio_uplink
+                    if (
+                        current_uplink is not None
+                        and current_uplink is not append_uplink
+                    ):
+                        self._fail_audio_uplink_locked(
+                            current_uplink,
+                            reason="audio_uplink_provider_rejected_append",
+                        )
+                    await self._persist_audio_uplink_failure(
+                        reason="audio_uplink_provider_rejected_append",
+                        first_notification=first_notification,
+                    )
                 self.broker.publish(
                     "error",
                     {
@@ -1950,22 +2500,217 @@ class RealtimeVoiceSession:
     async def _transcript_timeout(self, item_id: str) -> None:
         try:
             await asyncio.sleep(self.config.transcription_timeout_seconds)
+            async with self._event_lock:
+                await self._handle_input_transcription(
+                    "[Voice transcript unavailable; use the committed audio input.]",
+                    item_id,
+                )
             self.broker.publish(
                 "warning",
                 {
                     "code": "transcription_timeout",
                     "message": (
-                        "Input transcription did not finish before the response "
-                        "deadline; Hermes continued with the committed audio."
+                        "Input transcription did not finish before the transcript "
+                        "deadline; Hermes already continued with committed audio."
                     ),
                 },
             )
-            await self._handle_input_once(
-                "[Voice transcript unavailable; use the committed audio input.]",
-                item_id,
-            )
         finally:
             self._transcript_wait_tasks.pop(item_id, None)
+
+    async def _handle_input_transcription(
+        self,
+        transcript: str,
+        item_id: str,
+    ) -> None:
+        uplink = self._audio_uplink_items.get(item_id)
+        if uplink is not None:
+            if item_id in uplink.transcripts:
+                return
+            task = self._transcript_wait_tasks.pop(item_id, None)
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+            uplink.transcripts[item_id] = transcript
+            if uplink.turn_dispatched:
+                await self._apply_audio_uplink_transcript(uplink)
+            else:
+                await self._maybe_dispatch_audio_uplink_turn(uplink)
+            return
+        await self._handle_input_once(transcript, item_id)
+
+    async def _apply_audio_uplink_transcript(
+        self,
+        uplink: _AudioUplink,
+    ) -> None:
+        transcript, transcript_available = self._audio_uplink_transcript(uplink)
+        provider_item_id = (
+            uplink.committed_item_ids[-1]
+            if uplink.committed_item_ids
+            else ""
+        )
+
+        if uplink.turn is None:
+            self._pending_next_inputs = deque(
+                (
+                    transcript if item_id == provider_item_id else text,
+                    item_id,
+                )
+                for text, item_id in self._pending_next_inputs
+            )
+            if (
+                all(
+                    item_id in uplink.transcripts
+                    for item_id in uplink.committed_item_ids
+                )
+                and self._continuation_pending
+                and self._client_interrupt_pending
+            ):
+                self._continuation_pending = False
+                self._cancel_interrupt_handoff_timeout()
+                await self._finalize_current_turn(
+                    "[Assistant response interrupted by new speech.]",
+                    response_id="",
+                    interrupted=True,
+                )
+        else:
+            self._update_turn_user_transcript(
+                uplink.turn,
+                transcript=transcript,
+                provider_item_ids=uplink.committed_item_ids,
+                transcript_available=transcript_available,
+            )
+
+        db = getattr(self.agent, "_session_db", None)
+        durable_update_succeeded = db is None or uplink.turn is None
+        if db is not None and uplink.turn is not None:
+            user_message = self._turn_user_message(uplink.turn)
+            api_content = (
+                user_message.get("api_content")
+                if isinstance(user_message, Mapping)
+                else None
+            )
+            try:
+                durable_update_succeeded = await asyncio.to_thread(
+                    db.update_realtime_user_transcript,
+                    self.session_id,
+                    provider_item_id=provider_item_id,
+                    content=transcript,
+                    api_content=api_content,
+                    provider_item_ids=list(uplink.committed_item_ids),
+                    transcript_available=transcript_available,
+                )
+            except Exception:
+                durable_update_succeeded = False
+                logger.exception(
+                    "Realtime transcript update failed for session=%s item=%s",
+                    self.session_id,
+                    provider_item_id,
+                )
+            if not durable_update_succeeded:
+                await self._mark_transcript_persistence_failure(provider_item_id)
+
+        self.broker.publish(
+            "turn.input_transcript_updated",
+            {
+                "provider_item_ids": list(uplink.committed_item_ids),
+                "transcript_available": transcript_available,
+            },
+        )
+        all_transcripts_settled = all(
+            item_id in uplink.transcripts
+            for item_id in uplink.committed_item_ids
+        )
+        if all_transcripts_settled:
+            uplink.transcript_persistence_settled = True
+        if uplink.turn_dispatched and all_transcripts_settled:
+            for item_id in uplink.committed_item_ids:
+                self._audio_uplink_items.pop(item_id, None)
+            await self._resume_deferred_turn_finalization()
+
+    async def _mark_transcript_persistence_failure(
+        self,
+        provider_item_id: str,
+    ) -> None:
+        self._renewal_required = True
+        if not self._closed:
+            self._set_state("degraded", reason="transcript_persistence_failed")
+        self.broker.publish(
+            "error",
+            {
+                "fatal": True,
+                "code": "transcript_persistence_failed",
+                "message": (
+                    "The input transcript could not be written to durable "
+                    "session history."
+                ),
+                "provider_item_id": provider_item_id,
+            },
+        )
+        try:
+            await self._persist_runtime_state("renewal_required")
+        except Exception:
+            logger.warning(
+                "Could not persist transcript failure state for %s",
+                self.session_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _audio_uplink_transcript(
+        uplink: _AudioUplink,
+    ) -> tuple[str, bool]:
+        transcript_parts = [
+            uplink.transcripts.get(item_id, PENDING_AUDIO_TRANSCRIPT)
+            for item_id in uplink.committed_item_ids
+        ]
+        transcript = "\n".join(transcript_parts).strip() or (
+            "[Voice transcript was empty]"
+        )
+        transcript_available = all(
+            item_id in uplink.transcripts
+            and not uplink.transcripts[item_id].startswith("[Voice transcript")
+            for item_id in uplink.committed_item_ids
+        )
+        return transcript, transcript_available
+
+    @staticmethod
+    def _turn_user_message(turn: TurnContext) -> Mapping[str, Any]:
+        if 0 <= turn.current_turn_user_idx < len(turn.messages):
+            message = turn.messages[turn.current_turn_user_idx]
+            if isinstance(message, Mapping):
+                return message
+        return {}
+
+    def _update_turn_user_transcript(
+        self,
+        turn: TurnContext,
+        *,
+        transcript: str,
+        provider_item_ids: list[str],
+        transcript_available: bool,
+    ) -> None:
+        message = self._turn_user_message(turn)
+        if not isinstance(message, dict):
+            return
+        old_content = message.get("content")
+        api_content = message.get("api_content")
+        if (
+            isinstance(old_content, str)
+            and isinstance(api_content, str)
+            and api_content.startswith(old_content)
+        ):
+            message["api_content"] = transcript + api_content[len(old_content) :]
+        message["content"] = transcript
+        metadata = message.get("display_metadata")
+        metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+        metadata.update({
+            "provider_item_id": provider_item_ids[-1] if provider_item_ids else "",
+            "provider_item_ids": list(provider_item_ids),
+            "transcript_available": transcript_available,
+        })
+        message["display_metadata"] = metadata
+        turn.user_message = transcript
+        turn.original_user_message = transcript
 
     async def _handle_input_once(self, transcript: str, item_id: str) -> None:
         if item_id and item_id in self._handled_input_items:
@@ -1987,6 +2732,16 @@ class RealtimeVoiceSession:
             await self._begin_turn(transcript, item_id)
             return
         if tool_running:
+            if PENDING_AUDIO_TRANSCRIPT in transcript:
+                self._pending_next_inputs.append((transcript, item_id))
+                self.broker.publish(
+                    "turn.steered",
+                    {
+                        "during": "tool",
+                        "transcript_available": False,
+                    },
+                )
+                return
             if self._skip_current_tool_batch:
                 self._pending_next_inputs.append((transcript, item_id))
                 self.broker.publish(
@@ -2030,6 +2785,12 @@ class RealtimeVoiceSession:
     async def _begin_turn(self, transcript: str, item_id: str) -> None:
         if self._closing or self._closed:
             return
+        uplink = self._audio_uplink_items.get(item_id)
+        provider_item_ids = (
+            list(uplink.committed_item_ids)
+            if uplink is not None
+            else ([item_id] if item_id else [])
+        )
         self._set_state("listening")
         history = list(self.messages)
         self._turn = await asyncio.to_thread(
@@ -2041,15 +2802,19 @@ class RealtimeVoiceSession:
             persist_user_display_kind="realtime_voice",
             persist_user_display_metadata={
                 "provider_item_id": item_id,
+                "provider_item_ids": provider_item_ids,
                 "transcript_available": not transcript.startswith("[Voice transcript"),
             },
         )
+        if uplink is not None:
+            uplink.turn = self._turn
         self.messages = self._turn.messages
         self._turn_response_count = 0
         self.broker.publish(
             "turn.input_committed",
             {
                 "provider_item_id": item_id,
+                "provider_item_ids": provider_item_ids,
                 "transcript_available": not transcript.startswith("[Voice transcript"),
             },
         )
@@ -2380,6 +3145,21 @@ class RealtimeVoiceSession:
                     interrupted=True,
                 )
                 return
+            if (
+                self._client_interrupt_pending
+                and self._pending_next_inputs
+                and all(
+                    PENDING_AUDIO_TRANSCRIPT not in text
+                    for text, _item_id in self._pending_next_inputs
+                )
+            ):
+                await self._finalize_current_turn(
+                    spoken_preamble
+                    or "[Assistant response interrupted by new speech.]",
+                    response_id=response_id,
+                    interrupted=True,
+                )
+                return
             if self._client_interrupt_pending:
                 self._continuation_pending = True
                 self._schedule_interrupt_handoff_timeout()
@@ -2541,7 +3321,7 @@ class RealtimeVoiceSession:
             current.cancel()
         delay = max(
             1.0,
-            self.config.preroll_timeout_seconds
+            self.config.audio_uplink_idle_timeout_seconds
             + self.config.transcription_timeout_seconds,
         )
         self._interrupt_handoff_task = asyncio.create_task(
@@ -2657,6 +3437,22 @@ class RealtimeVoiceSession:
     ) -> None:
         if self._turn is None or self._finalizing_turn:
             return
+        if self._turn_has_pending_audio_transcript(self._turn):
+            pending = _DeferredTurnFinalization(
+                transcript=transcript,
+                response_id=response_id,
+                interrupted=interrupted,
+                failed=failed,
+            )
+            current = self._deferred_turn_finalization
+            if (
+                current is None
+                or interrupted
+                or failed
+                or not current.interrupted
+            ):
+                self._deferred_turn_finalization = pending
+            return
         self._finalizing_turn = True
         try:
             await self._finalize_current_turn_body(
@@ -2667,6 +3463,30 @@ class RealtimeVoiceSession:
             )
         finally:
             self._finalizing_turn = False
+
+    def _turn_has_pending_audio_transcript(self, turn: TurnContext) -> bool:
+        return any(
+            uplink.turn is turn
+            and not uplink.transcript_persistence_settled
+            for uplink in self._audio_uplinks.values()
+        )
+
+    async def _resume_deferred_turn_finalization(self) -> None:
+        pending = self._deferred_turn_finalization
+        turn = self._turn
+        if (
+            pending is None
+            or turn is None
+            or self._turn_has_pending_audio_transcript(turn)
+        ):
+            return
+        self._deferred_turn_finalization = None
+        await self._finalize_current_turn(
+            pending.transcript,
+            response_id=pending.response_id,
+            interrupted=pending.interrupted,
+            failed=pending.failed,
+        )
 
     async def _finalize_current_turn_body(
         self,
@@ -2779,9 +3599,12 @@ class RealtimeVoiceSession:
                         "message": "Background memory or skill review could not be queued.",
                     },
                 )
-        await self._persist_runtime_state("ready")
+        await self._persist_runtime_state(
+            "renewal_required" if self._renewal_required else "ready"
+        )
         self.messages = list(result.get("messages") or turn.messages)
         self._turn = None
+        self._deferred_turn_finalization = None
         self._turn_response_count = 0
         self._tool_task = None
         active_response_id = self._active_response_id
@@ -2792,17 +3615,31 @@ class RealtimeVoiceSession:
         for tracked_response_id in {response_id, active_response_id}:
             if not tracked_response_id:
                 continue
+            self._finalized_response_ids.add(tracked_response_id)
             self._playback_started_response_ids.discard(tracked_response_id)
             self._output_drained_response_ids.discard(tracked_response_id)
             self._client_playback_completed_response_ids.discard(tracked_response_id)
             self._interrupted_response_ids.discard(tracked_response_id)
+        while len(self._finalized_response_ids) > 64:
+            finalized_response_id = self._finalized_response_ids.pop()
+            for item in self._response_audio_items.pop(
+                finalized_response_id, set()
+            ):
+                self._response_audio_bytes.pop((finalized_response_id, item), None)
         self._barge_in_during_response = False
         self._skip_current_tool_batch = False
         self.agent._skip_unstarted_tool_calls = False
         self._client_interrupt_pending = False
         self._pending_interrupt_audio_end_ms = None
         self._cancel_interrupt_handoff_timeout()
-        self._set_state("ready")
+        self._set_state(
+            "degraded" if self._renewal_required else "ready",
+            **(
+                {"reason": "renewal_required"}
+                if self._renewal_required
+                else {}
+            ),
+        )
         self.broker.publish(
             "turn.completed",
             {
@@ -2936,14 +3773,21 @@ class RealtimeVoiceSession:
             )
         self.sideband = sideband
         self.call_id = call_id
-        self._preroll_requests.clear()
+        self._audio_uplink = None
+        self._audio_uplinks.clear()
+        self._audio_uplink_items.clear()
+        self._audio_uplink_append_events.clear()
         self._active_response_id = ""
         self._active_audio_item_id = ""
+        self._response_audio_items.clear()
+        self._response_audio_bytes.clear()
+        self._finalized_response_ids.clear()
         self._active_output_audio_response_id = ""
         self._playback_started_response_ids.clear()
         self._output_drained_response_ids.clear()
         self._client_playback_completed_response_ids.clear()
         self._pending_terminal_response = None
+        self._deferred_turn_finalization = None
         self._cancel_playback_finalization()
         self._cancel_interrupt_handoff_timeout()
         self._playback_completion_requests.clear()
@@ -2971,6 +3815,10 @@ class RealtimeVoiceSession:
             )
         self.call_started_at = time.time()
         self._provider_input_tokens = 0
+        self._provider_input_audio_bytes_sent = 0
+        self._provider_input_timeline_known = True
+        self._quarantine_provider_input = False
+        self._quarantined_input_items.clear()
         self._rotation_notified = False
         self._renewal_required = False
         if self._rotation_task is not None:
@@ -3082,9 +3930,8 @@ class RealtimeVoiceSession:
             self._logical_end = end_session
             if recoverable_state is not None:
                 persisted_state = recoverable_state
-            elif self._renewal_required or self._preroll_active:
-                # The provider may currently have VAD disabled. A fresh call is
-                # required because shutdown cancels the acknowledgment sequence.
+            elif self._renewal_required or self._audio_uplink is not None:
+                # An interrupted stream may leave provider input partially buffered.
                 persisted_state = "renewal_required"
             else:
                 persisted_state = "turn_active" if self._turn is not None else "ready"
@@ -3115,7 +3962,11 @@ class RealtimeVoiceSession:
                 self._status_watchdog_task,
                 self._playback_finalize_task,
                 self._interrupt_handoff_task,
-                *self._preroll_tasks,
+                (
+                    self._audio_uplink.timeout_task
+                    if self._audio_uplink is not None
+                    else None
+                ),
                 *self._transcript_wait_tasks.values(),
             ):
                 if task is not None:
@@ -3130,14 +3981,17 @@ class RealtimeVoiceSession:
                     self._status_watchdog_task,
                     self._playback_finalize_task,
                     self._interrupt_handoff_task,
-                    *self._preroll_tasks,
+                    (
+                        self._audio_uplink.timeout_task
+                        if self._audio_uplink is not None
+                        else None
+                    ),
                     *self._transcript_wait_tasks.values(),
                 )
                 if task is not None and task is not current_task
             ]
             if cancelled:
                 await asyncio.gather(*cancelled, return_exceptions=True)
-            self._reset_preroll_provider_signals()
             if self._tool_task is not None and not self._tool_task.done():
                 # Started tools intentionally survive barge-in, but explicit
                 # session destruction waits for their thread-bound work rather

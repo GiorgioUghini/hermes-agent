@@ -5,9 +5,10 @@ import pytest
 
 from gateway.realtime.controls import ControlEventBroker
 from gateway.realtime.protocol import (
+    AUDIO_UPLINK_APPEND_CHUNK_MILLISECONDS,
+    AUDIO_UPLINK_SAMPLE_RATE_HZ,
     RealtimeProtocolError,
     RealtimeVoiceConfig,
-    PREROLL_SAMPLE_RATE_HZ,
     conversation_item_truncate_event,
     conversation_function_call_event,
     derive_safety_identifier,
@@ -21,10 +22,12 @@ from gateway.realtime.protocol import (
     output_audio_buffer_clear_event,
     response_cancel_event,
     response_transcript,
-    session_turn_detection_update_event,
-    validate_preroll_idempotency_key,
+    validate_audio_stream_id,
+    validate_audio_uplink_command,
     validate_control_command,
 )
+
+STREAM_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def test_config_builds_hermes_owned_vad_session():
@@ -34,7 +37,11 @@ def test_config_builds_hermes_owned_vad_session():
             "model": "gpt-realtime",
             "voice": "marin",
             "turn_detection": {"silence_duration_ms": 750},
-            "preroll": {"max_seconds": 12, "timeout_seconds": 9},
+            "audio_uplink": {
+                "max_seconds": 12,
+                "idle_timeout_seconds": 9,
+                "append_chunk_milliseconds": 80,
+            },
         }
     })
 
@@ -62,16 +69,23 @@ def test_config_builds_hermes_owned_vad_session():
     assert payload["audio"]["input"]["turn_detection"]["silence_duration_ms"] == 750
     assert payload["audio"]["input"]["format"] == {
         "type": "audio/pcm",
-        "rate": PREROLL_SAMPLE_RATE_HZ,
+        "rate": AUDIO_UPLINK_SAMPLE_RATE_HZ,
     }
-    assert config.preroll_max_seconds == 12
-    assert config.preroll_timeout_seconds == 9
-    assert config.preroll_max_bytes == 12 * PREROLL_SAMPLE_RATE_HZ * 2
+    assert config.audio_uplink_max_seconds == 12
+    assert config.audio_uplink_idle_timeout_seconds == 9
+    assert (
+        config.audio_uplink_append_chunk_milliseconds
+        == AUDIO_UPLINK_APPEND_CHUNK_MILLISECONDS
+    )
+    assert (
+        config.audio_uplink_max_bytes
+        == 12 * AUDIO_UPLINK_SAMPLE_RATE_HZ * 2
+    )
     assert payload["tools"][0]["name"] == "skill_view"
     assert "function" not in payload["tools"][0]
 
 
-def test_preroll_events_are_typed_and_server_owned():
+def test_audio_uplink_events_are_typed_and_server_owned():
     audio = b"\x01\x02" * 2400
     append = input_audio_buffer_append_event(audio, event_id="append_1")
     assert append["type"] == "input_audio_buffer.append"
@@ -88,29 +102,103 @@ def test_preroll_events_are_typed_and_server_owned():
         "type": "output_audio_buffer.clear",
         "event_id": "output_clear_1",
     }
-    assert (
-        session_turn_detection_update_event(None)["session"]["audio"]["input"][
-            "turn_detection"
-        ]
-        is None
+    assert validate_audio_stream_id(STREAM_ID) == STREAM_ID
+    with pytest.raises(RealtimeProtocolError, match="UUID"):
+        validate_audio_stream_id("wake:123")
+
+
+def test_audio_uplink_commands_require_atomic_barge_in_target():
+    begin = validate_audio_uplink_command(
+        {
+            "type": "turn.begin",
+            "stream_id": STREAM_ID,
+            "barge_in": True,
+            "preroll_ms": 2000,
+            "interrupted": {
+                "response_id": "resp_1",
+                "item_id": "item_1",
+                "audio_end_ms": 875,
+            },
+        },
+        expected_stream_id=STREAM_ID,
     )
-    assert validate_preroll_idempotency_key("wake:123") == "wake:123"
-    with pytest.raises(RealtimeProtocolError, match="Idempotency-Key"):
-        validate_preroll_idempotency_key("")
+    assert begin["interrupted"] == {
+        "response_id": "resp_1",
+        "item_id": "item_1",
+        "audio_end_ms": 875,
+    }
+    assert begin["preroll_ms"] == 2000
+    assert validate_audio_uplink_command(
+        {"type": "turn.end"},
+        expected_stream_id=STREAM_ID,
+    ) == {"type": "turn.end"}
+
+    with pytest.raises(RealtimeProtocolError) as missing_target:
+        validate_audio_uplink_command(
+            {
+                "type": "turn.begin",
+                "stream_id": STREAM_ID,
+                "barge_in": True,
+                "preroll_ms": 2000,
+            },
+            expected_stream_id=STREAM_ID,
+        )
+    assert missing_target.value.code == "missing_audio_interruption"
+
+    with pytest.raises(RealtimeProtocolError) as unexpected_target:
+        validate_audio_uplink_command(
+            {
+                "type": "turn.begin",
+                "stream_id": STREAM_ID,
+                "barge_in": False,
+                "preroll_ms": 2000,
+                "interrupted": {
+                    "response_id": "resp_1",
+                    "item_id": "item_1",
+                    "audio_end_ms": 0,
+                },
+            },
+            expected_stream_id=STREAM_ID,
+        )
+    assert unexpected_target.value.code == "unexpected_audio_interruption"
+
+    with pytest.raises(RealtimeProtocolError) as null_target:
+        validate_audio_uplink_command(
+            {
+                "type": "turn.begin",
+                "stream_id": STREAM_ID,
+                "barge_in": False,
+                "preroll_ms": 2000,
+                "interrupted": None,
+            },
+            expected_stream_id=STREAM_ID,
+        )
+    assert null_target.value.code == "unexpected_audio_interruption"
+
+    with pytest.raises(RealtimeProtocolError) as missing_preroll:
+        validate_audio_uplink_command(
+            {
+                "type": "turn.begin",
+                "stream_id": STREAM_ID,
+                "barge_in": False,
+            },
+            expected_stream_id=STREAM_ID,
+        )
+    assert missing_preroll.value.code == "invalid_audio_preroll_ms"
 
 
 def test_config_accepts_secure_openai_compatible_proxy_endpoints():
     config = RealtimeVoiceConfig.from_config({
         "realtime_voice": {
             "transport": {
-                "call_url": "https://proxy.example/v1/realtime/calls?route=stock",
-                "sideband_url": "wss://proxy.example/v1/realtime?route=stock",
+                "call_url": "https://proxy.example/v1/realtime/stock/calls",
+                "sideband_url": "wss://proxy.example/v1/realtime/stock",
             }
         }
     })
 
-    assert config.call_url == ("https://proxy.example/v1/realtime/calls?route=stock")
-    assert config.sideband_url == ("wss://proxy.example/v1/realtime?route=stock")
+    assert config.call_url == ("https://proxy.example/v1/realtime/stock/calls")
+    assert config.sideband_url == ("wss://proxy.example/v1/realtime/stock")
 
 
 @pytest.mark.parametrize(

@@ -11,16 +11,25 @@ import re
 from time import time
 from typing import Any, Iterable, Mapping, Optional
 from urllib.parse import parse_qs, urlparse
+import uuid
 
 
 CONTROL_PROTOCOL_VERSION = 1
 MAX_CONTROL_COMMAND_BYTES = 64 * 1024
 MAX_TOOL_COUNT = 128
-PREROLL_SAMPLE_RATE_HZ = 24_000
-PREROLL_CHANNELS = 1
-PREROLL_SAMPLE_WIDTH_BYTES = 2
-PREROLL_MIN_MILLISECONDS = 100
-PREROLL_APPEND_CHUNK_MILLISECONDS = 1_000
+AUDIO_UPLINK_SAMPLE_RATE_HZ = 24_000
+AUDIO_UPLINK_CHANNELS = 1
+AUDIO_UPLINK_SAMPLE_WIDTH_BYTES = 2
+AUDIO_UPLINK_MIN_MILLISECONDS = 100
+AUDIO_UPLINK_APPEND_CHUNK_MILLISECONDS = 80
+MAX_AUDIO_UPLINK_PREROLL_MILLISECONDS = 30_000
+# Backward-compatible names for integrations that imported the original
+# pre-roll format constants. The transport itself is now streaming-only.
+PREROLL_SAMPLE_RATE_HZ = AUDIO_UPLINK_SAMPLE_RATE_HZ
+PREROLL_CHANNELS = AUDIO_UPLINK_CHANNELS
+PREROLL_SAMPLE_WIDTH_BYTES = AUDIO_UPLINK_SAMPLE_WIDTH_BYTES
+PREROLL_MIN_MILLISECONDS = AUDIO_UPLINK_MIN_MILLISECONDS
+PREROLL_APPEND_CHUNK_MILLISECONDS = AUDIO_UPLINK_APPEND_CHUNK_MILLISECONDS
 MAX_INTERRUPT_AUDIO_END_MS = 60 * 60 * 1000
 
 SESSION_STATES = frozenset({
@@ -172,9 +181,12 @@ class RealtimeVoiceConfig:
     request_timeout_seconds: float = 20.0
     connect_timeout_seconds: float = 10.0
     transcription_timeout_seconds: float = 5.0
-    preroll_enabled: bool = True
-    preroll_max_seconds: int = 30
-    preroll_timeout_seconds: float = 15.0
+    audio_uplink_enabled: bool = True
+    audio_uplink_max_seconds: int = 30
+    audio_uplink_idle_timeout_seconds: float = 5.0
+    audio_uplink_append_chunk_milliseconds: int = (
+        AUDIO_UPLINK_APPEND_CHUNK_MILLISECONDS
+    )
     call_url: str = _DEFAULT_CALL_URL
     sideband_url: str = _DEFAULT_SIDEBAND_URL
     approval_timeout_seconds: int = 10 * 60
@@ -188,7 +200,8 @@ class RealtimeVoiceConfig:
         raw = _as_mapping(root.get("realtime_voice", root))
         vad = _as_mapping(raw.get("turn_detection"))
         interim = _as_mapping(raw.get("intermediate_speech"))
-        preroll = _as_mapping(raw.get("preroll"))
+        legacy_preroll = _as_mapping(raw.get("preroll"))
+        audio_uplink = _as_mapping(raw.get("audio_uplink"))
         limits = _as_mapping(raw.get("limits"))
         transport = _as_mapping(raw.get("transport"))
 
@@ -317,18 +330,32 @@ class RealtimeVoiceConfig:
                 0.5,
                 30.0,
             ),
-            preroll_enabled=bool(preroll.get("enabled", cls.preroll_enabled)),
-            preroll_max_seconds=_bounded_int(
-                preroll.get("max_seconds"),
-                cls.preroll_max_seconds,
+            audio_uplink_enabled=bool(
+                audio_uplink.get(
+                    "enabled",
+                    legacy_preroll.get("enabled", cls.audio_uplink_enabled),
+                )
+            ),
+            audio_uplink_max_seconds=_bounded_int(
+                audio_uplink.get(
+                    "max_seconds",
+                    legacy_preroll.get("max_seconds"),
+                ),
+                cls.audio_uplink_max_seconds,
                 1,
                 120,
             ),
-            preroll_timeout_seconds=_bounded_float(
-                preroll.get("timeout_seconds"),
-                cls.preroll_timeout_seconds,
+            audio_uplink_idle_timeout_seconds=_bounded_float(
+                audio_uplink.get("idle_timeout_seconds"),
+                cls.audio_uplink_idle_timeout_seconds,
                 1.0,
-                60.0,
+                30.0,
+            ),
+            audio_uplink_append_chunk_milliseconds=_bounded_int(
+                audio_uplink.get("append_chunk_milliseconds"),
+                cls.audio_uplink_append_chunk_milliseconds,
+                20,
+                250,
             ),
             call_url=_validated_transport_url(
                 transport.get("call_url"),
@@ -369,12 +396,12 @@ class RealtimeVoiceConfig:
         )
 
     @property
-    def preroll_max_bytes(self) -> int:
+    def audio_uplink_max_bytes(self) -> int:
         return (
-            self.preroll_max_seconds
-            * PREROLL_SAMPLE_RATE_HZ
-            * PREROLL_CHANNELS
-            * PREROLL_SAMPLE_WIDTH_BYTES
+            self.audio_uplink_max_seconds
+            * AUDIO_UPLINK_SAMPLE_RATE_HZ
+            * AUDIO_UPLINK_CHANNELS
+            * AUDIO_UPLINK_SAMPLE_WIDTH_BYTES
         )
 
     def turn_detection_config(self) -> dict[str, Any]:
@@ -408,7 +435,7 @@ class RealtimeVoiceConfig:
                 "input": {
                     "format": {
                         "type": "audio/pcm",
-                        "rate": PREROLL_SAMPLE_RATE_HZ,
+                        "rate": AUDIO_UPLINK_SAMPLE_RATE_HZ,
                     },
                     "transcription": {"model": self.transcription_model},
                     "turn_detection": self.turn_detection_config(),
@@ -439,14 +466,141 @@ class RealtimeFunctionCall:
     response_id: str = ""
 
 
-def validate_preroll_idempotency_key(value: Any) -> str:
-    key = str(value or "").strip()
-    if not _ID_RE.fullmatch(key):
+def validate_audio_stream_id(value: Any) -> str:
+    stream_id = str(value or "").strip()
+    try:
+        normalized = str(uuid.UUID(stream_id))
+    except (ValueError, AttributeError, TypeError) as exc:
         raise RealtimeProtocolError(
-            "A valid Idempotency-Key header is required",
-            code="invalid_preroll_idempotency_key",
+            "stream_id must be a UUID",
+            code="invalid_audio_stream_id",
+        ) from exc
+    if normalized != stream_id.lower():
+        raise RealtimeProtocolError(
+            "stream_id must use canonical UUID notation",
+            code="invalid_audio_stream_id",
         )
-    return key
+    return normalized
+
+
+def validate_audio_uplink_command(
+    raw: Any,
+    *,
+    expected_stream_id: str,
+) -> dict[str, Any]:
+    """Validate one JSON control frame on an audio uplink socket."""
+
+    if isinstance(raw, (bytes, bytearray)):
+        if len(raw) > MAX_CONTROL_COMMAND_BYTES:
+            raise RealtimeProtocolError(
+                "Audio uplink command is too large",
+                code="audio_uplink_command_too_large",
+            )
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        if len(raw.encode("utf-8")) > MAX_CONTROL_COMMAND_BYTES:
+            raise RealtimeProtocolError(
+                "Audio uplink command is too large",
+                code="audio_uplink_command_too_large",
+            )
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RealtimeProtocolError(
+                "Audio uplink command is not valid JSON",
+                code="invalid_audio_uplink_json",
+            ) from exc
+    if not isinstance(raw, Mapping):
+        raise RealtimeProtocolError(
+            "Audio uplink command must be an object",
+            code="invalid_audio_uplink_command",
+        )
+
+    command_type = str(raw.get("type") or "").strip()
+    if command_type == "turn.end":
+        return {"type": "turn.end"}
+    if command_type != "turn.begin":
+        raise RealtimeProtocolError(
+            f"Unsupported audio uplink command: {command_type or '(missing)'}",
+            code="unsupported_audio_uplink_command",
+        )
+
+    stream_id = validate_audio_stream_id(raw.get("stream_id"))
+    if stream_id != expected_stream_id:
+        raise RealtimeProtocolError(
+            "turn.begin stream_id does not match the uplink URL",
+            code="audio_stream_id_mismatch",
+        )
+    barge_in = raw.get("barge_in")
+    if not isinstance(barge_in, bool):
+        raise RealtimeProtocolError(
+            "turn.begin barge_in must be a boolean",
+            code="invalid_audio_barge_in",
+        )
+    preroll_ms = raw.get("preroll_ms")
+    if (
+        isinstance(preroll_ms, bool)
+        or not isinstance(preroll_ms, int)
+        or not 0 <= preroll_ms <= MAX_AUDIO_UPLINK_PREROLL_MILLISECONDS
+    ):
+        raise RealtimeProtocolError(
+            "turn.begin preroll_ms must be an integer between 0 and 30000",
+            code="invalid_audio_preroll_ms",
+        )
+
+    interrupted = raw.get("interrupted")
+    if not barge_in:
+        if "interrupted" in raw:
+            raise RealtimeProtocolError(
+                "interrupted must be absent when barge_in is false",
+                code="unexpected_audio_interruption",
+            )
+        return {
+            "type": "turn.begin",
+            "stream_id": stream_id,
+            "barge_in": False,
+            "preroll_ms": preroll_ms,
+            "interrupted": None,
+        }
+    if not isinstance(interrupted, Mapping):
+        raise RealtimeProtocolError(
+            "interrupted is required when barge_in is true",
+            code="missing_audio_interruption",
+        )
+
+    response_id = str(interrupted.get("response_id") or "").strip()
+    item_id = str(interrupted.get("item_id") or "").strip()
+    if not _ID_RE.fullmatch(response_id):
+        raise RealtimeProtocolError(
+            "interrupted.response_id is invalid",
+            code="invalid_response_id",
+        )
+    if not _ID_RE.fullmatch(item_id):
+        raise RealtimeProtocolError(
+            "interrupted.item_id is invalid",
+            code="invalid_assistant_item_id",
+        )
+    audio_end_ms = interrupted.get("audio_end_ms")
+    if (
+        isinstance(audio_end_ms, bool)
+        or not isinstance(audio_end_ms, int)
+        or not 0 <= audio_end_ms <= MAX_INTERRUPT_AUDIO_END_MS
+    ):
+        raise RealtimeProtocolError(
+            "interrupted.audio_end_ms must be an integer between 0 and 3600000",
+            code="invalid_interrupt_audio_end_ms",
+        )
+    return {
+        "type": "turn.begin",
+        "stream_id": stream_id,
+        "barge_in": True,
+        "preroll_ms": preroll_ms,
+        "interrupted": {
+            "response_id": response_id,
+            "item_id": item_id,
+            "audio_end_ms": audio_end_ms,
+        },
+    }
 
 
 def flatten_realtime_tools(
@@ -635,29 +789,6 @@ def conversation_function_call_event(
     return event
 
 
-def session_turn_detection_update_event(
-    turn_detection: Optional[Mapping[str, Any]],
-    *,
-    event_id: Optional[str] = None,
-) -> dict[str, Any]:
-    event: dict[str, Any] = {
-        "type": "session.update",
-        "session": {
-            "type": "realtime",
-            "audio": {
-                "input": {
-                    "turn_detection": (
-                        dict(turn_detection) if turn_detection is not None else None
-                    )
-                }
-            },
-        },
-    }
-    if event_id:
-        event["event_id"] = event_id
-    return event
-
-
 def input_audio_buffer_clear_event(
     *,
     event_id: Optional[str] = None,
@@ -675,8 +806,8 @@ def input_audio_buffer_append_event(
 ) -> dict[str, Any]:
     if not isinstance(audio, bytes) or not audio:
         raise RealtimeProtocolError(
-            "Pre-roll audio chunk is empty",
-            code="empty_preroll_audio",
+            "Audio uplink chunk is empty",
+            code="empty_audio_uplink",
         )
     event: dict[str, Any] = {
         "type": "input_audio_buffer.append",

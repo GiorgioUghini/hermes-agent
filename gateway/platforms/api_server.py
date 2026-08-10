@@ -1821,9 +1821,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._handle_realtime_control,
             ),
             (
-                "POST",
-                "/v1/realtime/sessions/{session_id}/audio/preroll",
-                self._handle_realtime_preroll,
+                "GET",
+                "/v1/realtime/sessions/{session_id}/audio/uplink",
+                self._handle_realtime_audio_uplink,
             ),
             (
                 "POST",
@@ -2911,104 +2911,6 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return offer_sdp, requested_session_id, None
 
-    async def _read_realtime_preroll(self, request: "web.Request"):
-        """Read bounded PCM without buffering an untrusted oversized body."""
-
-        from gateway.realtime.protocol import (
-            PREROLL_CHANNELS,
-            PREROLL_SAMPLE_RATE_HZ,
-            RealtimeProtocolError,
-            validate_preroll_idempotency_key,
-        )
-
-        try:
-            realtime_config, _api_key, _review_configured = (
-                self._realtime_runtime_status()
-            )
-            idempotency_key = validate_preroll_idempotency_key(
-                request.headers.get("Idempotency-Key")
-            )
-        except Exception as exc:
-            return None, None, self._realtime_error_response(exc)
-
-        raw_content_type = request.headers.get("Content-Type", "")
-        segments = [segment.strip() for segment in raw_content_type.split(";")]
-        if not segments or segments[0].lower() != "audio/pcm":
-            return None, None, web.json_response(
-                _openai_error(
-                    "Pre-roll requires Content-Type audio/pcm",
-                    code="invalid_preroll_content_type",
-                ),
-                status=415,
-            )
-        parameters: dict[str, str] = {}
-        for segment in segments[1:]:
-            name, separator, value = segment.partition("=")
-            if separator:
-                parameters[name.strip().lower()] = value.strip().strip('"').lower()
-        if parameters.get("rate") != str(PREROLL_SAMPLE_RATE_HZ):
-            return None, None, web.json_response(
-                _openai_error(
-                    f"Pre-roll PCM must use {PREROLL_SAMPLE_RATE_HZ} Hz",
-                    code="invalid_preroll_sample_rate",
-                ),
-                status=415,
-            )
-        if parameters.get("channels") != str(PREROLL_CHANNELS):
-            return None, None, web.json_response(
-                _openai_error(
-                    "Pre-roll PCM must be mono",
-                    code="invalid_preroll_channels",
-                ),
-                status=415,
-            )
-        if parameters.get("format") not in {"s16le", "pcm16"}:
-            return None, None, web.json_response(
-                _openai_error(
-                    "Pre-roll PCM must be signed 16-bit little-endian",
-                    code="invalid_preroll_format",
-                ),
-                status=415,
-            )
-        content_encoding = request.headers.get("Content-Encoding", "identity").lower()
-        if content_encoding not in {"", "identity"}:
-            return None, None, web.json_response(
-                _openai_error(
-                    "Compressed pre-roll request bodies are not supported",
-                    code="invalid_preroll_content_encoding",
-                ),
-                status=415,
-            )
-        if (
-            request.content_length is not None
-            and request.content_length > realtime_config.preroll_max_bytes
-        ):
-            return None, None, web.json_response(
-                _openai_error(
-                    "Pre-roll audio exceeds the configured duration limit",
-                    code="preroll_audio_too_large",
-                ),
-                status=413,
-            )
-
-        chunks: list[bytes] = []
-        total = 0
-        try:
-            async for chunk in request.content.iter_chunked(64 * 1024):
-                total += len(chunk)
-                if total > realtime_config.preroll_max_bytes:
-                    return None, None, web.json_response(
-                        _openai_error(
-                            "Pre-roll audio exceeds the configured duration limit",
-                            code="preroll_audio_too_large",
-                        ),
-                        status=413,
-                    )
-                chunks.append(bytes(chunk))
-        except RealtimeProtocolError as exc:
-            return None, None, self._realtime_error_response(exc)
-        return b"".join(chunks), idempotency_key, None
-
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
@@ -3199,36 +3101,200 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 "provider_call_max_seconds": config.provider_call_max_seconds,
             }
-            if config.preroll_enabled:
-                payload["preroll_url"] = (
-                    f"/v1/realtime/sessions/{created.session.session_id}/audio/preroll"
+            if config.audio_uplink_enabled:
+                payload["audio_uplink_url"] = (
+                    f"/v1/realtime/sessions/{created.session.session_id}/audio/uplink"
                 )
             return web.json_response(payload)
         except Exception as exc:
             logger.warning("Realtime session creation failed: %s", exc)
             return self._realtime_error_response(exc)
 
-    async def _handle_realtime_preroll(
+    async def _handle_realtime_audio_uplink(
         self, request: "web.Request"
-    ) -> "web.Response":
+    ) -> "web.StreamResponse":
+        from gateway.realtime.protocol import (
+            RealtimeProtocolError,
+            validate_audio_stream_id,
+            validate_audio_uplink_command,
+        )
+
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        audio, idempotency_key, error = await self._read_realtime_preroll(request)
-        if error is not None:
-            return error
-        assert audio is not None and idempotency_key is not None
         try:
             manager = self._ensure_realtime_manager()
-            result = await manager.ingest_preroll_audio(
-                request.match_info["session_id"],
-                audio,
-                idempotency_key=idempotency_key,
-            )
-            return web.json_response(result)
+            session = await manager.require_active(request.match_info["session_id"])
+            stream_id = validate_audio_stream_id(request.query.get("stream_id"))
         except Exception as exc:
-            logger.warning("Realtime pre-roll upload failed: %s", exc)
             return self._realtime_error_response(exc)
+
+        ws = web.WebSocketResponse(
+            heartbeat=30,
+            max_msg_size=manager.config.audio_uplink_max_bytes,
+        )
+        await ws.prepare(request)
+        owner_id = uuid.uuid4().hex
+        began = False
+        ended = False
+
+        async def send_error(exc: Exception) -> None:
+            await ws.send_json({
+                "type": "error",
+                "stream_id": stream_id,
+                "code": getattr(exc, "code", "audio_uplink_error"),
+                "message": _redact_api_error_text(exc),
+            })
+
+        try:
+            while not ws.closed:
+                try:
+                    message = await ws.receive(
+                        timeout=manager.config.audio_uplink_idle_timeout_seconds
+                    )
+                except asyncio.TimeoutError:
+                    if began and not ended:
+                        await session.teardown_audio_uplink(
+                            stream_id,
+                            reason="audio_uplink_idle_timeout",
+                            owner_id=owner_id,
+                        )
+                        ended = True
+                    await ws.close(
+                        code=1001,
+                        message=b"audio uplink idle timeout",
+                    )
+                    break
+
+                if message.type == web.WSMsgType.TEXT:
+                    try:
+                        command = validate_audio_uplink_command(
+                            message.data,
+                            expected_stream_id=stream_id,
+                        )
+                        if command["type"] == "turn.begin":
+                            result = await session.begin_audio_uplink(
+                                command,
+                                owner_id=owner_id,
+                            )
+                            began = True
+                            await ws.send_json({
+                                "type": "turn.accepted",
+                                **result,
+                            })
+                        else:
+                            if not began:
+                                raise RealtimeProtocolError(
+                                    "turn.end requires an accepted turn.begin",
+                                    code="audio_stream_not_active",
+                                )
+                            result = await session.end_audio_uplink(
+                                stream_id,
+                                owner_id=owner_id,
+                            )
+                            ended = True
+                            await ws.send_json({
+                                "type": "turn.ended",
+                                **result,
+                            })
+                            await ws.close()
+                            break
+                    except Exception as exc:
+                        await send_error(exc)
+                        if began and not ended:
+                            await session.abort_audio_uplink(
+                                stream_id,
+                                reason=getattr(
+                                    exc,
+                                    "code",
+                                    "invalid_audio_uplink_control",
+                                ),
+                                owner_id=owner_id,
+                            )
+                            ended = True
+                        await ws.close(
+                            code=1008,
+                            message=b"invalid audio uplink control",
+                        )
+                        break
+                elif message.type == web.WSMsgType.BINARY:
+                    if not began:
+                        await send_error(
+                            RealtimeProtocolError(
+                                "Binary audio requires an accepted turn.begin",
+                                code="audio_stream_not_active",
+                            )
+                        )
+                        await ws.close(
+                            code=1008,
+                            message=b"turn.begin required",
+                        )
+                        break
+                    try:
+                        await session.append_audio_uplink(
+                            stream_id,
+                            bytes(message.data),
+                            owner_id=owner_id,
+                        )
+                    except Exception as exc:
+                        await send_error(exc)
+                        error_code = getattr(
+                            exc,
+                            "code",
+                            "audio_uplink_frame_failed",
+                        )
+                        if error_code in {
+                            "invalid_audio_uplink_frame",
+                            "audio_uplink_too_large",
+                        }:
+                            await session.abort_audio_uplink(
+                                stream_id,
+                                reason=error_code,
+                                owner_id=owner_id,
+                            )
+                        elif error_code not in {
+                            "audio_stream_not_owner",
+                            "audio_stream_not_active",
+                            "audio_stream_ended",
+                        }:
+                            await session.teardown_audio_uplink(
+                                stream_id,
+                                reason=error_code,
+                                owner_id=owner_id,
+                            )
+                        ended = True
+                        close_code = (
+                            1009
+                            if error_code == "audio_uplink_too_large"
+                            else 1011
+                        )
+                        await ws.close(
+                            code=close_code,
+                            message=b"audio uplink failed",
+                        )
+                        break
+                elif message.type in {
+                    web.WSMsgType.ERROR,
+                    web.WSMsgType.CLOSE,
+                    web.WSMsgType.CLOSED,
+                }:
+                    break
+        finally:
+            if began and not ended:
+                try:
+                    await session.teardown_audio_uplink(
+                        stream_id,
+                        reason="audio_uplink_disconnected",
+                        owner_id=owner_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not resolve disconnected audio uplink for %s",
+                        session.session_id,
+                        exc_info=True,
+                    )
+            await ws.close()
+        return ws
 
     async def _handle_realtime_session_renew(
         self, request: "web.Request"
@@ -3259,9 +3325,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 "provider_call_max_seconds": config.provider_call_max_seconds,
             }
-            if config.preroll_enabled:
-                payload["preroll_url"] = (
-                    f"/v1/realtime/sessions/{created.session.session_id}/audio/preroll"
+            if config.audio_uplink_enabled:
+                payload["audio_uplink_url"] = (
+                    f"/v1/realtime/sessions/{created.session.session_id}/audio/uplink"
                 )
             return web.json_response(payload)
         except Exception as exc:
@@ -3509,9 +3575,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             from gateway.realtime.protocol import (
-                PREROLL_CHANNELS,
-                PREROLL_SAMPLE_RATE_HZ,
-                PREROLL_SAMPLE_WIDTH_BYTES,
+                AUDIO_UPLINK_CHANNELS,
+                AUDIO_UPLINK_SAMPLE_RATE_HZ,
+                AUDIO_UPLINK_SAMPLE_WIDTH_BYTES,
             )
 
             realtime_config, realtime_key, review_configured = (
@@ -3532,7 +3598,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "cancels_started_tools": False,
                     "control_command": "response.interrupt",
                     "requires_audio_end_ms": True,
-                    "accepts_preroll_after_interrupt": True,
+                    "atomic_audio_uplink_interrupt": True,
+                    "requires_explicit_response_and_item": True,
                     "supports_post_generation_interrupt": True,
                 },
                 "playback_completion_command": "response.playback_completed",
@@ -3545,20 +3612,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 "provider_call_max_input_tokens": (
                     realtime_config.provider_call_max_input_tokens
                 ),
-                "wake_word_preroll": {
+                "audio_uplink": {
                     "available": bool(
-                        realtime_available and realtime_config.preroll_enabled
+                        realtime_available and realtime_config.audio_uplink_enabled
                     ),
-                    "complete_utterance_required": True,
-                    "content_type": "audio/pcm",
+                    "transport": "websocket",
+                    "binary_frames": "raw_pcm",
                     "format": "s16le",
-                    "sample_rate_hz": PREROLL_SAMPLE_RATE_HZ,
-                    "channels": PREROLL_CHANNELS,
-                    "sample_width_bytes": PREROLL_SAMPLE_WIDTH_BYTES,
-                    "max_seconds": realtime_config.preroll_max_seconds,
-                    "requires_idempotency_key": True,
-                    "reusable_per_provider_call": True,
-                    "webrtc_handoff": "unmute_after_committed",
+                    "sample_rate_hz": AUDIO_UPLINK_SAMPLE_RATE_HZ,
+                    "channels": AUDIO_UPLINK_CHANNELS,
+                    "sample_width_bytes": AUDIO_UPLINK_SAMPLE_WIDTH_BYTES,
+                    "max_seconds": realtime_config.audio_uplink_max_seconds,
+                    "idle_timeout_seconds": (
+                        realtime_config.audio_uplink_idle_timeout_seconds
+                    ),
+                    "append_chunk_milliseconds": (
+                        realtime_config.audio_uplink_append_chunk_milliseconds
+                    ),
+                    "requires_preroll_ms": True,
+                    "response_waits_for_turn_end": False,
+                    "response_waits_for_transcription": False,
+                    "idempotency": "call_id_and_stream_id",
+                    "provider_vad": True,
                 },
                 "background_self_improvement": {
                     "available": bool(realtime_available and review_configured),
@@ -3684,9 +3759,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "method": "GET",
                     "path": "/v1/realtime/sessions/{session_id}/control",
                 },
-                "realtime_preroll": {
-                    "method": "POST",
-                    "path": "/v1/realtime/sessions/{session_id}/audio/preroll",
+                "realtime_audio_uplink": {
+                    "method": "GET",
+                    "path": "/v1/realtime/sessions/{session_id}/audio/uplink",
                 },
                 "realtime_approval": {
                     "method": "POST",

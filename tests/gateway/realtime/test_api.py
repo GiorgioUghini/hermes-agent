@@ -27,6 +27,11 @@ class _FakeSession:
         self.state = "ready"
         self.closed = False
         self.commands = []
+        self.audio_begin = None
+        self.audio = bytearray()
+        self.audio_ended = False
+        self.audio_teardown_reason = ""
+        self.audio_abort_reason = ""
 
     def control_snapshot(self):
         return {
@@ -50,6 +55,41 @@ class _FakeSession:
                 },
             )
 
+    async def begin_audio_uplink(self, command, *, owner_id=""):
+        self.audio_begin = dict(command)
+        return {
+            "status": "accepted",
+            "stream_id": command["stream_id"],
+            "call_id": "call_1",
+            "barge_in": command["barge_in"],
+        }
+
+    async def append_audio_uplink(self, _stream_id, audio, *, owner_id=""):
+        if len(audio) % 2:
+            from gateway.realtime.protocol import RealtimeProtocolError
+
+            raise RealtimeProtocolError(
+                "invalid PCM frame",
+                code="invalid_audio_uplink_frame",
+            )
+        self.audio.extend(audio)
+
+    async def end_audio_uplink(self, stream_id, *, owner_id=""):
+        self.audio_ended = True
+        return {
+            "status": "ending",
+            "stream_id": stream_id,
+            "call_id": "call_1",
+            "audio_bytes": len(self.audio),
+        }
+
+    async def teardown_audio_uplink(self, stream_id, *, reason, owner_id=""):
+        self.audio_teardown_reason = reason
+        return {"status": "discarded", "stream_id": stream_id}
+
+    async def abort_audio_uplink(self, stream_id, *, reason, owner_id=""):
+        self.audio_abort_reason = reason
+
 
 class _FakeManager:
     def __init__(self):
@@ -57,8 +97,6 @@ class _FakeManager:
         self.session = _FakeSession()
         self.session.config = self.config
         self.created_offer = ""
-        self.preroll_audio = b""
-        self.preroll_idempotency_key = ""
         self.suspended_session_id = ""
 
     async def create_session(self, offer_sdp, requested_session_id=None):
@@ -77,21 +115,6 @@ class _FakeManager:
 
     async def require_active(self, session_id):
         return self.require(session_id)
-
-    async def ingest_preroll_audio(self, session_id, audio, *, idempotency_key):
-        self.require(session_id)
-        self.preroll_audio = audio
-        self.preroll_idempotency_key = idempotency_key
-        return {
-            "version": 1,
-            "session_id": session_id,
-            "call_id": "call_1",
-            "idempotency_key": idempotency_key,
-            "status": "committed",
-            "item_id": "item_preroll",
-            "audio_bytes": len(audio),
-            "duration_ms": round(len(audio) * 1000 / 48_000),
-        }
 
     async def close_session(self, session_id, reason="client_closed"):
         if session_id != self.session.session_id:
@@ -126,9 +149,9 @@ def _adapter_and_app():
         "/v1/realtime/sessions/{session_id}/control",
         adapter._handle_realtime_control,
     )
-    app.router.add_post(
-        "/v1/realtime/sessions/{session_id}/audio/preroll",
-        adapter._handle_realtime_preroll,
+    app.router.add_get(
+        "/v1/realtime/sessions/{session_id}/audio/uplink",
+        adapter._handle_realtime_audio_uplink,
     )
     app.router.add_post(
         "/v1/realtime/sessions/{session_id}/suspend",
@@ -170,88 +193,178 @@ async def test_create_returns_sdp_metadata_without_standard_openai_key():
     assert payload["call_id"] == "call_1"
     assert payload["model"] == "gpt-realtime"
     assert payload["voice"] == "marin"
-    assert payload["preroll_url"] == ("/v1/realtime/sessions/voice_1/audio/preroll")
+    assert payload["audio_uplink_url"] == (
+        "/v1/realtime/sessions/voice_1/audio/uplink"
+    )
     assert payload["suspend_url"] == "/v1/realtime/sessions/voice_1/suspend"
     assert manager.created_offer.startswith("v=0")
     assert "sk-openai-server-only" not in str(payload)
 
 
 @pytest.mark.asyncio
-async def test_preroll_accepts_bounded_pcm_with_idempotency_key():
+async def test_audio_uplink_accepts_raw_pcm_between_begin_and_end():
     adapter, manager, app = _adapter_and_app()
     client = TestClient(TestServer(app))
     await client.start_server()
     audio = b"\x01\x00" * 2400
+    stream_id = "11111111-1111-4111-8111-111111111111"
     try:
-        response = await client.post(
-            "/v1/realtime/sessions/voice_1/audio/preroll",
-            data=audio,
-            headers={
-                **_authorization(adapter),
-                "Content-Type": "audio/pcm;rate=24000;channels=1;format=s16le",
-                "Idempotency-Key": "wake:1",
-            },
+        socket = await client.ws_connect(
+            (
+                "/v1/realtime/sessions/voice_1/audio/uplink"
+                f"?stream_id={stream_id}"
+            ),
+            headers=_authorization(adapter),
         )
-        payload = await response.json()
+        await socket.send_json({
+            "type": "turn.begin",
+            "stream_id": stream_id,
+            "barge_in": False,
+            "preroll_ms": 0,
+        })
+        accepted = await socket.receive_json()
+        await socket.send_bytes(audio)
+        await socket.send_json({"type": "turn.end"})
+        ended = await socket.receive_json()
     finally:
         await client.close()
         adapter._response_store.close()
 
-    assert response.status == 200
-    assert payload["status"] == "committed"
-    assert manager.preroll_audio == audio
-    assert manager.preroll_idempotency_key == "wake:1"
+    assert accepted["type"] == "turn.accepted"
+    assert ended["type"] == "turn.ended"
+    assert bytes(manager.session.audio) == audio
+    assert manager.session.audio_ended is True
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("headers", "expected_status", "expected_code"),
-    [
-        (
-            {"Content-Type": "application/octet-stream", "Idempotency-Key": "wake:1"},
-            415,
-            "invalid_preroll_content_type",
-        ),
-        (
-            {
-                "Content-Type": "audio/pcm;rate=16000",
-                "Idempotency-Key": "wake:1",
-            },
-            415,
-            "invalid_preroll_sample_rate",
-        ),
-        (
-            {"Content-Type": "audio/pcm", "Idempotency-Key": "wake:1"},
-            415,
-            "invalid_preroll_sample_rate",
-        ),
-        (
-            {"Content-Type": "audio/pcm"},
-            400,
-            "invalid_preroll_idempotency_key",
-        ),
-    ],
-)
-async def test_preroll_rejects_ambiguous_audio_contract(
-    headers, expected_status, expected_code
-):
+async def test_audio_uplink_rejects_binary_before_turn_begin():
     adapter, _manager, app = _adapter_and_app()
     client = TestClient(TestServer(app))
     await client.start_server()
-    headers = {**_authorization(adapter), **headers}
+    stream_id = "11111111-1111-4111-8111-111111111111"
     try:
-        response = await client.post(
-            "/v1/realtime/sessions/voice_1/audio/preroll",
-            data=b"\x00\x00" * 2400,
-            headers=headers,
+        socket = await client.ws_connect(
+            (
+                "/v1/realtime/sessions/voice_1/audio/uplink"
+                f"?stream_id={stream_id}"
+            ),
+            headers=_authorization(adapter),
         )
-        payload = await response.json()
+        await socket.send_bytes(b"\x00\x00" * 2400)
+        payload = await socket.receive_json()
     finally:
         await client.close()
         adapter._response_store.close()
 
-    assert response.status == expected_status
-    assert payload["error"]["code"] == expected_code
+    assert payload["type"] == "error"
+    assert payload["code"] == "audio_stream_not_active"
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_aborts_partial_audio_on_invalid_client_frame():
+    adapter, manager, app = _adapter_and_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    stream_id = "11111111-1111-4111-8111-111111111111"
+    try:
+        socket = await client.ws_connect(
+            (
+                "/v1/realtime/sessions/voice_1/audio/uplink"
+                f"?stream_id={stream_id}"
+            ),
+            headers=_authorization(adapter),
+        )
+        await socket.send_json({
+            "type": "turn.begin",
+            "stream_id": stream_id,
+            "barge_in": False,
+            "preroll_ms": 0,
+        })
+        await socket.receive_json()
+        await socket.send_bytes(b"\x00\x00" * 4800)
+        await socket.send_bytes(b"\x00")
+        error = await socket.receive_json()
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert error["code"] == "invalid_audio_uplink_frame"
+    assert manager.session.audio_abort_reason == "invalid_audio_uplink_frame"
+    assert manager.session.audio_teardown_reason == ""
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_aborts_partial_audio_on_invalid_control():
+    adapter, manager, app = _adapter_and_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    stream_id = "11111111-1111-4111-8111-111111111111"
+    try:
+        socket = await client.ws_connect(
+            (
+                "/v1/realtime/sessions/voice_1/audio/uplink"
+                f"?stream_id={stream_id}"
+            ),
+            headers=_authorization(adapter),
+        )
+        await socket.send_json({
+            "type": "turn.begin",
+            "stream_id": stream_id,
+            "barge_in": False,
+            "preroll_ms": 0,
+        })
+        await socket.receive_json()
+        await socket.send_bytes(b"\x00\x00" * 4800)
+        await socket.send_json({"type": "turn.unsupported"})
+        error = await socket.receive_json()
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert error["code"] == "unsupported_audio_uplink_command"
+    assert manager.session.audio_abort_reason == (
+        "unsupported_audio_uplink_command"
+    )
+    assert manager.session.audio_teardown_reason == ""
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_idle_timeout_releases_session_stream():
+    adapter, manager, app = _adapter_and_app()
+    manager.config = RealtimeVoiceConfig(
+        enabled=True,
+        audio_uplink_idle_timeout_seconds=0.05,
+    )
+    manager.session.config = manager.config
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    stream_id = "11111111-1111-4111-8111-111111111111"
+    try:
+        socket = await client.ws_connect(
+            (
+                "/v1/realtime/sessions/voice_1/audio/uplink"
+                f"?stream_id={stream_id}"
+            ),
+            headers=_authorization(adapter),
+        )
+        await socket.send_json({
+            "type": "turn.begin",
+            "stream_id": stream_id,
+            "barge_in": False,
+            "preroll_ms": 0,
+        })
+        await socket.receive_json()
+        closed = await socket.receive(timeout=1)
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert closed.type in {
+        web.WSMsgType.CLOSE,
+        web.WSMsgType.CLOSED,
+        web.WSMsgType.CLOSING,
+    }
+    assert manager.session.audio_teardown_reason == "audio_uplink_idle_timeout"
 
 
 @pytest.mark.asyncio
@@ -456,22 +569,27 @@ async def test_capabilities_report_transport_and_authorization_semantics():
     assert details["voice_authorization"] is False
     assert details["barge_in"]["cancels_started_tools"] is False
     assert details["barge_in"]["control_command"] == "response.interrupt"
+    assert details["barge_in"]["atomic_audio_uplink_interrupt"] is True
     assert details["barge_in"]["supports_post_generation_interrupt"] is True
     assert details["playback_completion_command"] == "response.playback_completed"
     assert details["turn_completed_after_playback"] is True
     assert details["idle_provider_suspension"] is True
-    assert details["wake_word_preroll"] == {
+    assert details["audio_uplink"] == {
         "available": True,
-        "complete_utterance_required": True,
-        "content_type": "audio/pcm",
+        "transport": "websocket",
+        "binary_frames": "raw_pcm",
         "format": "s16le",
         "sample_rate_hz": 24000,
         "channels": 1,
         "sample_width_bytes": 2,
         "max_seconds": 30,
-        "requires_idempotency_key": True,
-        "reusable_per_provider_call": True,
-        "webrtc_handoff": "unmute_after_committed",
+        "idle_timeout_seconds": 5.0,
+        "append_chunk_milliseconds": 80,
+        "requires_preroll_ms": True,
+        "response_waits_for_turn_end": False,
+        "response_waits_for_transcription": False,
+        "idempotency": "call_id_and_stream_id",
+        "provider_vad": True,
     }
 
 
@@ -609,9 +727,9 @@ async def test_api_real_manager_round_trip_with_fake_openai_peers(tmp_path):
         "/v1/realtime/sessions/{session_id}/control",
         adapter._handle_realtime_control,
     )
-    api_app.router.add_post(
-        "/v1/realtime/sessions/{session_id}/audio/preroll",
-        adapter._handle_realtime_preroll,
+    api_app.router.add_get(
+        "/v1/realtime/sessions/{session_id}/audio/uplink",
+        adapter._handle_realtime_audio_uplink,
     )
     api_app.router.add_delete(
         "/v1/realtime/sessions/{session_id}",
@@ -650,47 +768,62 @@ async def test_api_real_manager_round_trip_with_fake_openai_peers(tmp_path):
             "/v1/realtime/sessions/voice-integration/control",
             headers=authorization,
         )
-        preroll_audio = b"\x01\x00" * 7200
-        preroll = await client.post(
-            "/v1/realtime/sessions/voice-integration/audio/preroll",
-            data=preroll_audio,
-            headers={
-                **authorization,
-                "Content-Type": "audio/pcm;rate=24000;channels=1;format=s16le",
-                "Idempotency-Key": "wake:integration",
-            },
+        stream_id = "11111111-1111-4111-8111-111111111111"
+        uplink_audio = b"\x01\x00" * 1920
+        uplink = await client.ws_connect(
+            (
+                "/v1/realtime/sessions/voice-integration/audio/uplink"
+                f"?stream_id={stream_id}"
+            ),
+            headers=authorization,
         )
-        preroll_payload = await preroll.json()
-        assert preroll.status == 200
-        assert preroll_payload["status"] == "committed"
-        assert preroll_payload["item_id"] == "input_integration"
-
-        pre_response_events = provider["events"]
-        assert (
-            pre_response_events[0]["session"]["audio"]["input"]["turn_detection"]
-            is None
-        )
-        assert any(
-            event["type"] == "input_audio_buffer.clear" for event in pre_response_events
-        )
+        await uplink.send_json({
+            "type": "turn.begin",
+            "stream_id": stream_id,
+            "barge_in": False,
+            "preroll_ms": 0,
+        })
+        accepted = await uplink.receive_json()
+        assert accepted["type"] == "turn.accepted"
+        await uplink.send_bytes(uplink_audio)
+        await _receive_matching(provider_events, "input_audio_buffer.append")
         appended = b"".join(
             base64.b64decode(event["audio"])
-            for event in pre_response_events
+            for event in provider["events"]
             if event["type"] == "input_audio_buffer.append"
         )
-        assert appended == preroll_audio
-        assert any(
-            event["type"] == "input_audio_buffer.commit"
-            for event in pre_response_events
+        assert appended == uplink_audio
+        assert not any(
+            event["type"]
+            in {
+                "session.update",
+                "input_audio_buffer.clear",
+                "input_audio_buffer.commit",
+            }
+            for event in provider["events"]
         )
-        assert any(
-            event["type"] == "session.update"
-            and event["session"]["audio"]["input"]["turn_detection"]
-            == config.turn_detection_config()
-            for event in pre_response_events
+
+        await provider["socket"].send_json(
+            {"type": "input_audio_buffer.speech_started"}
         )
+        await provider["socket"].send_json(
+            {"type": "input_audio_buffer.speech_stopped"}
+        )
+        await provider["socket"].send_json({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_integration",
+        })
         response_create = await _receive_matching(provider_events, "response.create")
         assert response_create["response"].get("conversation", "auto") == "auto"
+        await provider["socket"].send_json({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_integration",
+            "transcript": "Say hello.",
+        })
+        await uplink.send_json({"type": "turn.end"})
+        ended = await uplink.receive_json()
+        assert ended["type"] == "turn.ended"
+        await uplink.close()
 
         await provider["socket"].send_json({
             "type": "response.output_audio_transcript.done",

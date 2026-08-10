@@ -103,8 +103,8 @@ GET  /api/model/options          Provider-aware picker inventory
 POST /v1/realtime/sessions       Exchange a WebRTC SDP offer
 GET  /v1/realtime/sessions/{id}/control
                                  Structured control WebSocket
-POST /v1/realtime/sessions/{id}/audio/preroll
-                                 Commit a wake-word client's first utterance
+GET  /v1/realtime/sessions/{id}/audio/uplink?stream_id={uuid}
+                                 Stream one raw-PCM user turn over WebSocket
 POST /v1/realtime/sessions/{id}/renew
                                  Rotate the provider call with a new SDP offer
 POST /v1/realtime/sessions/{id}/suspend
@@ -144,11 +144,11 @@ Use `/v1/models` for OpenAI-client compatibility. Use `/api/model/options` or
 
 ### Native Realtime voice (Android/WebRTC)
 
-The native voice API is not text streaming plus TTS. Android and OpenAI carry
-bidirectional audio over WebRTC, while a Hermes session actor attaches to the
-same provider call over a sideband WebSocket. Hermes remains the sole
-orchestrator for instructions, responses, tools, authorization, persistence,
-and rotation.
+The native voice API is not text streaming plus TTS. Android streams microphone
+PCM to Hermes over the authenticated audio uplink, OpenAI returns model audio
+over WebRTC, and a Hermes session actor owns the provider sideband. Hermes
+remains the sole orchestrator for instructions, responses, tools,
+authorization, persistence, and rotation.
 
 ```mermaid
 sequenceDiagram
@@ -158,7 +158,7 @@ sequenceDiagram
     participant OAI as OpenAI Realtime
     participant Core as Hermes tools and SessionDB
 
-    App->>App: Create peer connection, audio track, and SDP offer
+    App->>App: Create receive-capable peer connection and SDP offer
     App->>API: POST /v1/realtime/sessions (offer + bearer auth)
     API->>Core: Build AIAgent, SOUL, memory, skills, and tool snapshot
     API->>OAI: POST /v1/realtime/calls (offer + server API key)
@@ -166,12 +166,12 @@ sequenceDiagram
     API->>Actor: Attach sideband WebSocket by call_id
     API-->>App: session_id + SDP answer + control_url
     App->>App: Apply remote description
-    opt Locally buffered first utterance
-        App->>API: POST complete PCM utterance
-        API->>Actor: Disable VAD, append, commit, restore VAD
-        Actor-->>App: Committed; live microphone may start
-    end
-    App<<->>OAI: WebRTC microphone and model audio
+    App->>API: Open audio uplink and send turn.begin
+    App->>API: Burst pre-wake PCM, then stream live PCM
+    API->>Actor: Forward append events immediately
+    App->>API: Send turn.end
+    OAI-->>Actor: VAD speech events and committed input
+    OAI-->>App: WebRTC model audio
     App<<->>API: Sequenced structured controls
     OAI-->>Actor: Committed input, function calls, response events
     Actor->>Core: Persist, authorize, and execute tools
@@ -197,9 +197,9 @@ limit, rotation thresholds, barge-in contract, and background-review status.
 
 #### 1. Negotiate the media call
 
-The Android app creates an `RTCPeerConnection`, adds its microphone audio
-track, configures remote audio playback, and generates an SDP offer. Send that
-offer to Hermes:
+The Android app creates a receive-capable `RTCPeerConnection`, configures remote
+audio playback, and generates an SDP offer. It keeps microphone transmission
+disabled because user PCM uses the Hermes uplink. Send the offer to Hermes:
 
 ```http
 POST /v1/realtime/sessions HTTP/1.1
@@ -223,7 +223,7 @@ Raw `application/sdp` request bodies are also accepted. JSON is always returned:
   "model": "gpt-realtime",
   "voice": "marin",
   "control_url": "/v1/realtime/sessions/rt_123/control",
-  "preroll_url": "/v1/realtime/sessions/rt_123/audio/preroll",
+  "audio_uplink_url": "/v1/realtime/sessions/rt_123/audio/uplink",
   "renew_url": "/v1/realtime/sessions/rt_123/renew",
   "suspend_url": "/v1/realtime/sessions/rt_123/suspend",
   "provider_call_max_seconds": 3300
@@ -240,67 +240,53 @@ The Android OpenAI data channel is transport-only. It must not send
 client state from bypassing its frozen prompt, authorization, or durable
 ordering.
 
-#### 1a. Preserve wake-word audio during startup
+#### 1a. Stream the pre-wake burst and live microphone
 
-`features.realtime_voice_details.wake_word_preroll` describes the optional
-server-mediated handoff. Use it when the app starts a provider call only after
-local wake detection and cannot inject historical PCM into its WebRTC audio
-source.
+`features.realtime_voice_details.audio_uplink` describes the authenticated
+WebSocket input. Keep one echo-cancelled `AudioRecord` feeding both the wake
+detector and a rolling two-second PCM buffer. Keep the WebRTC microphone sender
+inactive so the provider does not receive duplicate audio.
 
-The upload represents one **complete utterance**, not an unfinished prefix
-that continues over RTP. It is reusable for every locally captured turn on
-the active provider call:
+For each confirmed command, generate a UUID and connect to:
 
-1. Keep one local `AudioRecord` stream feeding both the wake detector and a
-   rolling buffer.
-2. On detection, start SDP negotiation while continuing that same capture
-   stream.
-3. Run local end-of-speech detection. Retain audio from the desired pre-wake
-   boundary through the end of the command.
-4. Freeze that utterance while keeping the shared local capture source
-   available for future wake detection. Keep the WebRTC microphone sender
-   inactive.
-5. Apply the SDP answer, then upload the complete utterance to the returned
-   `preroll_url`.
-6. Wait for Hermes to return `status: "committed"`. A client that uses local
-   capture for every turn may keep WebRTC receive-only and repeat this upload
-   with a new idempotency key.
-
-```http
-POST /v1/realtime/sessions/rt_123/audio/preroll HTTP/1.1
-Authorization: ******
-Content-Type: audio/pcm;rate=24000;channels=1;format=s16le
-Idempotency-Key: wake-018f3c0d
-
-<raw signed 16-bit little-endian mono PCM>
+```text
+wss://hermes.example/v1/realtime/sessions/rt_123/audio/uplink?stream_id=<uuid>
 ```
+
+Send this text frame first:
 
 ```json
 {
-  "version": 1,
-  "session_id": "rt_123",
-  "call_id": "rtc_456",
-  "idempotency_key": "wake-018f3c0d",
-  "status": "committed",
-  "item_id": "item_789",
-  "audio_bytes": 288000,
-  "duration_ms": 6000
+  "type": "turn.begin",
+  "stream_id": "018f3c0d-2ad7-7b31-8d5e-4b6999351d22",
+  "barge_in": false,
+  "preroll_ms": 2000
 }
 ```
 
-Hermes temporarily disables provider VAD, clears any pending input, appends the
-PCM through its authoritative sideband, commits it, and restores the configured
-VAD before acknowledging. The normal transcript, persistence, tools, and
-response path then handles that provider item.
+The client may send binary frames immediately without waiting for
+`turn.accepted`. Binary frames contain raw signed 16-bit little-endian mono PCM
+at 24 kHz. Send the ring-buffer burst at full network speed, then continue with
+live frames. Do not base64-encode, pace, or wrap binary frames in JSON.
+`preroll_ms` is the exact duration of the initial buffered burst. Send
+`{"type":"turn.end"}` when capture closes, but do not wait for a commit before
+sending it.
 
-Do not upload a partial utterance and immediately continue it over WebRTC:
-cross-transport ordering cannot make that one coherent VAD turn. Do not run a
-wake-word `AudioRecord` and a second WebRTC-owned `AudioRecord` concurrently.
-Either keep one shared local source and a receive-only WebRTC connection, or
-release local capture before enabling a WebRTC microphone sender. On an
-ambiguous timeout or provider error, keep the microphone sender inactive and
-renew/recreate the provider call rather than submitting the audio under a new
-idempotency key.
+Hermes splits only client frames larger than the configured append size
+(80 ms by default) and forwards every piece immediately. Provider VAD remains
+enabled and owns speech endpointing and commit. Hermes ignores commits until
+`preroll_ms` has been forwarded; after that boundary, a commit covering all
+forwarded audio triggers `response.create` immediately. Neither `turn.end` nor
+input transcription sits on this response path. Transcription updates the
+durable user row asynchronously and has its own bounded timeout. An explicit
+`turn.end` before the declared burst boundary authorizes a shorter completed
+turn.
+
+`stream_id` provides idempotency within the current provider `call_id`.
+Repeating identical `turn.begin` metadata is a no-op; changing barge-in metadata
+for the same UUID is a conflict. A disconnect commits an uncommitted tail of at
+least 100 ms and clears anything shorter. Five seconds without frames tears
+down the stream, and one turn may contain at most 30 seconds of PCM.
 
 #### 2. Attach the control WebSocket
 
@@ -339,7 +325,7 @@ usage, and recovery UI. Important event families include:
 |--------|-----------------|
 | `session.state`, `session.reconnected`, `session.rotated`, `session.suspended` | Update connection/lifecycle UI; `session.state` carries closing and closed states |
 | `vad.speech_started`, `vad.speech_stopped` | Show microphone/turn state |
-| `audio.preroll_started`, `audio.preroll_committed` | Keep the initial WebRTC microphone inactive until the upload is committed |
+| `audio.uplink_started`, `audio.uplink_ended`, `audio.uplink_committed` | Track streamed microphone ingestion without enabling a duplicate WebRTC sender |
 | `turn.input_committed`, `turn.steered`, `turn.completed` | Reconcile logical voice-turn state without rendering assistant text; `turn.completed` is emitted only after playout is confirmed or the bounded fallback expires |
 | `tool.started`, `tool.completed` | Render tool activity; arguments are reduced to key names |
 | `approval.request`, `approval.resolved` | Show and resolve a privileged-action decision |
@@ -434,27 +420,37 @@ silent past the configured delay, Hermes may request one short
 `conversation: "none"` status response with no tools. Status speech is
 rate-limited, canceled by barge-in, and excluded from canonical history.
 
-Live WebRTC microphone input uses OpenAI VAD for automatic barge-in. A
-receive-only, locally buffered client uses the structured path instead:
+For a spoken barge-in, make interruption part of the new stream's first frame:
 
-1. On a confirmed wake word, stop local playback immediately.
-2. Send `response.interrupt` with the decoded audio duration that was actually
-   rendered for the current response. Use `0` if no response audio played.
-3. Hermes sends `response.cancel` when generation is still active. While the
-   WebRTC output buffer is active it sends `output_audio_buffer.clear`, which
-   stops queued RTP and makes OpenAI truncate conversation audio at its
-   synchronized playback cursor. If the provider buffer already drained but
-   device audio remains, Hermes sends `conversation.item.truncate` with the
-   client's `audio_end_ms` instead.
-4. Keep recording through local end-of-speech, then upload the complete command
-   to `preroll_url` with a new idempotency key. Hermes accepts this handoff while
-   the interrupted response or a started tool is settling.
+```json
+{
+  "type": "turn.begin",
+  "stream_id": "018f3c0d-2ad7-7b31-8d5e-4b6999351d22",
+  "barge_in": true,
+  "preroll_ms": 2000,
+  "interrupted": {
+    "response_id": "response_abc",
+    "item_id": "item_abc",
+    "audio_end_ms": 875
+  }
+}
+```
+
+The app silences playback immediately on wake detection but sends this frame
+only after local speech confirmation. If confirmation fails, it sends nothing
+and may resume playback without truncating the response. On confirmation, the
+pre-wake ring buffer covers the delay.
 
 `audio_end_ms` is not wall-clock time, RTP-receive time, or session duration.
-Reset the counter for each response and derive it from decoded frames presented
-to the audio renderer. Hermes acknowledges an accepted command with
-`control.ack`, emits `response.interrupted`, and emits `response.truncated`
-after the provider confirms truncation.
+It is the cursor frozen when playback was silenced: decoded frames actually
+presented to the audio renderer, excluding buffered or subsequently received
+audio. Hermes targets the supplied response and item, clamps the cursor to
+audio received from the provider, and never infers a target from the newest
+overlapping response. A stale, finalized, or unknown target skips truncation
+without failing the new turn.
+
+`response.interrupt` remains available on the control WebSocket for a stop
+button or another interruption that is not followed by a new spoken command.
 
 A provider `response.done` event means generation finished, not that the device
 finished playing the response. Hermes therefore retains the response and
@@ -517,7 +513,7 @@ window. At the end of a normal response:
 4. Keep the logical `session_id` and local wake capture active.
 5. On the next wake, create a new receive-capable peer connection and send its
    offer to `/renew`.
-6. Upload that turn's complete PCM command to the returned `preroll_url`.
+6. Open the returned audio uplink with a fresh stream UUID and send the burst.
 
 `suspend` returns `204`, closes Hermes' provider sideband, and persists state as
 suspended without ending SessionDB history, memory, or the frozen prompt/tool
@@ -532,10 +528,10 @@ renewed actor has a new stream epoch; adopt the new stream ID and apply its
 `data.snapshot` before processing later events. A normal in-place provider
 rotation keeps the existing actor and stream ID.
 
-For barge-in, keep the current peer connection long enough to send
-`response.interrupt` and the replacement pre-roll; this avoids renegotiation
-latency. Suspend after the replacement response finishes. Closing and renewing
-mid-response is a recovery fallback, not the cancellation primitive.
+For barge-in, keep the current peer connection and open the replacement audio
+uplink immediately; this avoids renegotiation latency. Suspend after the
+replacement response finishes. Closing and renewing mid-response is a recovery
+fallback, not the cancellation primitive.
 
 Provider calls rotate before `provider_call_max_seconds` or
 `provider_call_max_input_tokens`. On `session.rotation_required`:

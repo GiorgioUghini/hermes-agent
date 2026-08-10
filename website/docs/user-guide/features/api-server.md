@@ -324,7 +324,7 @@ All routes use the normal API-server bearer authentication.
 |--------|------|---------|
 | `POST` | `/v1/realtime/sessions` | Exchange an Android SDP offer for the OpenAI SDP answer and create or resume a logical Hermes session |
 | `GET` | `/v1/realtime/sessions/{id}/control?stream_id={stream_id}&after={sequence}` | Upgrade to the sequenced structured-control WebSocket |
-| `POST` | `/v1/realtime/sessions/{id}/audio/preroll` | Commit one complete first utterance buffered locally during wake-word/session startup |
+| `GET` | `/v1/realtime/sessions/{id}/audio/uplink?stream_id={uuid}` | Upgrade to the raw-PCM WebSocket used for one streamed user turn |
 | `POST` | `/v1/realtime/sessions/{id}/approval` | HTTP fallback for an approval decision |
 | `POST` | `/v1/realtime/sessions/{id}/renew` | Exchange a fresh SDP offer while preserving the logical session |
 | `POST` | `/v1/realtime/sessions/{id}/suspend` | Close provider resources while preserving the logical Hermes session |
@@ -350,7 +350,7 @@ The response is JSON:
   "model": "gpt-realtime",
   "voice": "marin",
   "control_url": "/v1/realtime/sessions/rt_.../control",
-  "preroll_url": "/v1/realtime/sessions/rt_.../audio/preroll",
+  "audio_uplink_url": "/v1/realtime/sessions/rt_.../audio/uplink",
   "renew_url": "/v1/realtime/sessions/rt_.../renew",
   "suspend_url": "/v1/realtime/sessions/rt_.../suspend",
   "provider_call_max_seconds": 3300
@@ -362,34 +362,37 @@ nor any control event contains the standard OpenAI API key.
 
 ### Wake-word startup without dropped speech
 
-An always-open provider call is not required. Keep wake detection and a rolling
-PCM buffer entirely on the Android device, then use `preroll_url` for each
-locally captured utterance:
+Keep wake detection and a rolling PCM buffer on Android, and keep the WebRTC
+microphone sender inactive so the same audio is not ingested twice. For every
+confirmed turn:
 
-1. One local `AudioRecord` feeds both the wake detector and a 4-6 second ring
-   buffer.
-2. After detection, start SDP negotiation and continue the same local capture
-   through **local end-of-speech**.
-3. Keep the WebRTC microphone sender inactive. Freeze the completed utterance
-   while retaining the shared local capture source for future wake detection.
-4. Upload the complete utterance as `audio/pcm;rate=24000;channels=1;format=s16le`
-   with a unique `Idempotency-Key`.
-5. Wait until the endpoint returns `status: committed`. A local-capture client
-   may keep WebRTC receive-only and repeat the upload with a new idempotency key.
+1. Open `audio_uplink_url?stream_id=<uuid>` with API-server bearer auth.
+2. Send a `turn.begin` JSON text frame with the exact buffered duration:
+   `{"type":"turn.begin","stream_id":"<uuid>","barge_in":false,"preroll_ms":2000}`.
+   Do not wait for its acknowledgement.
+3. Send the pre-wake ring buffer immediately as one or more binary frames.
+4. Continue sending live PCM16 mono 24 kHz frames as `AudioRecord` produces
+   them. Hermes forwards them immediately without pacing or provider ACK waits.
+5. Send `{"type":"turn.end"}` when closing capture. This releases the uplink but
+   is not required before Hermes starts the response.
 
-Hermes temporarily disables provider VAD, clears the provider input buffer,
-appends and commits the PCM through its server-owned sideband, then restores
-the configured VAD before replying. The resulting item follows the same
-transcription, persistence, tool, memory, and response path as live WebRTC
-speech.
+Provider VAD stays enabled throughout. It emits `speech_started`,
+`speech_stopped`, and `committed`; Hermes never toggles turn detection during a
+turn. Commits are ignored until at least `preroll_ms` has been forwarded. The
+first later commit that covers all forwarded audio starts `response.create`
+immediately, without waiting for `turn.end` or input transcription. Transcripts
+update the durable user turn asynchronously; the configured transcription
+timeout records an explicit unavailable marker rather than stalling speech. If
+capture stops before `preroll_ms`, `turn.end` explicitly authorizes the
+already-received commit instead of leaving the short turn pending.
 
-The upload must be a complete first utterance. Do not send an unfinished prefix
-and continue it over RTP: the two transports cannot guarantee one coherent VAD
-turn. Avoid two simultaneous Android `AudioRecord` owners; use one shared
-capture source with receive-only WebRTC, or release wake-word capture before
-enabling WebRTC recording.
-If an upload times out, keep the microphone inactive and renew/recreate the
-provider call rather than resubmitting under a new key.
+Each socket carries one turn. The `stream_id` is also the idempotency key within
+the current provider `call_id`. A repeated identical `turn.begin` is a no-op;
+reusing the UUID with different interruption metadata is rejected. Binary
+frames are raw signed 16-bit little-endian PCM with no JSON or base64 envelope.
+The client must use hardware AEC during playback and silence output before
+freezing a barge-in burst, because Hermes cannot remove assistant speech already
+present in microphone PCM.
 
 ### Quick PC microphone test
 
@@ -463,29 +466,29 @@ that already started is allowed to finish; superseded calls that have not
 started are skipped, and the model reevaluates after the durable result
 boundary.
 
-A client that owns microphone capture locally and does not send RTP uplink must
-request barge-in over the authenticated control WebSocket:
+A new spoken command performs interruption atomically on the audio uplink:
 
 ```json
 {
-  "version": 1,
-  "type": "response.interrupt",
-  "request_id": "wake-018f3c0d",
-  "data": {"audio_end_ms": 875}
+  "type": "turn.begin",
+  "stream_id": "018f3c0d-2ad7-7b31-8d5e-4b6999351d22",
+  "barge_in": true,
+  "preroll_ms": 2000,
+  "interrupted": {
+    "response_id": "response_abc",
+    "item_id": "item_abc",
+    "audio_end_ms": 875
+  }
 }
 ```
 
-Stop local playback before sending the command. `audio_end_ms` is the duration
-of the current response actually rendered from decoded frames, reset for every
-response; it is not wall-clock or RTP-receive time. Hermes cancels the exact
-provider response if generation is active. It clears an active WebRTC output
-buffer so queued RTP stops and OpenAI truncates at its synchronized playback
-cursor; after provider drain it uses the client's `audio_end_ms` to truncate
-the remaining device-playout tail. The command remains valid after provider
-generation finishes while local audio is still playing. Continue local capture
-through end-of-speech and upload the replacement utterance to `preroll_url`.
-That upload is accepted while the interrupted response or a started tool is
-settling.
+`audio_end_ms` is the playout cursor frozen when the app silenced the assistant:
+decoded audio actually rendered to the speaker, not received or buffered audio.
+Hermes targets the supplied response and item, clamps the cursor to audio it
+received from the provider, and never infers a target from a newer overlapping
+response. A stale, finalized, or unknown target skips truncation without
+rejecting the new turn. The existing `response.interrupt` control command
+remains available for a stop button that is not followed by new speech.
 
 For a normal completion, `response.generated` means OpenAI finished generation
 and `response.output_drained` means its WebRTC output buffer drained. After the
@@ -512,10 +515,10 @@ For zero idle provider cost, drain local playout, send
 `response.playback_completed`, wait for `turn.completed`, then
 `POST /v1/realtime/sessions/{id}/suspend` and close the peer connection. The
 endpoint returns `204` and preserves SessionDB history, memory, and the logical
-`session_id`. At the next wake, create a new peer connection, call `/renew`,
-and upload the new complete utterance. During barge-in, interrupt and reuse the
-current call first; using `/renew` as cancellation adds latency and does not
-replace precise interruption.
+`session_id`. At the next wake, create a new peer connection, call `/renew`, and open a new
+audio uplink with a fresh stream UUID. During barge-in, reuse the current call;
+using `/renew` as cancellation adds latency and does not replace precise
+interruption.
 
 The provider call rotates before its age or input-context limit. When the
 control socket emits `session.rotation_required`, create a fresh peer
@@ -817,9 +820,9 @@ The API server gives full access to hermes-agent's toolset, **including terminal
 
 For Realtime voice, use HTTPS/WSS outside a trusted loopback or private
 network. The Android client receives only the Hermes bearer credential, never
-the OpenAI key. Raw audio flows over the negotiated WebRTC connection and is
-not persisted by Hermes by default; finalized transcripts, function calls, and
-tool results are durable session history.
+the OpenAI key. User PCM crosses Hermes only through the authenticated audio
+uplink and is not persisted by default; model audio returns over WebRTC.
+Finalized transcripts, function calls, and tool results are durable history.
 :::
 
 ## Configuration
@@ -869,13 +872,15 @@ Realtime behavior belongs in the top-level `realtime_voice` section of
 | `turn_detection.silence_duration_ms` | `500` | Silence required to commit a turn |
 | `intermediate_speech.enabled` | `true` | Allow brief out-of-band spoken status during a long tool wait |
 | `intermediate_speech.delay_seconds` | `2.5` | Delay before eligible status speech |
-| `preroll.enabled` | `true` | Accept a complete wake-word startup utterance through the authenticated sideband bridge |
-| `preroll.max_seconds` | `30` | Maximum PCM duration accepted by one pre-roll upload |
-| `preroll.timeout_seconds` | `15` | Maximum provider-acknowledgment wait for the handoff |
+| `audio_uplink.enabled` | `true` | Accept streamed wake-word and live microphone PCM over WebSocket |
+| `audio_uplink.max_seconds` | `30` | Maximum PCM duration accepted by one streamed turn |
+| `audio_uplink.idle_timeout_seconds` | `5` | Tear down an uplink that stops sending frames |
+| `audio_uplink.append_chunk_milliseconds` | `80` | Maximum PCM duration in each provider append event; smaller client frames are not buffered |
 | `limits.max_active_sessions` | `4` | Concurrent logical Realtime sessions per profile |
 | `limits.provider_call_max_seconds` | `3300` | Proactive provider-call rotation age |
 | `limits.provider_call_max_input_tokens` | `24000` | Proactive input-context rotation threshold |
 | `transport.reconnect_grace_seconds` | `30` | Sideband reconnect window before renewal is required |
+| `transport.transcription_timeout_seconds` | `5` | Maximum asynchronous transcript wait; timeout never delays response audio |
 | `transport.call_url` | `https://api.openai.com/v1/realtime/calls` | Exact HTTPS endpoint for WebRTC call creation |
 | `transport.sideband_url` | `wss://api.openai.com/v1/realtime` | Exact WSS endpoint for call-ID sideband attachment |
 | `limits.approval_timeout_seconds` | `600` | Structured approval/clarification wait limit |
@@ -895,17 +900,17 @@ realtime_voice:
   model: gpt-realtime-2.1
   voice: marin
   transport:
-    call_url: https://proxy.example/v1/realtime/calls
-    sideband_url: wss://proxy.example/v1/realtime
+    call_url: https://proxy.example/v1/realtime/stock/calls
+    sideband_url: wss://proxy.example/v1/realtime/stock
 ```
 
 `call_url` must accept OpenAI's multipart `sdp` and `session` fields and return
 the raw SDP answer with a `Location` call identifier. `sideband_url` must attach
 to that same call through a `call_id` query parameter and relay Realtime events
-without rewriting them, including `session.update`,
-`input_audio_buffer.clear`, `input_audio_buffer.append`, and
-`input_audio_buffer.commit`. Existing query parameters are preserved when
-Hermes adds `call_id`.
+without replacing Hermes' individual tool catalogue. The internal proxy's
+`/v1/realtime/stock` route preserves tools and parallel tool-call behavior; do
+not use its aggregate `/v1/realtime` route. Existing query parameters are
+preserved when Hermes adds `call_id`.
 
 Hermes sends `OPENAI_API_KEY` as a bearer credential to both configured
 endpoints. Only configure trusted HTTPS/WSS services, and keep credentials out

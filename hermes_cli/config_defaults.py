@@ -1501,8 +1501,8 @@ DEFAULT_CONFIG = {
     },
 
     # Native speech-to-speech sessions served by the authenticated API server.
-    # Android/WebRTC media goes directly to OpenAI; Hermes keeps the standard
-    # OPENAI_API_KEY server-side and controls the call through a sideband socket.
+    # Android receives model audio over WebRTC and streams microphone PCM through
+    # Hermes; the standard OPENAI_API_KEY stays server-side on the sideband call.
     "realtime_voice": {
         "enabled": False,
         "model": "gpt-realtime",
@@ -1518,12 +1518,12 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "delay_seconds": 2.5,
         },
-        # Lets a wake-word client submit one complete first utterance captured
-        # locally while its WebRTC call was being negotiated.
-        "preroll": {
+        # Streams a wake-word pre-roll burst followed by live microphone PCM.
+        "audio_uplink": {
             "enabled": True,
             "max_seconds": 30,
-            "timeout_seconds": 15,
+            "idle_timeout_seconds": 5,
+            "append_chunk_milliseconds": 80,
         },
         "limits": {
             "max_active_sessions": 4,
