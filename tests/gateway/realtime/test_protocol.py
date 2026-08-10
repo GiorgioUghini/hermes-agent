@@ -191,14 +191,14 @@ def test_config_accepts_secure_openai_compatible_proxy_endpoints():
     config = RealtimeVoiceConfig.from_config({
         "realtime_voice": {
             "transport": {
-                "call_url": "https://proxy.example/v1/realtime/stock/calls",
-                "sideband_url": "wss://proxy.example/v1/realtime/stock",
+                "call_url": "https://proxy.example/v1/realtime/calls",
+                "sideband_url": "wss://proxy.example/v1/realtime",
             }
         }
     })
 
-    assert config.call_url == ("https://proxy.example/v1/realtime/stock/calls")
-    assert config.sideband_url == ("wss://proxy.example/v1/realtime/stock")
+    assert config.call_url == ("https://proxy.example/v1/realtime/calls")
+    assert config.sideband_url == ("wss://proxy.example/v1/realtime")
 
 
 @pytest.mark.parametrize(

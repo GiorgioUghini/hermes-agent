@@ -900,17 +900,16 @@ realtime_voice:
   model: gpt-realtime-2.1
   voice: marin
   transport:
-    call_url: https://proxy.example/v1/realtime/stock/calls
-    sideband_url: wss://proxy.example/v1/realtime/stock
+    call_url: https://proxy.example/v1/realtime/calls
+    sideband_url: wss://proxy.example/v1/realtime
 ```
 
 `call_url` must accept OpenAI's multipart `sdp` and `session` fields and return
 the raw SDP answer with a `Location` call identifier. `sideband_url` must attach
 to that same call through a `call_id` query parameter and relay Realtime events
-without replacing Hermes' individual tool catalogue. The internal proxy's
-`/v1/realtime/stock` route preserves tools and parallel tool-call behavior; do
-not use its aggregate `/v1/realtime` route. Existing query parameters are
-preserved when Hermes adds `call_id`.
+without replacing Hermes' individual tool catalogue. For proxies that reserve
+all sideband query parameters, configure a query-free `sideband_url`; Hermes
+then sends exactly `?call_id=<provider-call-id>`.
 
 Hermes sends `OPENAI_API_KEY` as a bearer credential to both configured
 endpoints. Only configure trusted HTTPS/WSS services, and keep credentials out

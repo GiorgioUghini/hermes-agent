@@ -178,6 +178,32 @@ async def test_sideband_serializes_events_and_reconnects_same_call():
 
 
 @pytest.mark.asyncio
+async def test_sideband_query_free_proxy_sends_only_call_id():
+    connects = []
+
+    async def connect(url, **kwargs):
+        connects.append((url, kwargs))
+        return _FakeSocket()
+
+    sideband = OpenAIRealtimeSideband(
+        "proxy-key",
+        "call_123",
+        lambda _event: None,
+        websocket_url=(
+            "wss://gu-aoai-pxy-app.azurewebsites.net/v1/realtime"
+        ),
+        connect_fn=connect,
+    )
+    await sideband.connect()
+    await sideband.close()
+
+    assert connects[0][0] == (
+        "wss://gu-aoai-pxy-app.azurewebsites.net/v1/realtime"
+        "?call_id=call_123"
+    )
+
+
+@pytest.mark.asyncio
 async def test_sideband_preserves_proxy_query_and_replaces_stale_call_id():
     connects = []
 
