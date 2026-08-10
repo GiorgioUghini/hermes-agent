@@ -5674,6 +5674,79 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         )
 
+    def update_realtime_user_transcript(
+        self,
+        session_id: str,
+        *,
+        provider_item_id: str,
+        content: str,
+        api_content: Optional[str],
+        provider_item_ids: List[str],
+        transcript_available: bool,
+    ) -> bool:
+        """Replace a pending Realtime user transcript after response dispatch."""
+
+        if not session_id or not provider_item_id:
+            return False
+
+        def _do(conn):
+            rows = conn.execute(
+                """SELECT id, display_metadata
+                   FROM messages
+                   WHERE session_id = ? AND role = 'user' AND active = 1
+                     AND display_kind = 'realtime_voice'
+                   ORDER BY id DESC LIMIT 16""",
+                (session_id,),
+            ).fetchall()
+            target = None
+            metadata: Dict[str, Any] = {}
+            for row in rows:
+                candidate = self._decode_display_metadata(
+                    row["display_metadata"]
+                ) or {}
+                candidate_ids = candidate.get("provider_item_ids")
+                if (
+                    candidate.get("provider_item_id") == provider_item_id
+                    or (
+                        isinstance(candidate_ids, list)
+                        and provider_item_id in candidate_ids
+                    )
+                ):
+                    target = row["id"]
+                    metadata = candidate
+                    break
+            if target is None:
+                return False
+
+            metadata.update({
+                "provider_item_id": provider_item_id,
+                "provider_item_ids": list(provider_item_ids),
+                "transcript_available": bool(transcript_available),
+            })
+            cursor = conn.execute(
+                """UPDATE messages
+                   SET content = ?, api_content = ?, display_metadata = ?
+                   WHERE id = ?""",
+                (
+                    self._encode_content(content),
+                    (
+                        _scrub_surrogates(api_content)
+                        if isinstance(api_content, str)
+                        else None
+                    ),
+                    self._encode_display_metadata(metadata),
+                    target,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        return bool(
+            self._execute_write(
+                _do,
+                patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            )
+        )
+
     def save_realtime_session_state(
         self,
         session_id: str,

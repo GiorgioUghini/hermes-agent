@@ -3,7 +3,7 @@ import base64
 import json
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -47,391 +47,1126 @@ class _FakeSideband:
         self._stop.set()
 
 
-class _ResponsivePrerollSideband(_FakeSideband):
+class _FailingSideband(_FakeSideband):
+    async def send(self, event):
+        self.sent.append(event)
+        raise OpenAIRealtimeError("provider send failed", code="send_failed")
+
+
+class _CommitDuringAppendSideband(_FakeSideband):
+    def __init__(self):
+        super().__init__()
+        self.handler = None
+        self.append_count = 0
+
+    async def send(self, event):
+        await super().send(event)
+        if event["type"] != "input_audio_buffer.append":
+            return
+        self.append_count += 1
+        if self.append_count == 1 and self.handler is not None:
+            await self.handler({
+                "type": "input_audio_buffer.committed",
+                "item_id": "input_early",
+            })
+            await self.handler({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "input_early",
+                "transcript": "early",
+            })
+
+
+class _AckFallbackCommitSideband(_FakeSideband):
     def __init__(self):
         super().__init__()
         self.handler = None
 
     async def send(self, event):
         await super().send(event)
-        if self.handler is None:
-            return
-        if event["type"] == "session.update":
-            await self.handler({"type": "session.updated", "session": event["session"]})
-        elif event["type"] == "input_audio_buffer.clear":
-            await self.handler({"type": "input_audio_buffer.cleared"})
-        elif event["type"] == "input_audio_buffer.commit":
+        if (
+            event["type"] == "input_audio_buffer.commit"
+            and self.handler is not None
+        ):
             await self.handler({
                 "type": "input_audio_buffer.committed",
-                "item_id": "input_preroll",
+                "item_id": "input_fallback",
             })
 
 
-class _DeferredRestoreAckSideband(_ResponsivePrerollSideband):
+class _CommitThenFailAppendSideband(_FakeSideband):
     def __init__(self):
         super().__init__()
-        self.update_count = 0
-        self.restore_sent = asyncio.Event()
-        self.restore_event = None
+        self.handler = None
+        self.append_count = 0
 
     async def send(self, event):
-        if event["type"] == "session.update":
-            self.update_count += 1
-            if self.update_count == 2:
-                await _FakeSideband.send(self, event)
-                self.restore_event = event
-                self.restore_sent.set()
-                return
         await super().send(event)
+        if event["type"] != "input_audio_buffer.append":
+            return
+        self.append_count += 1
+        if self.append_count == 2 and self.handler is not None:
+            await self.handler({
+                "type": "input_audio_buffer.committed",
+                "item_id": "input_partial",
+            })
+            await self.handler({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "input_partial",
+                "transcript": "partial",
+            })
+            raise OpenAIRealtimeError("append failed", code="append_failed")
 
 
-class _FailingCommitPrerollSideband(_ResponsivePrerollSideband):
-    async def send(self, event):
-        if event["type"] == "input_audio_buffer.commit":
-            await _FakeSideband.send(self, event)
-            raise OpenAIRealtimeError(
-                "provider commit failed",
-                code="commit_failed",
-                status=502,
-            )
-        await super().send(event)
+STREAM_ID = "11111111-1111-4111-8111-111111111111"
 
 
-class _FailingInitialClearSideband(_ResponsivePrerollSideband):
-    def __init__(self):
-        super().__init__()
-        self.clear_count = 0
-
-    async def send(self, event):
-        if event["type"] == "input_audio_buffer.clear":
-            self.clear_count += 1
-            if self.clear_count == 1:
-                await _FakeSideband.send(self, event)
-                raise OpenAIRealtimeError(
-                    "initial clear failed",
-                    code="clear_failed",
-                    status=502,
-                )
-        await super().send(event)
-
-
-class _StalledPrerollSideband(_FakeSideband):
-    async def send(self, event):
-        self.sent.append(event)
-        await asyncio.Event().wait()
-
-
-class _RecordingRealtimeStateDB:
-    def __init__(self):
-        self.states = []
-
-    def save_realtime_session_state(self, _session_id, **values):
-        self.states.append(values["state"])
+def _begin_command(stream_id=STREAM_ID, *, preroll_ms=0):
+    return {
+        "type": "turn.begin",
+        "stream_id": stream_id,
+        "barge_in": False,
+        "preroll_ms": preroll_ms,
+        "interrupted": None,
+    }
 
 
 @pytest.mark.asyncio
-async def test_preroll_commits_complete_utterance_once_and_restores_vad():
-    sideband = _ResponsivePrerollSideband()
+async def test_audio_uplink_forwards_burst_without_vad_updates_or_manual_commit():
+    sideband = _FakeSideband()
     session = RealtimeVoiceSession(
-        session_id="preroll",
+        session_id="uplink",
         agent=SimpleNamespace(tools=[], _session_db=None),
         config=RealtimeVoiceConfig(
             enabled=True,
             intermediate_speech_enabled=False,
             provider_call_max_seconds=3600,
+            audio_uplink_append_chunk_milliseconds=80,
         ),
         frozen_instructions="prompt",
         conversation_history=[],
         sideband=sideband,
-        call_id="call_preroll",
+        call_id="call_uplink",
     )
-    sideband.handler = session.handle_provider_event
     session.state = "ready"
-    audio = b"\x01\x00" * 7200
+    audio = b"\x01\x00" * 48_000
 
     try:
-        first = await session.ingest_preroll_audio(
-            audio,
-            idempotency_key="wake:1",
-        )
-        repeated = await session.ingest_preroll_audio(
-            audio,
-            idempotency_key="wake:1",
-        )
+        await session.begin_audio_uplink(_begin_command())
+        await session.append_audio_uplink(STREAM_ID, audio)
+        result = await session.end_audio_uplink(STREAM_ID)
 
-        assert first == repeated
-        assert first["status"] == "committed"
-        assert first["item_id"] == "input_preroll"
-        assert first["duration_ms"] == 300
-        assert [event["type"] for event in sideband.sent].count(
-            "input_audio_buffer.commit"
-        ) == 1
         appended = b"".join(
             base64.b64decode(event["audio"])
             for event in sideband.sent
             if event["type"] == "input_audio_buffer.append"
         )
         assert appended == audio
-        updates = [
-            event for event in sideband.sent if event["type"] == "session.update"
-        ]
-        assert updates[0]["session"]["audio"]["input"]["turn_detection"] is None
-        assert (
-            updates[-1]["session"]["audio"]["input"]["turn_detection"]
-            == session.config.turn_detection_config()
+        assert result["status"] == "ending"
+        assert len(sideband.sent) == 25
+        assert not any(
+            event["type"]
+            in {
+                "session.update",
+                "input_audio_buffer.clear",
+                "input_audio_buffer.commit",
+            }
+            for event in sideband.sent
         )
         assert session.can_renew is False
-
-        with pytest.raises(RealtimeProtocolError) as conflict:
-            await session.ingest_preroll_audio(
-                b"\x02\x00" * 7200,
-                idempotency_key="wake:1",
-            )
-        assert conflict.value.code == "preroll_idempotency_conflict"
     finally:
         await session.close(reason="test_complete", end_session=False)
 
 
 @pytest.mark.asyncio
-async def test_preroll_ignores_stale_vad_acknowledgment():
-    sideband = _DeferredRestoreAckSideband()
-    session = RealtimeVoiceSession(
-        session_id="preroll-stale-ack",
-        agent=SimpleNamespace(tools=[], _session_db=None),
-        config=RealtimeVoiceConfig(
-            enabled=True,
-            intermediate_speech_enabled=False,
-            provider_call_max_seconds=3600,
-        ),
-        frozen_instructions="prompt",
-        conversation_history=[],
-        sideband=sideband,
-        call_id="call_preroll_stale_ack",
-    )
-    sideband.handler = session.handle_provider_event
-    session.state = "ready"
-    upload = asyncio.create_task(
-        session.ingest_preroll_audio(
-            b"\x01\x00" * 7200,
-            idempotency_key="wake:stale-ack",
-        )
-    )
-    try:
-        await asyncio.wait_for(sideband.restore_sent.wait(), timeout=1)
-        await session.handle_provider_event({
-            "type": "session.updated",
-            "session": {"audio": {"input": {"turn_detection": None}}},
-        })
-        await asyncio.sleep(0)
-        assert upload.done() is False
-
-        await session.handle_provider_event({
-            "type": "session.updated",
-            "session": sideband.restore_event["session"],
-        })
-        result = await upload
-        assert result["status"] == "committed"
-    finally:
-        if not upload.done():
-            upload.cancel()
-        await session.close(reason="test_complete", end_session=False)
-
-
-@pytest.mark.asyncio
-async def test_preroll_failure_clears_audio_and_requires_sticky_renewal():
-    sideband = _FailingCommitPrerollSideband()
-    db = _RecordingRealtimeStateDB()
-    session = RealtimeVoiceSession(
-        session_id="preroll-cleanup",
-        agent=SimpleNamespace(tools=[], _session_db=db),
-        config=RealtimeVoiceConfig(
-            enabled=True,
-            intermediate_speech_enabled=False,
-            provider_call_max_seconds=3600,
-        ),
-        frozen_instructions="prompt",
-        conversation_history=[],
-        sideband=sideband,
-        call_id="call_preroll_cleanup",
-    )
-    sideband.handler = session.handle_provider_event
-    session.state = "ready"
-    audio = b"\x01\x00" * 7200
-
-    with pytest.raises(OpenAIRealtimeError, match="provider commit failed"):
-        await session.ingest_preroll_audio(
-            audio,
-            idempotency_key="wake:cleanup",
-        )
-    await asyncio.sleep(0)
-
-    event_types = [event["type"] for event in sideband.sent]
-    commit_index = event_types.index("input_audio_buffer.commit")
-    cleanup_clear_index = event_types.index(
-        "input_audio_buffer.clear",
-        commit_index + 1,
-    )
-    restore_index = event_types.index("session.update", cleanup_clear_index + 1)
-    assert commit_index < cleanup_clear_index < restore_index
-    assert session._renewal_required is True
-    assert session.state == "degraded"
-    assert session.can_renew is True
-    assert db.states[-1] == "renewal_required"
-
-    record = session._preroll_requests["wake:cleanup"]
-    assert record.task is None
-    assert record.failure is not None
-    sent_count = len(sideband.sent)
-    with pytest.raises(OpenAIRealtimeError, match="provider commit failed"):
-        await session.ingest_preroll_audio(
-            audio,
-            idempotency_key="wake:cleanup",
-        )
-    assert len(sideband.sent) == sent_count
-
-    await session._persist_runtime_state("ready")
-    assert db.states[-1] == "renewal_required"
-    await session.close(reason="test_complete", end_session=False)
-    assert db.states[-1] == "renewal_required"
-
-
-@pytest.mark.asyncio
-async def test_preroll_initial_clear_failure_retries_clear_before_vad_restore():
-    sideband = _FailingInitialClearSideband()
-    session = RealtimeVoiceSession(
-        session_id="preroll-initial-clear",
-        agent=SimpleNamespace(tools=[], _session_db=None),
-        config=RealtimeVoiceConfig(
-            enabled=True,
-            intermediate_speech_enabled=False,
-            provider_call_max_seconds=3600,
-        ),
-        frozen_instructions="prompt",
-        conversation_history=[],
-        sideband=sideband,
-        call_id="call_preroll_initial_clear",
-    )
-    sideband.handler = session.handle_provider_event
-    session.state = "ready"
-
-    with pytest.raises(OpenAIRealtimeError, match="initial clear failed"):
-        await session.ingest_preroll_audio(
-            b"\x01\x00" * 7200,
-            idempotency_key="wake:initial-clear",
-        )
-
-    event_types = [event["type"] for event in sideband.sent]
-    first_clear = event_types.index("input_audio_buffer.clear")
-    cleanup_clear = event_types.index("input_audio_buffer.clear", first_clear + 1)
-    restore = event_types.index("session.update", cleanup_clear + 1)
-    assert first_clear < cleanup_clear < restore
-    assert session._renewal_required is True
-    await session.close(reason="test_complete", end_session=False)
-
-
-@pytest.mark.asyncio
-async def test_preroll_stalled_send_honors_operation_timeout():
-    sideband = _StalledPrerollSideband()
-    session = RealtimeVoiceSession(
-        session_id="preroll-send-timeout",
-        agent=SimpleNamespace(tools=[], _session_db=None),
-        config=RealtimeVoiceConfig(
-            enabled=True,
-            intermediate_speech_enabled=False,
-            provider_call_max_seconds=3600,
-            preroll_timeout_seconds=0.05,
-        ),
-        frozen_instructions="prompt",
-        conversation_history=[],
-        sideband=sideband,
-        call_id="call_preroll_send_timeout",
-    )
-    session.state = "ready"
-
-    with pytest.raises(RealtimeProtocolError) as timeout:
-        await session.ingest_preroll_audio(
-            b"\x01\x00" * 7200,
-            idempotency_key="wake:send-timeout",
-        )
-    assert timeout.value.code == "preroll_provider_timeout"
-    assert session._preroll_active is False
-    assert session._renewal_required is True
-    assert session.can_renew is True
-    await session.close(reason="test_complete", end_session=False)
-
-
-@pytest.mark.asyncio
-async def test_preroll_blocks_rotation_and_parallel_upload_until_teardown():
+async def test_audio_uplink_dispatches_before_turn_end_and_transcription():
     sideband = _FakeSideband()
-    db = _RecordingRealtimeStateDB()
     session = RealtimeVoiceSession(
-        session_id="preroll-blocked",
-        agent=SimpleNamespace(tools=[], _session_db=db),
-        config=RealtimeVoiceConfig(
-            enabled=True,
-            intermediate_speech_enabled=False,
-            provider_call_max_seconds=3600,
-        ),
+        session_id="uplink-vad",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
         frozen_instructions="prompt",
         conversation_history=[],
         sideband=sideband,
-        call_id="call_preroll_blocked",
+        call_id="call_uplink_vad",
     )
     session.state = "ready"
-    upload = asyncio.create_task(
-        session.ingest_preroll_audio(
-            b"\x01\x00" * 7200,
-            idempotency_key="wake:blocked",
-        )
-    )
-    await _wait_until(lambda: session._preroll_active)
+    session._handle_input = AsyncMock()
+
     try:
-        assert session.can_renew is False
-        assert session.idle_timeout_eligible is False
-        with pytest.raises(RealtimeProtocolError) as concurrent:
-            await session.ingest_preroll_audio(
-                b"\x01\x00" * 7200,
-                idempotency_key="wake:other",
-            )
-        assert concurrent.value.code == "preroll_in_progress"
+        await session.begin_audio_uplink(_begin_command())
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 7200)
+        await session.handle_provider_event(
+            {"type": "input_audio_buffer.speech_started"}
+        )
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_1",
+        })
+        session._handle_input.assert_awaited_once_with(
+            "[Voice transcript pending; use the committed audio input.]",
+            "input_1",
+        )
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "latest news",
+        })
+        assert session._handle_input.await_count == 1
+
+        result = await session.end_audio_uplink(STREAM_ID)
+
+        assert result["status"] == "committed"
+        assert session._audio_uplink is None
     finally:
         await session.close(reason="test_complete", end_session=False)
-    with pytest.raises(asyncio.CancelledError):
-        await upload
-    assert db.states[-1] == "renewal_required"
 
 
 @pytest.mark.asyncio
-async def test_active_provider_input_blocks_suspend_and_renew():
+async def test_audio_uplink_turn_end_authorizes_commit_before_declared_burst():
     session = RealtimeVoiceSession(
-        session_id="active-input",
+        session_id="uplink-short-burst",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_uplink_short_burst",
+    )
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+
+    try:
+        await session.begin_audio_uplink(_begin_command(preroll_ms=2000))
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 4800)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_short",
+        })
+        session._handle_input.assert_not_awaited()
+
+        result = await session.end_audio_uplink(STREAM_ID)
+
+        assert result["status"] == "committed"
+        assert session._audio_uplink is None
+        session._handle_input.assert_awaited_once_with(
+            "[Voice transcript pending; use the committed audio input.]",
+            "input_short",
+        )
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_combines_vad_commits_inside_the_burst():
+    session = RealtimeVoiceSession(
+        session_id="uplink-multiple-commits",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_uplink_multiple",
+    )
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+
+    try:
+        await session.begin_audio_uplink(_begin_command(preroll_ms=200))
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 1920)
+        await session.handle_provider_event(
+            {"type": "input_audio_buffer.speech_started"}
+        )
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 80,
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_1",
+        })
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_1",
+            "transcript": "tell me the",
+        })
+        session._handle_input.assert_not_awaited()
+
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 2880)
+        await session.handle_provider_event(
+            {"type": "input_audio_buffer.speech_started"}
+        )
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 200,
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_2",
+        })
+        session._handle_input.assert_awaited_once_with(
+            (
+                "tell me the\n"
+                "[Voice transcript pending; use the committed audio input.]"
+            ),
+            "input_2",
+        )
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_2",
+            "transcript": "latest news",
+        })
+        await session.end_audio_uplink(STREAM_ID)
+        assert session._handle_input.await_count == 1
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_commit_during_append_keeps_later_chunks_pending():
+    sideband = _CommitDuringAppendSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-commit-race",
         agent=SimpleNamespace(tools=[], _session_db=None),
         config=RealtimeVoiceConfig(
             enabled=True,
             provider_call_max_seconds=3600,
-            transcription_timeout_seconds=30,
+            audio_uplink_append_chunk_milliseconds=80,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_commit_race",
+    )
+    sideband.handler = session.handle_provider_event
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+
+    try:
+        await session.begin_audio_uplink(_begin_command())
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 3840)
+        result = await session.end_audio_uplink(STREAM_ID)
+
+        assert result["status"] == "ending"
+        assert session._audio_uplink is not None
+        assert session._audio_uplink.uncommitted_bytes > 0
+        session._handle_input.assert_not_awaited()
+
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 160,
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_tail",
+        })
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_tail",
+            "transcript": "tail",
+        })
+
+        session._handle_input.assert_awaited_once_with(
+            (
+                "early\n"
+                "[Voice transcript pending; use the committed audio input.]"
+            ),
+            "input_tail",
+        )
+        assert session._audio_uplink is None
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_commit_during_final_send_dispatches_without_end():
+    sideband = _CommitDuringAppendSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-final-send-commit",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            provider_call_max_seconds=3600,
+            audio_uplink_append_chunk_milliseconds=80,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_final_send_commit",
+    )
+    sideband.handler = session.handle_provider_event
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+
+    try:
+        await session.begin_audio_uplink(_begin_command(preroll_ms=80))
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 1920)
+
+        session._handle_input.assert_awaited_once_with("early", "input_early")
+        assert session._audio_uplink is not None
+        assert session._audio_uplink.state == "dispatched"
+        assert session._audio_uplink.uncommitted_bytes == 0
+    finally:
+        await session.end_audio_uplink(STREAM_ID)
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_append_failure_quarantines_partial_provider_input():
+    sideband = _CommitThenFailAppendSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-append-failure",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            provider_call_max_seconds=3600,
+            audio_uplink_append_chunk_milliseconds=80,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_append_failure",
+    )
+    sideband.handler = session.handle_provider_event
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+
+    with pytest.raises(OpenAIRealtimeError, match="append failed"):
+        await session.begin_audio_uplink(_begin_command())
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 3840)
+
+    session._handle_input.assert_not_awaited()
+    assert session._renewal_required is True
+    assert session._quarantine_provider_input is True
+
+    await session.handle_provider_event({
+        "type": "input_audio_buffer.committed",
+        "item_id": "input_late",
+    })
+    await session.handle_provider_event({
+        "type": "conversation.item.input_audio_transcription.completed",
+        "item_id": "input_late",
+        "transcript": "must be ignored",
+    })
+    session._handle_input.assert_not_awaited()
+    await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_async_append_error_quarantines_late_commit():
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-async-append-error",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_async_append_error",
+    )
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+
+    await session.begin_audio_uplink(_begin_command())
+    await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 4800)
+    append_event = next(
+        event
+        for event in sideband.sent
+        if event["type"] == "input_audio_buffer.append"
+    )
+    await session.handle_provider_event({
+        "type": "error",
+        "error": {
+            "event_id": append_event["event_id"],
+            "code": "invalid_audio",
+            "message": "append rejected",
+        },
+    })
+
+    assert session._renewal_required is True
+    assert session._quarantine_provider_input is True
+    assert session._audio_uplink is None
+
+    await session.handle_provider_event({
+        "type": "input_audio_buffer.committed",
+        "item_id": "input_rejected",
+    })
+    await session.handle_provider_event({
+        "type": "conversation.item.input_audio_transcription.completed",
+        "item_id": "input_rejected",
+        "transcript": "must be ignored",
+    })
+    session._handle_input.assert_not_awaited()
+    await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_late_old_append_error_fails_current_audio_uplink():
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-old-append-error",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_old_append_error",
+    )
+    session.state = "ready"
+
+    first_stream = STREAM_ID
+    second_stream = "22222222-2222-4222-8222-222222222222"
+    await session.begin_audio_uplink(_begin_command(first_stream))
+    await session.append_audio_uplink(first_stream, b"\x01\x00" * 4800)
+    old_append = next(
+        event
+        for event in sideband.sent
+        if event["type"] == "input_audio_buffer.append"
+    )
+    old_uplink = session._audio_uplink
+    old_uplink.state = "committed"
+    session._audio_uplink = None
+
+    await session.begin_audio_uplink(_begin_command(second_stream))
+    current_uplink = session._audio_uplink
+    await session.handle_provider_event({
+        "type": "error",
+        "error": {
+            "event_id": old_append["event_id"],
+            "code": "invalid_audio",
+            "message": "old append rejected",
+        },
+    })
+
+    assert old_uplink.state == "failed"
+    assert current_uplink.state == "failed"
+    assert session._audio_uplink is None
+    assert session._quarantine_provider_input is True
+    with pytest.raises(RealtimeProtocolError) as quarantined:
+        await session.append_audio_uplink(
+            second_stream,
+            b"\x01\x00" * 2400,
+        )
+    assert quarantined.value.code == "session_renewal_required"
+    await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_uses_provider_timeline_baseline_for_vad_boundary():
+    session = RealtimeVoiceSession(
+        session_id="uplink-provider-timeline",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            provider_call_max_seconds=3600,
+            audio_uplink_append_chunk_milliseconds=80,
         ),
         frozen_instructions="prompt",
         conversation_history=[],
         sideband=_FakeSideband(),
-        call_id="call_active_input",
+        call_id="call_uplink_provider_timeline",
+    )
+    session.state = "ready"
+    session._provider_input_audio_bytes_sent = 10_000 * 48
+    session._provider_input_timeline_known = True
+    session._handle_input = AsyncMock()
+
+    try:
+        await session.begin_audio_uplink(_begin_command())
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 5760)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 10_160,
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_boundary",
+        })
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_boundary",
+            "transcript": "first segment",
+        })
+        result = await session.end_audio_uplink(STREAM_ID)
+
+        assert result["status"] == "ending"
+        assert session._audio_uplink is not None
+        assert session._audio_uplink.uncommitted_bytes == 80 * 48
+        session._handle_input.assert_not_awaited()
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_recovered_call_requires_renewal_for_timeline():
+    session = RealtimeVoiceSession(
+        session_id="uplink-recovered-timeline",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_uplink_recovered_timeline",
+        call_started_at=1,
     )
     session.state = "ready"
 
-    await session.handle_provider_event({"type": "input_audio_buffer.speech_started"})
+    with pytest.raises(RealtimeProtocolError) as renewal:
+        await session.begin_audio_uplink(_begin_command())
+
+    assert renewal.value.code == "session_renewal_required"
+    assert session._renewal_required is True
+    assert session.state == "degraded"
+    await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_rejects_concurrent_socket_attachment():
+    session = RealtimeVoiceSession(
+        session_id="uplink-reattach",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_uplink_reattach",
+    )
+    session.state = "ready"
+
+    try:
+        await session.begin_audio_uplink(_begin_command(), owner_id="old")
+        with pytest.raises(RealtimeProtocolError) as duplicate:
+            await session.begin_audio_uplink(
+                _begin_command(),
+                owner_id="new",
+            )
+        assert duplicate.value.code == "audio_stream_already_attached"
+        assert session._audio_uplink is not None
+        assert session._audio_uplink.owner_id == "old"
+
+        with pytest.raises(RealtimeProtocolError) as wrong_owner:
+            await session.append_audio_uplink(
+                STREAM_ID,
+                b"\x01\x00" * 2400,
+                owner_id="new",
+            )
+        assert wrong_owner.value.code == "audio_stream_not_owner"
+
+        await session.append_audio_uplink(
+            STREAM_ID,
+            b"\x01\x00" * 2400,
+            owner_id="old",
+        )
+        await session.end_audio_uplink(STREAM_ID, owner_id="old")
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_disconnect_commits_long_audio_and_discards_short_audio():
+    long_sideband = _FakeSideband()
+    long_session = RealtimeVoiceSession(
+        session_id="uplink-long-disconnect",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=long_sideband,
+        call_id="call_uplink_long",
+    )
+    long_session.state = "ready"
+    await long_session.begin_audio_uplink(_begin_command())
+    await long_session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 4800)
+    await long_session.teardown_audio_uplink(
+        STREAM_ID,
+        reason="audio_uplink_disconnected",
+    )
+    assert long_sideband.sent[-1]["type"] == "input_audio_buffer.commit"
+    await long_session.close(reason="test_complete", end_session=False)
+
+    short_sideband = _FakeSideband()
+    short_session = RealtimeVoiceSession(
+        session_id="uplink-short-disconnect",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=short_sideband,
+        call_id="call_uplink_short",
+    )
+    short_session.state = "ready"
+    await short_session.begin_audio_uplink(_begin_command())
+    await short_session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 1200)
+    result = await short_session.teardown_audio_uplink(
+        STREAM_ID,
+        reason="audio_uplink_disconnected",
+    )
+    assert short_sideband.sent[-1]["type"] == "input_audio_buffer.clear"
+    assert result["status"] == "discarded"
+    assert short_session.can_renew is True
+    await short_session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_disconnect_dispatches_audio_already_committed_by_vad():
+    session = RealtimeVoiceSession(
+        session_id="uplink-committed-disconnect",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_uplink_committed_disconnect",
+    )
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+
+    try:
+        await session.begin_audio_uplink(_begin_command())
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 4800)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_committed",
+        })
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_committed",
+            "transcript": "committed before disconnect",
+        })
+
+        result = await session.teardown_audio_uplink(
+            STREAM_ID,
+            reason="audio_uplink_disconnected",
+        )
+
+        assert result["status"] == "committed"
+        assert session._audio_uplink is None
+        session._handle_input.assert_awaited_once_with(
+            "[Voice transcript pending; use the committed audio input.]",
+            "input_committed",
+        )
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_fallback_commit_ack_cancels_commit_timeout():
+    sideband = _AckFallbackCommitSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-fallback-ack",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            provider_call_max_seconds=3600,
+            audio_uplink_idle_timeout_seconds=0.05,
+            transcription_timeout_seconds=1,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_fallback_ack",
+    )
+    sideband.handler = session.handle_provider_event
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+
+    try:
+        await session.begin_audio_uplink(_begin_command())
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 4800)
+        await session.teardown_audio_uplink(
+            STREAM_ID,
+            reason="audio_uplink_disconnected",
+        )
+        await asyncio.sleep(0.1)
+
+        assert session._renewal_required is False
+        assert session._audio_uplink is None
+        session._handle_input.assert_awaited_once_with(
+            "[Voice transcript pending; use the committed audio input.]",
+            "input_fallback",
+        )
+
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_fallback",
+            "transcript": "fallback committed",
+        })
+        assert session._audio_uplink is None
+        assert session._handle_input.await_count == 1
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_vad_commit_precedes_fallback_commit_ack():
+    session = RealtimeVoiceSession(
+        session_id="uplink-vad-before-fallback",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            provider_call_max_seconds=3600,
+            audio_uplink_idle_timeout_seconds=1,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_uplink_vad_before_fallback",
+    )
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+
+    try:
+        await session.begin_audio_uplink(_begin_command())
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 24_000)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 800,
+        })
+        await session.teardown_audio_uplink(
+            STREAM_ID,
+            reason="audio_uplink_disconnected",
+        )
+
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_vad",
+        })
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_vad",
+            "transcript": "vad segment",
+        })
+        assert session._audio_uplink is not None
+        assert session._audio_uplink.uncommitted_bytes == 200 * 48
+        assert session._audio_uplink.fallback_commit_sent is True
+        session._handle_input.assert_not_awaited()
+
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_tail",
+        })
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_tail",
+            "transcript": "tail",
+        })
+        assert session._audio_uplink is None
+        session._handle_input.assert_awaited_once_with(
+            (
+                "vad segment\n"
+                "[Voice transcript pending; use the committed audio input.]"
+            ),
+            "input_tail",
+        )
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_barge_in_targets_item_clamps_and_is_idempotent():
+    sideband = _FakeSideband()
+    agent = SimpleNamespace(
+        tools=[],
+        _session_db=None,
+        _skip_unstarted_tool_calls=False,
+    )
+    session = RealtimeVoiceSession(
+        session_id="uplink-barge-in",
+        agent=agent,
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_barge",
+    )
+    session.state = "responding"
+    session._turn = SimpleNamespace(messages=[])
+    session._active_response_id = "resp_target"
+    session._active_output_audio_response_id = "resp_target"
+    session._generation_active_response_ids.add("resp_target")
+    await session.handle_provider_event({
+        "type": "response.output_item.added",
+        "response_id": "resp_target",
+        "item": {
+            "id": "item_target",
+            "type": "message",
+            "role": "assistant",
+        },
+    })
+    await session.handle_provider_event({
+        "type": "response.output_audio.delta",
+        "response_id": "resp_target",
+        "item_id": "item_target",
+        "delta": base64.b64encode(b"\x00\x00" * 24_000).decode("ascii"),
+    })
+    command = {
+        "type": "turn.begin",
+        "stream_id": STREAM_ID,
+        "barge_in": True,
+        "preroll_ms": 0,
+        "interrupted": {
+            "response_id": "resp_target",
+            "item_id": "item_target",
+            "audio_end_ms": 1200,
+        },
+    }
+
+    try:
+        first = await session.begin_audio_uplink(command)
+        repeated = await session.begin_audio_uplink(command)
+
+        assert first == repeated
+        assert first["interruption"]["audio_end_ms"] == 1000
+        assert [event["type"] for event in sideband.sent] == [
+            "response.cancel",
+            "output_audio_buffer.clear",
+            "conversation.item.truncate",
+        ]
+        assert sideband.sent[-1]["item_id"] == "item_target"
+        assert sideband.sent[-1]["audio_end_ms"] == 1000
+
+        changed = {
+            **command,
+            "interrupted": {**command["interrupted"], "audio_end_ms": 900},
+        }
+        with pytest.raises(RealtimeProtocolError) as conflict:
+            await session.begin_audio_uplink(changed)
+        assert conflict.value.code == "audio_stream_idempotency_conflict"
+    finally:
+        session._turn = None
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_stale_barge_target_does_not_block_new_turn():
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-stale-barge",
+        agent=SimpleNamespace(
+            tools=[],
+            _session_db=None,
+            _skip_unstarted_tool_calls=False,
+        ),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_stale",
+    )
+    session.state = "responding"
+    session._turn = SimpleNamespace(messages=[])
+
+    try:
+        result = await session.begin_audio_uplink({
+            "type": "turn.begin",
+            "stream_id": STREAM_ID,
+            "barge_in": True,
+            "preroll_ms": 0,
+            "interrupted": {
+                "response_id": "resp_stale",
+                "item_id": "item_stale",
+                "audio_end_ms": 250,
+            },
+        })
+
+        assert result["status"] == "accepted"
+        assert result["interruption"]["target_status"] == "stale"
+        assert sideband.sent == []
+    finally:
+        session._turn = None
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_tool_barge_retains_transcript_for_tool_boundary():
+    sideband = _FakeSideband()
+    release = asyncio.Event()
+    tool_task = asyncio.create_task(release.wait())
+    agent = SimpleNamespace(
+        tools=[],
+        _session_db=None,
+        _skip_unstarted_tool_calls=False,
+        steer=Mock(),
+    )
+    session = RealtimeVoiceSession(
+        session_id="uplink-tool-steer",
+        agent=agent,
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_tool_steer",
+    )
+    session.state = "tool_wait"
+    session._turn = SimpleNamespace(messages=[])
+    session._tool_task = tool_task
+
+    try:
+        await session.begin_audio_uplink({
+            "type": "turn.begin",
+            "stream_id": STREAM_ID,
+            "barge_in": True,
+            "preroll_ms": 0,
+            "interrupted": {
+                "response_id": "resp_stale",
+                "item_id": "item_stale",
+                "audio_end_ms": 0,
+            },
+        })
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 4800)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_steer",
+        })
+
+        agent.steer.assert_not_called()
+        assert session._pending_next_inputs[-1][0] == (
+            "[Voice transcript pending; use the committed audio input.]"
+        )
+
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_steer",
+            "transcript": "Use the shorter answer.",
+        })
+
+        agent.steer.assert_not_called()
+        assert session._pending_next_inputs[-1] == (
+            "Use the shorter answer.",
+            "input_steer",
+        )
+    finally:
+        release.set()
+        await tool_task
+        session._tool_task = None
+        session._turn = None
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_settled_tool_barge_resumes_waiting_continuation_immediately():
+    session = RealtimeVoiceSession(
+        session_id="uplink-tool-continuation",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_uplink_tool_continuation",
+    )
+    session.state = "tool_wait"
+    session._turn = SimpleNamespace(messages=[])
+    session._continuation_pending = True
+    session._client_interrupt_pending = True
+    session._finalize_current_turn = AsyncMock()
+
+    await session.begin_audio_uplink({
+        "type": "turn.begin",
+        "stream_id": STREAM_ID,
+        "barge_in": True,
+        "preroll_ms": 0,
+        "interrupted": {
+            "response_id": "resp_stale",
+            "item_id": "item_stale",
+            "audio_end_ms": 0,
+        },
+    })
+    await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 4800)
     await session.handle_provider_event({
         "type": "input_audio_buffer.committed",
-        "item_id": "input_pending",
+        "item_id": "input_waiting",
+    })
+    await session.handle_provider_event({
+        "type": "conversation.item.input_audio_transcription.completed",
+        "item_id": "input_waiting",
+        "transcript": "Continue with this request.",
     })
 
-    assert session.can_suspend is False
-    assert session.can_renew is False
-    with pytest.raises(RealtimeProtocolError) as busy:
-        await session.ingest_preroll_audio(
-            b"\x01\x00" * 7200,
-            idempotency_key="wake:while-input-active",
-        )
-    assert busy.value.code == "session_busy"
+    assert session._continuation_pending is False
+    assert session._pending_next_inputs[-1] == (
+        "Continue with this request.",
+        "input_waiting",
+    )
+    session._finalize_current_turn.assert_awaited_once_with(
+        "[Assistant response interrupted by new speech.]",
+        response_id="",
+        interrupted=True,
+    )
+    session._turn = None
+    await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_pending_transcript_does_not_block_next_audio_uplink():
+    session = RealtimeVoiceSession(
+        session_id="uplink-pending-transcript-admission",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_uplink_pending_transcript",
+    )
+    session.state = "ready"
+    pending = asyncio.create_task(asyncio.sleep(10))
+    session._transcript_wait_tasks["previous_item"] = pending
+
+    try:
+        result = await session.begin_audio_uplink(_begin_command())
+
+        assert result["status"] == "accepted"
+        assert session.can_renew is False
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        session._transcript_wait_tasks.clear()
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_interrupt_failure_requires_renewal_and_clears_flags():
+    sideband = _FailingSideband()
+    agent = SimpleNamespace(
+        tools=[],
+        _session_db=None,
+        _skip_unstarted_tool_calls=False,
+    )
+    session = RealtimeVoiceSession(
+        session_id="uplink-failed-barge",
+        agent=agent,
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_failed_barge",
+    )
+    session.state = "responding"
+    session._turn = SimpleNamespace(messages=[])
+    session._active_response_id = "resp_target"
+    session._generation_active_response_ids.add("resp_target")
+    session._response_audio_items["resp_target"].add("item_target")
+    session._response_audio_bytes[("resp_target", "item_target")] = 48_000
+
+    with pytest.raises(OpenAIRealtimeError, match="provider send failed"):
+        await session.begin_audio_uplink({
+            "type": "turn.begin",
+            "stream_id": STREAM_ID,
+            "barge_in": True,
+            "preroll_ms": 0,
+            "interrupted": {
+                "response_id": "resp_target",
+                "item_id": "item_target",
+                "audio_end_ms": 500,
+            },
+        })
+
+    assert session._renewal_required is True
+    assert session.state == "degraded"
+    assert session._audio_uplink is None
+    assert (session.call_id, STREAM_ID) not in session._audio_uplinks
+    assert session._client_interrupt_pending is False
+    assert session._barge_in_during_response is False
+    assert agent._skip_unstarted_tool_calls is False
+    session._turn = None
     await session.close(reason="test_complete", end_session=False)
 
 
@@ -478,7 +1213,7 @@ async def test_status_interruption_with_pending_continuation_starts_handoff_time
         agent=agent,
         config=RealtimeVoiceConfig(
             enabled=True,
-            preroll_timeout_seconds=0.01,
+            audio_uplink_idle_timeout_seconds=0.01,
             transcription_timeout_seconds=0.01,
         ),
         frozen_instructions="prompt",
@@ -725,6 +1460,236 @@ async def test_duplicate_provider_response_does_not_repeat_tool_side_effect(
 
 
 @pytest.mark.asyncio
+async def test_audio_uplink_response_create_precedes_transcript_and_updates_db(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="uplink-async-transcript",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-async-transcript",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+            transcription_timeout_seconds=1,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_async_transcript",
+    )
+
+    await session.start()
+    try:
+        await session.begin_audio_uplink(_begin_command(preroll_ms=0))
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 4800)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 200,
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_async",
+        })
+
+        assert sideband.sent[-1]["type"] == "response.create"
+        user_rows = [
+            message
+            for message in db.get_messages("uplink-async-transcript")
+            if message["role"] == "user"
+        ]
+        assert user_rows[-1]["content"] == (
+            "[Voice transcript pending; use the committed audio input.]"
+        )
+
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_async",
+            "transcript": "Tell me the latest news.",
+        })
+
+        user_rows = [
+            message
+            for message in db.get_messages("uplink-async-transcript")
+            if message["role"] == "user"
+        ]
+        assert user_rows[-1]["content"] == "Tell me the latest news."
+        assert user_rows[-1]["display_metadata"]["transcript_available"] is True
+        assert (
+            session._turn.messages[session._turn.current_turn_user_idx]["content"]
+            == "Tell me the latest news."
+        )
+        assert not any(
+            event["type"] == "input_audio_buffer.commit"
+            for event in sideband.sent
+        )
+        await session.end_audio_uplink(STREAM_ID)
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_defers_host_finalization_until_transcript(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="uplink-deferred-finalization",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-deferred-finalization",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+            transcription_timeout_seconds=1,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_deferred_finalization",
+    )
+
+    await session.start()
+    try:
+        await session.begin_audio_uplink(_begin_command())
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 4800)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_deferred",
+        })
+        await session._finalize_current_turn(
+            "Fast answer.",
+            response_id="response_fast",
+        )
+
+        assert session._turn is not None
+        assert session._deferred_turn_finalization is not None
+        assert [
+            message["role"]
+            for message in db.get_messages("uplink-deferred-finalization")
+        ] == ["user"]
+
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_deferred",
+            "transcript": "Actual spoken request.",
+        })
+
+        assert session._turn is None
+        assert session._deferred_turn_finalization is None
+        messages = db.get_messages("uplink-deferred-finalization")
+        assert [message["role"] for message in messages[-2:]] == [
+            "user",
+            "assistant",
+        ]
+        assert messages[-2]["content"] == "Actual spoken request."
+        assert messages[-1]["content"] == "Fast answer."
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_transcript_timeout_does_not_delay_response(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="uplink-transcript-timeout",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+    )
+    agent._skill_nudge_interval = 0
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-transcript-timeout",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+            transcription_timeout_seconds=0.01,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_transcript_timeout",
+    )
+
+    await session.start()
+    try:
+        await session.begin_audio_uplink(_begin_command())
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 4800)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_timeout",
+        })
+        assert sideband.sent[-1]["type"] == "response.create"
+
+        await _wait_until(
+            lambda: any(
+                event["type"] == "warning"
+                and event["data"]["code"] == "transcription_timeout"
+                for event in session.broker.snapshot()
+            )
+        )
+        user_rows = [
+            message
+            for message in db.get_messages("uplink-transcript-timeout")
+            if message["role"] == "user"
+        ]
+        assert "transcript unavailable" in user_rows[-1]["content"].lower()
+        assert user_rows[-1]["display_metadata"]["transcript_available"] is False
+
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input_timeout",
+            "transcript": "Too late.",
+        })
+        user_rows = [
+            message
+            for message in db.get_messages("uplink-transcript-timeout")
+            if message["role"] == "user"
+        ]
+        assert "transcript unavailable" in user_rows[-1]["content"].lower()
+        await session.end_audio_uplink(STREAM_ID)
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_transcript_timeout_continues_once_and_ignores_late_transcript(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     agent = AIAgent(
@@ -795,7 +1760,7 @@ async def test_transcript_timeout_continues_once_and_ignores_late_transcript(tmp
 
 
 @pytest.mark.asyncio
-async def test_structured_interrupt_cancels_truncates_and_accepts_next_preroll(
+async def test_atomic_uplink_interrupt_cancels_truncates_and_accepts_next_turn(
     tmp_path,
 ):
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -812,7 +1777,7 @@ async def test_structured_interrupt_cancels_truncates_and_accepts_next_preroll(
         quiet_mode=True,
     )
     agent._skill_nudge_interval = 0
-    sideband = _ResponsivePrerollSideband()
+    sideband = _FakeSideband()
     session = RealtimeVoiceSession(
         session_id="structured-barge-in",
         agent=agent,
@@ -826,8 +1791,6 @@ async def test_structured_interrupt_cancels_truncates_and_accepts_next_preroll(
         sideband=sideband,
         call_id="call_structured_barge_in",
     )
-    sideband.handler = session.handle_provider_event
-
     await session.start()
     try:
         await session.handle_provider_event({
@@ -852,24 +1815,27 @@ async def test_structured_interrupt_cancels_truncates_and_accepts_next_preroll(
                 "role": "assistant",
             },
         })
-
-        first = await session.interrupt_response(
-            request_id="wake-2",
-            audio_end_ms=875,
-        )
-        repeated = await session.interrupt_response(
-            request_id="wake-2",
-            audio_end_ms=875,
-        )
+        await session.handle_provider_event({
+            "type": "response.output_audio.delta",
+            "response_id": "response_1",
+            "item_id": "assistant_1",
+            "delta": base64.b64encode(b"\x00\x00" * 24_000).decode("ascii"),
+        })
+        command = {
+            "type": "turn.begin",
+            "stream_id": STREAM_ID,
+            "barge_in": True,
+            "preroll_ms": 0,
+            "interrupted": {
+                "response_id": "response_1",
+                "item_id": "assistant_1",
+                "audio_end_ms": 875,
+            },
+        }
+        first = await session.begin_audio_uplink(command)
+        repeated = await session.begin_audio_uplink(command)
         assert first == repeated
-        with pytest.raises(RealtimeProtocolError) as conflict:
-            await session.interrupt_response(
-                request_id="wake-2",
-                audio_end_ms=900,
-            )
-        assert conflict.value.code == "interrupt_request_conflict"
-        assert first["status"] == "accepted"
-        assert first["truncation_requested"] is True
+        assert first["interruption"]["truncation_requested"] is True
         assert [event["type"] for event in sideband.sent].count("response.cancel") == 1
         truncate = next(
             event
@@ -879,16 +1845,18 @@ async def test_structured_interrupt_cancels_truncates_and_accepts_next_preroll(
         assert truncate["item_id"] == "assistant_1"
         assert truncate["audio_end_ms"] == 875
 
-        preroll = await session.ingest_preroll_audio(
-            b"\x01\x00" * 7200,
-            idempotency_key="wake:2",
-        )
-        assert preroll["status"] == "committed"
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * 7200)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_uplink",
+        })
         await session.handle_provider_event({
             "type": "conversation.item.input_audio_transcription.completed",
-            "item_id": "input_preroll",
+            "item_id": "input_uplink",
             "transcript": "Actually, answer briefly.",
         })
+        uplink = await session.end_audio_uplink(STREAM_ID)
+        assert uplink["status"] == "committed"
         await session.handle_provider_event({
             "type": "response.output_audio_transcript.done",
             "response_id": "response_1",
@@ -1962,7 +2930,7 @@ async def test_interrupted_tool_turn_expires_when_replacement_audio_never_arrive
             enabled=True,
             intermediate_speech_enabled=False,
             provider_call_max_seconds=3600,
-            preroll_timeout_seconds=0.01,
+            audio_uplink_idle_timeout_seconds=0.01,
             transcription_timeout_seconds=0.01,
         ),
         frozen_instructions=prepare_realtime_agent(agent, []),
