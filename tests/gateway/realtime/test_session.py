@@ -322,6 +322,138 @@ async def test_audio_uplink_combines_vad_commits_inside_the_burst():
 
 
 @pytest.mark.asyncio
+async def test_audio_uplink_dispatches_vad_commit_past_preroll_with_silence_tail():
+    session = RealtimeVoiceSession(
+        session_id="uplink-vad-silence-tail",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            provider_call_max_seconds=3600,
+            audio_uplink_append_chunk_milliseconds=80,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_uplink_vad_silence_tail",
+    )
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+    preroll_ms = 1999
+
+    try:
+        await session.begin_audio_uplink(_begin_command(preroll_ms=preroll_ms))
+        await session.append_audio_uplink(
+            STREAM_ID,
+            b"\x01\x00" * (preroll_ms * 24),
+        )
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_started",
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 1000,
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_preroll",
+        })
+        session._handle_input.assert_not_awaited()
+
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_started",
+        })
+        await session.append_audio_uplink(
+            STREAM_ID,
+            b"\x02\x00" * (1500 * 24),
+        )
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 2500,
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_live",
+        })
+
+        assert session._audio_uplink is not None
+        assert session._audio_uplink.state == "dispatched"
+        assert session._audio_uplink.committed_audio_bytes == 2500 * 48
+        assert session._audio_uplink.uncommitted_bytes == 999 * 48
+        session._handle_input.assert_awaited_once_with(
+            (
+                "[Voice transcript pending; use the committed audio input.]\n"
+                "[Voice transcript pending; use the committed audio input.]"
+            ),
+            "input_live",
+        )
+
+        result = await session.end_audio_uplink(STREAM_ID)
+
+        assert result["status"] == "committed"
+        assert session._audio_uplink is None
+        assert not any(
+            event["type"] == "input_audio_buffer.commit"
+            for event in session.sideband.sent
+        )
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_preserves_new_speech_across_prior_vad_commit():
+    session = RealtimeVoiceSession(
+        session_id="uplink-overlapping-vad-commit",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(enabled=True, provider_call_max_seconds=3600),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call_uplink_overlapping_vad_commit",
+    )
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+
+    try:
+        await session.begin_audio_uplink(_begin_command(preroll_ms=200))
+        await session.append_audio_uplink(STREAM_ID, b"\x01\x00" * (200 * 24))
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_started",
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 160,
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_started",
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_first",
+        })
+
+        assert session._audio_uplink is not None
+        assert session._audio_uplink.speech_since_commit is True
+        assert session._audio_uplink.last_commit_was_vad is False
+        session._handle_input.assert_not_awaited()
+
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 200,
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_second",
+        })
+
+        assert session._audio_uplink is not None
+        assert session._audio_uplink.state == "dispatched"
+        session._handle_input.assert_awaited_once()
+    finally:
+        await session.end_audio_uplink(STREAM_ID)
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
 async def test_audio_uplink_commit_during_append_keeps_later_chunks_pending():
     sideband = _CommitDuringAppendSideband()
     session = RealtimeVoiceSession(
@@ -698,12 +830,17 @@ async def test_audio_uplink_uses_provider_timeline_baseline_for_vad_boundary():
             "item_id": "input_boundary",
             "transcript": "first segment",
         })
+        uplink = session._audio_uplink
         result = await session.end_audio_uplink(STREAM_ID)
 
-        assert result["status"] == "ending"
-        assert session._audio_uplink is not None
-        assert session._audio_uplink.uncommitted_bytes == 80 * 48
-        session._handle_input.assert_not_awaited()
+        assert result["status"] == "committed"
+        assert session._audio_uplink is None
+        assert uplink.committed_audio_bytes == 160 * 48
+        assert uplink.uncommitted_bytes == 80 * 48
+        session._handle_input.assert_awaited_once_with(
+            "[Voice transcript pending; use the committed audio input.]",
+            "input_boundary",
+        )
     finally:
         await session.close(reason="test_complete", end_session=False)
 

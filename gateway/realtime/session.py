@@ -99,6 +99,8 @@ class _AudioUplink:
     pending_commit_boundary_bytes: Optional[int] = None
     fallback_commit_boundary_bytes: Optional[int] = None
     speech_since_commit: bool = False
+    speech_started_after_commit_boundary: bool = False
+    last_commit_was_vad: bool = False
     committed_item_ids: list[str] = field(default_factory=list)
     transcripts: dict[str, str] = field(default_factory=dict)
     fallback_commit_sent: bool = False
@@ -771,8 +773,8 @@ class RealtimeVoiceSession:
             await self._maybe_dispatch_audio_uplink_turn(uplink)
             if self._audio_uplink is uplink and (
                 not uplink.committed_item_ids
-                or uplink.speech_since_commit
-                or uplink.uncommitted_bytes
+                or self._audio_uplink_has_uncommitted_speech(uplink)
+                or uplink.fallback_commit_sent
             ):
                 self._schedule_audio_uplink_timeout(uplink)
 
@@ -826,6 +828,9 @@ class RealtimeVoiceSession:
                     "duration_ms": self._audio_duration_ms(uplink.audio_bytes),
                     "reason": reason,
                 }
+            await self._maybe_dispatch_audio_uplink_turn(uplink)
+            if self._audio_uplink is not uplink:
+                return dict(uplink.result or {"status": uplink.state})
             if uplink.fallback_commit_sent:
                 return dict(uplink.result or {"status": "ending"})
             if uplink.uncommitted_bytes >= minimum_bytes:
@@ -1087,8 +1092,7 @@ class RealtimeVoiceSession:
         if uplink.turn_dispatched:
             if (
                 uplink.close_requested
-                and not uplink.speech_since_commit
-                and not uplink.uncommitted_bytes
+                and not self._audio_uplink_has_uncommitted_speech(uplink)
                 and not uplink.fallback_commit_sent
             ):
                 uplink.state = "committed"
@@ -1106,10 +1110,13 @@ class RealtimeVoiceSession:
                     self._audio_uplink = None
             return
         if (
-            (uplink.audio_bytes < preroll_bytes and not uplink.close_requested)
+            (
+                uplink.committed_audio_bytes < preroll_bytes
+                and not uplink.close_requested
+            )
             or not uplink.committed_item_ids
-            or uplink.speech_since_commit
-            or uplink.uncommitted_bytes
+            or self._audio_uplink_has_uncommitted_speech(uplink)
+            or uplink.fallback_commit_sent
         ):
             return
 
@@ -1148,6 +1155,12 @@ class RealtimeVoiceSession:
             uplink.state = "committed"
             if self._audio_uplink is uplink:
                 self._audio_uplink = None
+
+    @staticmethod
+    def _audio_uplink_has_uncommitted_speech(uplink: _AudioUplink) -> bool:
+        return uplink.speech_since_commit or (
+            bool(uplink.uncommitted_bytes) and not uplink.last_commit_was_vad
+        )
 
     @staticmethod
     def _audio_duration_ms(audio_bytes: int) -> int:
@@ -2198,6 +2211,8 @@ class RealtimeVoiceSession:
                 if self._audio_uplink is not None:
                     uplink = self._audio_uplink
                     uplink.speech_since_commit = True
+                    if uplink.pending_commit_boundary_bytes is not None:
+                        uplink.speech_started_after_commit_boundary = True
                 self.broker.publish("vad.speech_started", {})
                 if self.state in {"responding", "tool_wait"}:
                     self._client_interrupt_pending = True
@@ -2252,6 +2267,7 @@ class RealtimeVoiceSession:
                             uplink.audio_bytes,
                             uplink.inflight_audio_bytes,
                         )
+                    uplink.speech_started_after_commit_boundary = False
                 self.broker.publish("vad.speech_stopped", {})
                 return
             if event_type == "input_audio_buffer.committed":
@@ -2272,6 +2288,13 @@ class RealtimeVoiceSession:
                     fallback_acknowledged = (
                         uplink.pending_commit_boundary_bytes is None
                         and uplink.fallback_commit_sent
+                    )
+                    vad_commit_acknowledged = (
+                        uplink.pending_commit_boundary_bytes is not None
+                    )
+                    newer_speech_pending = (
+                        vad_commit_acknowledged
+                        and uplink.speech_started_after_commit_boundary
                     )
                     boundary = uplink.pending_commit_boundary_bytes
                     if boundary is None and fallback_acknowledged:
@@ -2298,7 +2321,11 @@ class RealtimeVoiceSession:
                         uplink.audio_bytes - uplink.committed_audio_bytes,
                     )
                     uplink.pending_commit_boundary_bytes = None
-                    uplink.speech_since_commit = False
+                    uplink.speech_since_commit = newer_speech_pending
+                    uplink.speech_started_after_commit_boundary = False
+                    uplink.last_commit_was_vad = (
+                        vad_commit_acknowledged and not newer_speech_pending
+                    )
                     if fallback_acknowledged:
                         uplink.fallback_commit_boundary_bytes = None
                         uplink.fallback_commit_sent = False
@@ -2313,8 +2340,7 @@ class RealtimeVoiceSession:
                         self._audio_uplink is uplink
                         and uplink.state == "ending"
                         and (
-                            uplink.uncommitted_bytes
-                            or uplink.speech_since_commit
+                            self._audio_uplink_has_uncommitted_speech(uplink)
                             or uplink.fallback_commit_sent
                         )
                         and uplink.timeout_task is None
