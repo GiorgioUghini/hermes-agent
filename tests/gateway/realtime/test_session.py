@@ -411,6 +411,118 @@ async def test_audio_uplink_commit_during_final_send_dispatches_without_end():
 
 
 @pytest.mark.asyncio
+async def test_audio_uplink_forwards_live_audio_after_preroll_dispatch():
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-live-after-preroll",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            provider_call_max_seconds=3600,
+            audio_uplink_append_chunk_milliseconds=80,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_live_after_preroll",
+    )
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+    burst = b"\x01\x00" * (2359 * 24)
+    live_audio = b"\x02\x00" * (120 * 24)
+
+    try:
+        await session.begin_audio_uplink(_begin_command(preroll_ms=2359))
+        await session.append_audio_uplink(STREAM_ID, burst)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_preroll",
+        })
+        assert session._audio_uplink is not None
+        assert session._audio_uplink.state == "dispatched"
+
+        await session.append_audio_uplink(STREAM_ID, live_audio)
+
+        appended = b"".join(
+            base64.b64decode(event["audio"])
+            for event in sideband.sent
+            if event["type"] == "input_audio_buffer.append"
+        )
+        assert appended == burst + live_audio
+        assert session._audio_uplink.uncommitted_bytes == len(live_audio)
+
+        result = await session.end_audio_uplink(STREAM_ID)
+        assert result["status"] == "ending"
+        await session.teardown_audio_uplink(
+            STREAM_ID,
+            reason="audio_uplink_idle_timeout",
+        )
+        assert sideband.sent[-1]["type"] == "input_audio_buffer.commit"
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
+async def test_audio_uplink_finalizes_after_live_audio_vad_commit():
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="uplink-live-vad-commit",
+        agent=SimpleNamespace(tools=[], _session_db=None),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            provider_call_max_seconds=3600,
+            audio_uplink_append_chunk_milliseconds=80,
+        ),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=sideband,
+        call_id="call_uplink_live_vad_commit",
+    )
+    session.state = "ready"
+    session._handle_input = AsyncMock()
+    burst = b"\x01\x00" * (2359 * 24)
+    live_audio = b"\x02\x00" * (120 * 24)
+
+    try:
+        await session.begin_audio_uplink(_begin_command(preroll_ms=2359))
+        await session.append_audio_uplink(STREAM_ID, burst)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_preroll",
+        })
+        await session.append_audio_uplink(STREAM_ID, live_audio)
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.speech_stopped",
+            "audio_end_ms": 2479,
+        })
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_live",
+        })
+
+        result = await session.end_audio_uplink(STREAM_ID)
+
+        assert result["status"] == "committed"
+        assert result["audio_bytes"] == len(burst + live_audio)
+        assert result["item_ids"] == ["input_preroll", "input_live"]
+        assert session._audio_uplink is None
+        assert session._provider_input_active is False
+        assert "input_live" in session._handled_input_items
+        assert not any(
+            event["type"] == "input_audio_buffer.commit"
+            for event in sideband.sent
+        )
+
+        await session.handle_provider_event({
+            "type": "input_audio_buffer.committed",
+            "item_id": "input_live",
+        })
+        assert session._provider_input_active is False
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+
+
+@pytest.mark.asyncio
 async def test_audio_uplink_append_failure_quarantines_partial_provider_input():
     sideband = _CommitThenFailAppendSideband()
     session = RealtimeVoiceSession(
