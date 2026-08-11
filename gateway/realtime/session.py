@@ -479,7 +479,7 @@ class RealtimeVoiceSession:
                     )
                 self._audio_uplinks.move_to_end(key)
                 if (
-                    existing.state == "active"
+                    existing.state in {"active", "dispatched"}
                     and existing.owner_id
                     and existing.owner_id != owner_id
                 ):
@@ -616,10 +616,8 @@ class RealtimeVoiceSession:
                     self._require_audio_uplink_owner(
                         uplink,
                         owner_id=owner_id,
-                        require_active=False,
+                        require_active=True,
                     )
-                    if uplink.state == "dispatched":
-                        return
                     uplink.forwarding_audio = True
                 for offset in range(0, len(audio), chunk_bytes):
                     chunk = audio[offset : offset + chunk_bytes]
@@ -668,9 +666,6 @@ class RealtimeVoiceSession:
                         self._provider_input_audio_bytes_sent += len(chunk)
                         self.last_activity_at = time.time()
                         await self._maybe_dispatch_audio_uplink_turn(uplink)
-                        if uplink.state == "dispatched":
-                            uplink.forwarding_audio = False
-                            return
                 await self._finish_audio_uplink_forwarding(uplink)
         except asyncio.TimeoutError as exc:
             await self._finish_audio_uplink_forwarding(uplink, dispatch=False)
@@ -728,7 +723,7 @@ class RealtimeVoiceSession:
                 "Audio stream is attached to another socket",
                 code="audio_stream_not_owner",
             )
-        if require_active and uplink.state != "active":
+        if require_active and uplink.state not in {"active", "dispatched"}:
             raise RealtimeProtocolError(
                 "Audio stream no longer accepts frames",
                 code="audio_stream_ended",
@@ -754,13 +749,7 @@ class RealtimeVoiceSession:
                     "Audio stream is attached to another socket",
                     code="audio_stream_not_owner",
                 )
-            if uplink.state == "dispatched":
-                uplink.state = "committed"
-                self._cancel_audio_uplink_timeout(uplink)
-                if self._audio_uplink is uplink:
-                    self._audio_uplink = None
-                return dict(uplink.result or {"status": "committed"})
-            if uplink.state != "active":
+            if uplink.state not in {"active", "dispatched"}:
                 return dict(
                     uplink.result
                     or {
@@ -824,16 +813,10 @@ class RealtimeVoiceSession:
                     "stream_id": stream_id,
                     "call_id": uplink.call_id,
                 }
-            if uplink.state == "dispatched":
-                uplink.state = "committed"
-                self._cancel_audio_uplink_timeout(uplink)
-                if self._audio_uplink is uplink:
-                    self._audio_uplink = None
-                return dict(uplink.result or {"status": "committed"})
             if uplink.state in {"committed", "discarded", "failed"}:
                 return dict(uplink.result or {"status": uplink.state})
             uplink.close_requested = True
-            if uplink.state == "active":
+            if uplink.state in {"active", "dispatched"}:
                 uplink.state = "ending"
                 uplink.result = {
                     "status": "ending",
@@ -1097,13 +1080,33 @@ class RealtimeVoiceSession:
         )
         if (
             self._audio_uplink is not uplink
-            or uplink.state not in {"active", "ending"}
-            or uplink.turn_dispatched
+            or uplink.state not in {"active", "dispatched", "ending"}
             or uplink.forwarding_audio
-            or (
-                uplink.audio_bytes < preroll_bytes
-                and not uplink.close_requested
-            )
+        ):
+            return
+        if uplink.turn_dispatched:
+            if (
+                uplink.close_requested
+                and not uplink.speech_since_commit
+                and not uplink.uncommitted_bytes
+                and not uplink.fallback_commit_sent
+            ):
+                uplink.state = "committed"
+                uplink.result = {
+                    "status": "committed",
+                    "stream_id": uplink.stream_id,
+                    "call_id": uplink.call_id,
+                    "item_ids": list(uplink.committed_item_ids),
+                    "audio_bytes": uplink.audio_bytes,
+                    "duration_ms": self._audio_duration_ms(uplink.audio_bytes),
+                }
+                self._cancel_audio_uplink_timeout(uplink)
+                self._provider_input_active = False
+                if self._audio_uplink is uplink:
+                    self._audio_uplink = None
+            return
+        if (
+            (uplink.audio_bytes < preroll_bytes and not uplink.close_requested)
             or not uplink.committed_item_ids
             or uplink.speech_since_commit
             or uplink.uncommitted_bytes
@@ -2257,7 +2260,11 @@ class RealtimeVoiceSession:
                     return
                 self._provider_input_active = True
                 uplink = self._audio_uplink
-                if uplink is not None and uplink.state in {"active", "ending"}:
+                if uplink is not None and uplink.state in {
+                    "active",
+                    "dispatched",
+                    "ending",
+                }:
                     had_commits = bool(uplink.committed_item_ids)
                     if item_id and item_id not in uplink.committed_item_ids:
                         uplink.committed_item_ids.append(item_id)
@@ -2298,6 +2305,8 @@ class RealtimeVoiceSession:
                         self._cancel_audio_uplink_timeout(uplink)
                 if item_id:
                     self._start_transcript_wait(item_id)
+                    if uplink is not None and uplink.turn_dispatched:
+                        self._handled_input_items.add(item_id)
                 if uplink is not None:
                     await self._maybe_dispatch_audio_uplink_turn(uplink)
                     if (
