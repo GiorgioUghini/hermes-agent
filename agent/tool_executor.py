@@ -53,6 +53,24 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def finalize_tool_batch(
+    agent,
+    messages: list,
+    effective_task_id: str,
+    total_tools: int,
+) -> None:
+    """Apply the one whole-batch output budget and pending steer marker."""
+
+    if total_tools <= 0:
+        return
+    enforce_turn_budget(
+        messages[-total_tools:],
+        env=get_active_env(effective_task_id),
+        config=_budget_for_agent(agent),
+    )
+    agent._apply_pending_steer_to_tool_results(messages, total_tools)
+
+
 def _ensure_file_checkpoint(
     agent,
     function_name: str,
@@ -2073,18 +2091,12 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)
-    if total_tools > 0:
-        _tool_budget = _budget_for_agent(agent)
-        enforce_turn_budget(
-            messages[-total_tools:],
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        )
-        agent._apply_pending_steer_to_tool_results(messages, total_tools)
+    finalize_tool_batch(agent, messages, effective_task_id, total_tools)
 
 
 __all__ = [
     "execute_tool_calls_concurrent",
     "execute_tool_calls_sequential",
     "execute_tool_calls_segmented",
+    "finalize_tool_batch",
 ]

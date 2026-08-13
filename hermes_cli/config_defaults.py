@@ -1525,6 +1525,11 @@ DEFAULT_CONFIG = {
             "idle_timeout_seconds": 5,
             "append_chunk_milliseconds": 80,
         },
+        "device_actions": {
+            # Catalog timeouts remain authoritative; operators may only lower
+            # their maximum wait for a device result.
+            "timeout_cap_seconds": 30,
+        },
         "limits": {
             "max_active_sessions": 4,
             "max_creations_per_minute": 10,

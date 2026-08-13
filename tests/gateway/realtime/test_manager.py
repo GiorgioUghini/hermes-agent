@@ -1,13 +1,22 @@
 import asyncio
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from gateway.realtime.manager import RealtimeSessionError, RealtimeSessionManager
-from gateway.realtime.protocol import RealtimeCall, RealtimeVoiceConfig
+from gateway.realtime.protocol import (
+    RealtimeCall,
+    RealtimeProtocolError,
+    RealtimeVoiceConfig,
+    validate_device_advertisement,
+)
 from hermes_state import SessionDB
+
+
+DEVICE_ID = "22222222-2222-4222-8222-222222222222"
 
 
 class _FakeAgent:
@@ -16,9 +25,16 @@ class _FakeAgent:
         self.session_id = session_id
         self.tools = tools or []
         self._cached_system_prompt = ""
+        self.ephemeral_system_prompt = None
+        self.iteration_budget = SimpleNamespace(consume=lambda: True)
+        self._skill_nudge_interval = 0
+        self.valid_tool_names = set()
 
     def _ensure_db_session(self):
         return None
+
+    def _build_system_prompt(self, _system_message):
+        return "fresh frozen prompt"
 
 
 class _FakeSideband:
@@ -146,6 +162,17 @@ def _persist_call(db, *, state="ready", started_at=None, frozen_tools=None):
     )
 
 
+def _device(*capabilities):
+    return validate_device_advertisement({
+        "protocol_version": 1,
+        "instance_id": DEVICE_ID,
+        "capabilities": [
+            {"name": name, "version": version}
+            for name, version in capabilities
+        ],
+    })
+
+
 @pytest.fixture()
 def db(tmp_path):
     state = SessionDB(db_path=tmp_path / "state.db")
@@ -181,6 +208,515 @@ async def test_require_active_demands_renewal_for_non_idle_projection(db):
             await manager.require_active("voice-recovery")
         assert caught.value.code == "session_renewal_required"
         assert caught.value.status == 409
+    finally:
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_create_without_device_metadata_preserves_base_tools(db):
+    call_client = _FakeCallClient(
+        RealtimeCall(answer_sdp="answer", call_id="call_without_device")
+    )
+    manager, _sidebands = _manager(db, call_client=call_client)
+    try:
+        created = await manager.create_session(
+            "offer",
+            requested_session_id="voice-recovery",
+        )
+
+        assert created.session.device_response() is None
+        assert [tool["name"] for tool in call_client.requests[0][1]["tools"]] == [
+            "current_tool"
+        ]
+    finally:
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_negotiation_adds_only_server_catalog_timer_tools(db):
+    call_client = _FakeCallClient(
+        RealtimeCall(answer_sdp="answer", call_id="call_with_device")
+    )
+    manager, _sidebands = _manager(db, call_client=call_client)
+    try:
+        created = await manager.create_session(
+            "offer",
+            requested_session_id="voice-recovery",
+            device=_device(("timer", 1), ("unsupported_future", 9)),
+        )
+
+        tool_names = [
+            tool["name"] for tool in call_client.requests[0][1]["tools"]
+        ]
+        assert tool_names == [
+            "current_tool",
+            "device_timer_create",
+            "device_timer_list",
+            "device_timer_cancel",
+        ]
+        assert created.session.device_response() == {
+            "protocol_version": 1,
+            "instance_id": DEVICE_ID,
+            "capabilities": [{"name": "timer", "version": 1}],
+        }
+    finally:
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_device_tools_require_durable_session_storage():
+    call_client = _FakeCallClient(
+        RealtimeCall(answer_sdp="answer", call_id="call-should-not-start")
+    )
+    manager = RealtimeSessionManager(
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        api_key="sk-test",
+        agent_factory=lambda session_id: _FakeAgent(None, session_id),
+        call_client=call_client,
+        sideband_factory=lambda *_args: _FakeSideband("unused"),
+    )
+
+    with pytest.raises(RealtimeSessionError) as exc:
+        await manager.create_session(
+            "offer",
+            requested_session_id="device-no-storage",
+            device=_device(("timer", 1)),
+        )
+
+    assert exc.value.code == "device_persistence_unavailable"
+    assert call_client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_renewal_without_device_advertisement_removes_device_tools(db):
+    call_client = _FakeCallClient(
+        RealtimeCall(answer_sdp="answer-1", call_id="call_with_device"),
+        RealtimeCall(answer_sdp="answer-2", call_id="call_without_device"),
+    )
+    manager, _sidebands = _manager(db, call_client=call_client)
+    try:
+        created = await manager.create_session(
+            "offer-1",
+            requested_session_id="voice-recovery",
+            device=_device(("timer", 1)),
+        )
+        assert created.session.device_response() is not None
+
+        renewed = await manager.renew_session("voice-recovery", "offer-2")
+
+        assert renewed.session.device_response() is None
+        assert [tool["name"] for tool in call_client.requests[1][1]["tools"]] == [
+            "current_tool"
+        ]
+        persisted = db.get_realtime_session_state("voice-recovery")
+        assert persisted["device_context"] is None
+        assert [
+            tool["function"]["name"] for tool in persisted["frozen_base_tools"]
+        ] == ["current_tool"]
+    finally:
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_dispatched_timer_as_outcome_unknown(db):
+    _persist_call(db, state="turn_active")
+    db.append_message("voice-recovery", role="user", content="Set a timer.")
+    db.append_message(
+        "voice-recovery",
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": "server-call-before-device",
+                "type": "function",
+                "function": {
+                    "name": "frozen_tool",
+                    "arguments": "{}",
+                },
+            },
+            {
+                "id": "device-call-crashed",
+                "type": "function",
+                "function": {
+                    "name": "device_timer_create",
+                    "arguments": '{"duration_seconds":300}',
+                },
+            },
+            {
+                "id": "server-call-after-device",
+                "type": "function",
+                "function": {
+                    "name": "frozen_tool",
+                    "arguments": "{}",
+                },
+            },
+        ],
+    )
+    request = {
+        "invocation_id": "device-call-crashed",
+        "device_instance_id": DEVICE_ID,
+        "tool_name": "device_timer_create",
+        "capability": "timer",
+        "operation": "create",
+        "arguments": {"duration_seconds": 300, "label": None},
+        "expires_at_epoch_ms": 1_786_450_200_000,
+    }
+    assert db.create_realtime_device_invocation(
+        "voice-recovery",
+        invocation_id="device-call-crashed",
+        tool_name="device_timer_create",
+        side_effecting=True,
+        request_data=request,
+        expires_at_epoch_ms=request["expires_at_epoch_ms"],
+    )
+    assert db.mark_realtime_device_invocation_dispatch(
+        "voice-recovery",
+        "device-call-crashed",
+        dispatched=False,
+    )
+    assert db.mark_realtime_device_invocation_dispatch(
+        "voice-recovery",
+        "device-call-crashed",
+        dispatched=True,
+    )
+    call_client = _FakeCallClient(
+        RealtimeCall(answer_sdp="answer", call_id="call_after_crash"),
+        RealtimeCall(
+            answer_sdp="continued-answer",
+            call_id="call_after_rejection",
+        ),
+        RealtimeCall(
+            answer_sdp="recovered-answer",
+            call_id="call_after_accepted_crash",
+        ),
+    )
+    manager, sidebands = _manager(db, call_client=call_client)
+    try:
+        with pytest.raises(RealtimeSessionError) as recovery:
+            await manager.require_active("voice-recovery")
+        assert recovery.value.code == "session_renewal_required"
+
+        renewed = await manager.renew_session("voice-recovery", "offer")
+
+        durable = db.get_tool_result_by_call_id(
+            "voice-recovery",
+            "device-call-crashed",
+        )
+        assert durable is not None
+        assert '"code":"outcome_unknown"' in durable["content"]
+        assert durable["effect_disposition"] == "unknown"
+        skipped_server = db.get_tool_result_by_call_id(
+            "voice-recovery",
+            "server-call-after-device",
+        )
+        assert skipped_server is not None
+        assert "Tool execution skipped" in skipped_server["content"]
+        assert skipped_server["effect_disposition"] == "none"
+        uncertain_server = db.get_tool_result_by_call_id(
+            "voice-recovery",
+            "server-call-before-device",
+        )
+        assert uncertain_server is not None
+        assert '"code":"outcome_unknown"' in uncertain_server["content"]
+        assert uncertain_server["effect_disposition"] == "unknown"
+        invocation = db.get_realtime_device_invocation(
+            "voice-recovery",
+            "device-call-crashed",
+        )
+        assert invocation["status"] == "completed"
+        assert invocation["result_source"] == "recovery"
+        assert invocation["continuation_required"] is True
+        output = next(
+            event
+            for event in sidebands[0].sent
+            if event.get("item", {}).get("type") == "function_call_output"
+            and event["item"].get("call_id") == "device-call-crashed"
+        )
+        assert output["item"]["call_id"] == "device-call-crashed"
+        assert "outcome_unknown" in output["item"]["output"]
+        projected_call_ids = [
+            event["item"]["call_id"]
+            for event in sidebands[0].sent
+            if event.get("item", {}).get("type") == "function_call_output"
+        ]
+        assert projected_call_ids == [
+            "server-call-before-device",
+            "device-call-crashed",
+            "server-call-after-device",
+        ]
+        output_index = sidebands[0].sent.index(output)
+        continuation_index = next(
+            index
+            for index, event in enumerate(sidebands[0].sent)
+            if index > output_index and event.get("type") == "response.create"
+        )
+        assert output_index < continuation_index
+        assert renewed.session._turn is not None
+        continuation = sidebands[0].sent[continuation_index]
+        await renewed.session.handle_provider_event({
+            "type": "error",
+            "error": {
+                "event_id": continuation["event_id"],
+                "code": "temporary_provider_error",
+                "message": "Retry the continuation.",
+            },
+        })
+        assert db.get_realtime_device_invocation(
+            "voice-recovery",
+            "device-call-crashed",
+        )["continuation_required"] is True
+        assert renewed.session.can_renew
+        await renewed.session.handle_provider_event({
+            "type": "response.created",
+            "response": {"id": "unrelated-response"},
+        })
+        assert db.get_realtime_device_invocation(
+            "voice-recovery",
+            "device-call-crashed",
+        )["continuation_required"] is True
+        continued = await manager.renew_session(
+            "voice-recovery",
+            "offer-recovery-continued",
+        )
+        assert len(sidebands) == 2
+        renewed_continuations = [
+            event
+            for event in sidebands[1].sent
+            if event.get("type") == "response.create"
+            and not event["response"].get("metadata")
+        ]
+        assert len(renewed_continuations) == 1
+        await continued.session.handle_provider_event({
+            "type": "response.created",
+            "response": {"id": "accepted-recovery"},
+        })
+        assert db.get_realtime_device_invocation(
+            "voice-recovery",
+            "device-call-crashed",
+        )["continuation_required"] is False
+        assert db.get_realtime_session_state("voice-recovery")["state"] == (
+            "turn_active"
+        )
+        await continued.session.close(
+            reason="crash_after_continuation_acceptance",
+            end_session=False,
+        )
+        recovered = await manager.renew_session(
+            "voice-recovery",
+            "offer-after-accepted-crash",
+        )
+        assert len(sidebands) == 3
+        assert db.get_realtime_device_invocation(
+            "voice-recovery",
+            "device-call-crashed",
+        )["continuation_required"] is True
+        recovered_call_ids = [
+            event["item"]["call_id"]
+            for event in sidebands[2].sent
+            if event.get("item", {}).get("type") == "function_call_output"
+        ]
+        assert recovered_call_ids == [
+            "server-call-before-device",
+            "device-call-crashed",
+            "server-call-after-device",
+        ]
+        assert any(
+            event.get("type") == "response.create"
+            and not event["response"].get("metadata")
+            for event in sidebands[2].sent
+        )
+        await recovered.session.handle_provider_event({
+            "type": "response.created",
+            "response": {"id": "accepted-after-crash"},
+        })
+        assert db.get_realtime_device_invocation(
+            "voice-recovery",
+            "device-call-crashed",
+        )["continuation_required"] is False
+        assert not any(
+            event["type"] == "device.action.request"
+            for event in recovered.session.broker.snapshot()
+        )
+        with pytest.raises(RealtimeProtocolError) as late_result:
+            await recovered.session._handle_device_action_result({
+                "invocation_id": "device-call-crashed",
+                "status": "ok",
+            })
+        assert late_result.value.code == "expired_device_invocation"
+    finally:
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_restart_preserves_device_result_captured_before_ack(db):
+    _persist_call(db, state="renewal_required")
+    db.append_message("voice-recovery", role="user", content="Set a timer.")
+    db.append_message(
+        "voice-recovery",
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": "device-call-result-captured",
+                "type": "function",
+                "function": {
+                    "name": "device_timer_create",
+                    "arguments": '{"duration_seconds":300}',
+                },
+            }
+        ],
+    )
+    request = {
+        "invocation_id": "device-call-result-captured",
+        "device_instance_id": DEVICE_ID,
+        "tool_name": "device_timer_create",
+        "capability": "timer",
+        "operation": "create",
+        "arguments": {"duration_seconds": 300, "label": None},
+        "expires_at_epoch_ms": 1_786_450_200_000,
+    }
+    assert db.create_realtime_device_invocation(
+        "voice-recovery",
+        invocation_id="device-call-result-captured",
+        tool_name="device_timer_create",
+        side_effecting=True,
+        request_data=request,
+        expires_at_epoch_ms=request["expires_at_epoch_ms"],
+    )
+    assert db.mark_realtime_device_invocation_dispatch(
+        "voice-recovery",
+        "device-call-result-captured",
+        dispatched=False,
+    )
+    assert db.mark_realtime_device_invocation_dispatch(
+        "voice-recovery",
+        "device-call-result-captured",
+        dispatched=True,
+    )
+    output = '{"success":true,"result":{"timer_id":"timer-42"}}'
+    assert db.record_realtime_device_invocation_result(
+        "voice-recovery",
+        "device-call-result-captured",
+        output=output,
+        effect_disposition=None,
+        result_source="device",
+    )
+    call_client = _FakeCallClient(
+        RealtimeCall(answer_sdp="answer", call_id="call_after_crash")
+    )
+    manager, sidebands = _manager(db, call_client=call_client)
+    try:
+        renewed = await manager.renew_session("voice-recovery", "offer")
+
+        durable = db.get_tool_result_by_call_id(
+            "voice-recovery",
+            "device-call-result-captured",
+        )
+        assert durable["content"] == output
+        invocation = db.get_realtime_device_invocation(
+            "voice-recovery",
+            "device-call-result-captured",
+        )
+        assert invocation["status"] == "completed"
+        assert invocation["result_source"] == "device"
+        projected = next(
+            event
+            for event in sidebands[0].sent
+            if event.get("item", {}).get("type") == "function_call_output"
+            and event["item"].get("call_id") == "device-call-result-captured"
+        )
+        assert projected["item"]["output"] == output
+        assert any(
+            event.get("type") == "response.create"
+            for event in sidebands[0].sent[
+                sidebands[0].sent.index(projected) + 1 :
+            ]
+        )
+        assert renewed.session._turn is not None
+    finally:
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciles_device_call_not_yet_dispatched(db):
+    _persist_call(db, state="renewal_required")
+    db.append_message("voice-recovery", role="user", content="Set a timer.")
+    db.append_message(
+        "voice-recovery",
+        role="assistant",
+        content="",
+        tool_calls=[
+            {
+                "id": "device-call-not-dispatched",
+                "type": "function",
+                "function": {
+                    "name": "device_timer_create",
+                    "arguments": '{"duration_seconds":300}',
+                },
+            }
+        ],
+    )
+    request = {
+        "invocation_id": "device-call-not-dispatched",
+        "device_instance_id": DEVICE_ID,
+        "tool_name": "device_timer_create",
+        "capability": "timer",
+        "operation": "create",
+        "arguments": {"duration_seconds": 300, "label": None},
+        "expires_at_epoch_ms": 1_786_450_200_000,
+    }
+    assert db.create_realtime_device_invocation(
+        "voice-recovery",
+        invocation_id="device-call-not-dispatched",
+        tool_name="device_timer_create",
+        side_effecting=True,
+        request_data=request,
+        expires_at_epoch_ms=request["expires_at_epoch_ms"],
+    )
+    call_client = _FakeCallClient(
+        RealtimeCall(answer_sdp="answer", call_id="call_after_crash")
+    )
+    manager, sidebands = _manager(db, call_client=call_client)
+    try:
+        renewed = await manager.renew_session("voice-recovery", "offer")
+
+        durable = db.get_tool_result_by_call_id(
+            "voice-recovery",
+            "device-call-not-dispatched",
+        )
+        assert durable is not None
+        assert '"code":"device_action_not_dispatched"' in durable["content"]
+        assert durable["effect_disposition"] == "none"
+        invocation = db.get_realtime_device_invocation(
+            "voice-recovery",
+            "device-call-not-dispatched",
+        )
+        assert invocation["status"] == "completed"
+        assert invocation["result_source"] == "recovery"
+        output = next(
+            event
+            for event in sidebands[0].sent
+            if (
+                event.get("item", {}).get("type") == "function_call_output"
+                and event["item"].get("call_id")
+                == "device-call-not-dispatched"
+            )
+        )
+        assert "device_action_not_dispatched" in output["item"]["output"]
+        output_index = sidebands[0].sent.index(output)
+        assert any(
+            event.get("type") == "response.create"
+            for event in sidebands[0].sent[output_index + 1 :]
+        )
+        assert renewed.session._turn is not None
+        assert not any(
+            event["type"] == "device.action.request"
+            for event in renewed.session.broker.snapshot()
+        )
     finally:
         await manager.close_all()
 

@@ -19,6 +19,11 @@ import uuid
 from agent.turn_context import TurnContext, build_host_turn_context
 from agent.turn_finalizer import finalize_host_turn
 from gateway.realtime.controls import ControlEventBroker
+from gateway.realtime.device_actions import (
+    DevicePayloadError,
+    DeviceSessionBinding,
+    DeviceToolDefinition,
+)
 from gateway.realtime.openai_sideband import (
     OpenAIRealtimeError,
     OpenAIRealtimeSideband,
@@ -129,6 +134,19 @@ class _DeferredTurnFinalization:
     failed: bool
 
 
+@dataclass
+class _PendingDeviceInvocation:
+    invocation_id: str
+    tool: DeviceToolDefinition
+    future: asyncio.Future
+    completion_future: asyncio.Future
+    resolution_lock: asyncio.Lock
+    request_data: dict[str, Any]
+    expires_at_epoch_ms: int
+    durably_claimed: bool = False
+    dispatched: bool = False
+
+
 def prepare_realtime_agent(
     agent,
     conversation_history: list[dict[str, Any]],
@@ -205,6 +223,8 @@ class RealtimeVoiceSession:
         call_id: str,
         profile_name: str = "",
         frozen_tools: Optional[list[dict[str, Any]]] = None,
+        frozen_base_tools: Optional[list[dict[str, Any]]] = None,
+        device_binding: Optional[DeviceSessionBinding] = None,
         call_started_at: Optional[float] = None,
     ):
         self.session_id = session_id
@@ -218,6 +238,18 @@ class RealtimeVoiceSession:
                 default=str,
             )
         )
+        self.frozen_base_tools = json.loads(
+            json.dumps(
+                (
+                    frozen_base_tools
+                    if isinstance(frozen_base_tools, list)
+                    else self.frozen_tools
+                ),
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        self.device_binding = device_binding
         self.messages = list(conversation_history)
         self.sideband = sideband
         self.call_id = call_id
@@ -253,6 +285,18 @@ class RealtimeVoiceSession:
         self._response_transcripts: dict[str, str] = {}
         self._processed_responses: set[str] = set()
         self._processed_calls: set[str] = set()
+        self._pending_device_invocations: dict[str, _PendingDeviceInvocation] = {}
+        self._completed_device_invocations: OrderedDict[str, None] = OrderedDict()
+        self._expired_device_invocations: OrderedDict[str, None] = OrderedDict()
+        self._pending_device_continuation_events: OrderedDict[str, None] = (
+            OrderedDict()
+        )
+        self._device_continuation_renewal_required = False
+        self._device_continuation_renewal_lock = asyncio.Lock()
+        self._tool_skip_lock = threading.Lock()
+        self._device_continuation_turn_active = False
+        self._active_device_continuation_invocation_ids: set[str] = set()
+        self._control_client_ids: set[str] = set()
         self._tool_task: Optional[asyncio.Task] = None
         self._intermediate_task: Optional[asyncio.Task] = None
         self._status_response_active = False
@@ -299,6 +343,7 @@ class RealtimeVoiceSession:
         self._rotation_notified = False
         self._barge_in_during_response = False
         self._skip_current_tool_batch = False
+        self._tool_batch_steer_captured = False
         self._finalizing_turn = False
         self._closing = False
         self._closed = False
@@ -331,8 +376,12 @@ class RealtimeVoiceSession:
                 not task.done() for task in self._transcript_wait_tasks.values()
             )
             and not self._pending_next_inputs
-            and self._turn is None
+            and (
+                self._turn is None
+                or self._device_continuation_renewal_required
+            )
             and (self._tool_task is None or self._tool_task.done())
+            and not self._pending_device_invocations
             and not self._pending_approvals
         )
 
@@ -360,6 +409,7 @@ class RealtimeVoiceSession:
             and not self._pending_next_inputs
             and self._turn is None
             and (self._tool_task is None or self._tool_task.done())
+            and not self._pending_device_invocations
             and not self._pending_approvals
             and not has_pending_prompts
         )
@@ -383,6 +433,14 @@ class RealtimeVoiceSession:
             for payload in self._pending_approval_events.values()
         ]
         pending_controls.extend(pending_prompts)
+        pending_controls.extend(
+            {
+                "type": "device.action.request",
+                "data": dict(pending.request_data),
+            }
+            for pending in self._pending_device_invocations.values()
+            if pending.dispatched
+        )
         pending_terminal = self._pending_terminal_response
         response_id = (
             self._active_output_audio_response_id
@@ -419,10 +477,21 @@ class RealtimeVoiceSession:
             "pending_controls": pending_controls,
         }
 
-    def session_config(self) -> dict[str, Any]:
+    def session_config(
+        self,
+        *,
+        tools: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
         return self.config.openai_session(
             instructions=self.frozen_instructions,
-            tools=self.frozen_tools,
+            tools=self.frozen_tools if tools is None else tools,
+        )
+
+    def device_response(self) -> Optional[dict[str, Any]]:
+        return (
+            self.device_binding.public_payload()
+            if self.device_binding is not None
+            else None
         )
 
     async def begin_audio_uplink(
@@ -971,7 +1040,7 @@ class RealtimeVoiceSession:
         self._client_interrupt_pending = False
         self._barge_in_during_response = False
         self._pending_interrupt_audio_end_ms = None
-        self.agent._skip_unstarted_tool_calls = False
+        self._set_skip_unstarted_tool_calls(False)
         self._renewal_required = True
         self._quarantine_provider_input = True
         if not self._closed:
@@ -1203,6 +1272,97 @@ class RealtimeVoiceSession:
         if recover_review:
             await self._recover_due_review()
 
+    async def resume_recovered_device_turn(
+        self,
+        invocation_ids: list[str],
+        *,
+        outputs_seeded: bool,
+    ) -> None:
+        """Continue a crash-interrupted turn from its durable device outputs."""
+
+        recovered_ids = set(invocation_ids)
+        assistant_index = -1
+        for index, message in enumerate(self.messages):
+            if not isinstance(message, Mapping) or message.get("role") != "assistant":
+                continue
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            call_ids = {
+                str(call.get("id") or call.get("call_id") or "")
+                for call in tool_calls
+                if isinstance(call, Mapping)
+            }
+            if call_ids & recovered_ids:
+                assistant_index = index
+        if assistant_index < 0:
+            raise RuntimeError("Recovered device calls have no assistant tool request")
+
+        user_index = next(
+            (
+                index
+                for index in range(assistant_index - 1, -1, -1)
+                if isinstance(self.messages[index], Mapping)
+                and self.messages[index].get("role") == "user"
+            ),
+            -1,
+        )
+        if user_index < 0:
+            raise RuntimeError("Recovered device calls have no user turn")
+
+        from agent.message_content import flatten_message_text
+
+        turn_messages = list(self.messages)
+        user_row = turn_messages[user_index]
+        user_message = flatten_message_text(
+            user_row.get("api_content")
+            if user_row.get("api_content") is not None
+            else user_row.get("content")
+        )
+        effective_task_id = str(uuid.uuid4())
+        turn_id = str(uuid.uuid4())
+        self._turn = TurnContext(
+            user_message=user_message,
+            original_user_message=user_message,
+            messages=turn_messages,
+            conversation_history=list(turn_messages[:user_index]),
+            active_system_prompt=self.frozen_instructions,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            current_turn_user_idx=user_index,
+        )
+        self.messages = turn_messages
+        self.agent._current_task_id = effective_task_id
+        self.agent._current_turn_id = turn_id
+        self.agent._persist_user_message_idx = user_index
+        self.agent._turn_received_provider_response = False
+        self._turn_response_count = 1
+
+        if not outputs_seeded:
+            tool_outputs = {
+                str(message.get("tool_call_id") or ""): message
+                for message in turn_messages
+                if isinstance(message, Mapping) and message.get("role") == "tool"
+            }
+            for invocation_id in invocation_ids:
+                result = tool_outputs.get(invocation_id)
+                if result is None:
+                    raise RuntimeError(
+                        f"Recovered device call {invocation_id} has no tool result"
+                    )
+                await self.sideband.send(
+                    function_call_output_event(
+                        invocation_id,
+                        _tool_output_text(result.get("content", "")),
+                        event_id=self._event_id("recovered_device_tool"),
+                    )
+                )
+
+        await self._persist_runtime_state("turn_active")
+        await self._send_response_create(
+            instructions=self._response_instructions(self._turn)
+        )
+
     def _set_state(self, state: str, **details: Any) -> None:
         if state not in SESSION_STATES:
             raise RealtimeProtocolError(
@@ -1213,6 +1373,10 @@ class RealtimeVoiceSession:
 
     def _event_id(self, prefix: str) -> str:
         return f"hermes_{prefix}_{uuid.uuid4().hex}"
+
+    def _set_skip_unstarted_tool_calls(self, value: bool) -> None:
+        with self._tool_skip_lock:
+            self.agent._skip_unstarted_tool_calls = value
 
     def _install_agent_callbacks(self) -> None:
         self.agent.tool_start_callback = self._tool_start_sync
@@ -1237,6 +1401,12 @@ class RealtimeVoiceSession:
             voice=self.config.voice,
             frozen_instructions=self.frozen_instructions,
             frozen_tools=self.frozen_tools,
+            frozen_base_tools=self.frozen_base_tools,
+            device_context=(
+                self.device_binding.persisted_payload()
+                if self.device_binding is not None
+                else None
+            ),
         )
 
     def _schedule_background_review_sync(
@@ -1685,7 +1855,9 @@ class RealtimeVoiceSession:
                 self._pending_interrupt_audio_end_ms = applied_audio_end_ms
                 if self._turn is not None or tool_running:
                     self._barge_in_during_response = True
-                    self.agent._skip_unstarted_tool_calls = True
+                    if tool_running:
+                        self._skip_current_tool_batch = True
+                    self._set_skip_unstarted_tool_calls(True)
                 if response_id:
                     self._interrupted_response_ids.add(response_id)
 
@@ -1807,7 +1979,9 @@ class RealtimeVoiceSession:
                 self._pending_interrupt_audio_end_ms = audio_end_ms
                 if turn_response_pending or tool_running:
                     self._barge_in_during_response = True
-                    self.agent._skip_unstarted_tool_calls = True
+                    if tool_running:
+                        self._skip_current_tool_batch = True
+                    self._set_skip_unstarted_tool_calls(True)
                 if tracked_response_id and (turn_response_pending or tool_running):
                     self._interrupted_response_ids.add(tracked_response_id)
 
@@ -2027,6 +2201,8 @@ class RealtimeVoiceSession:
                     "Clarification is no longer pending",
                     code="stale_clarification",
                 )
+        elif command_type == "device.action.result":
+            await self._handle_device_action_result(data)
         elif command_type == "response.interrupt":
             await self.interrupt_response(
                 request_id=str(request_id),
@@ -2056,6 +2232,205 @@ class RealtimeVoiceSession:
                 {"request_id": request_id, "command": command_type},
             )
 
+    def control_client_attached(self, client_id: str) -> None:
+        if client_id:
+            self._control_client_ids.add(client_id)
+
+    async def control_client_detached(self, client_id: str) -> None:
+        if client_id:
+            self._control_client_ids.discard(client_id)
+        if self._control_client_ids:
+            return
+        await self._fail_pending_device_invocations(
+            code="device_disconnected",
+            message=(
+                "The device control connection closed before Hermes received "
+                "an execution result."
+            ),
+        )
+
+    @staticmethod
+    def _remember_invocation(
+        store: OrderedDict[str, None],
+        invocation_id: str,
+    ) -> None:
+        store[invocation_id] = None
+        store.move_to_end(invocation_id)
+        while len(store) > 256:
+            store.popitem(last=False)
+
+    async def _fail_pending_device_invocations(
+        self,
+        *,
+        code: str,
+        message: str,
+    ) -> None:
+        for invocation_id, pending in tuple(
+            self._pending_device_invocations.items()
+        ):
+            async with pending.resolution_lock:
+                if pending.future.done():
+                    continue
+                if not pending.dispatched:
+                    pending.future.set_result({
+                        "status": "not_dispatched",
+                        "error": {
+                            "code": "device_action_not_dispatched",
+                            "message": (
+                                "The device disconnected before Hermes durably "
+                                "dispatched the action."
+                            ),
+                            "retryable": False,
+                        },
+                    })
+                    continue
+                resolved = {
+                    "status": "transport_error",
+                    "error": {
+                        "code": code,
+                        "message": message,
+                        "retryable": False,
+                    },
+                }
+                db = getattr(self.agent, "_session_db", None)
+                if db is None:
+                    raise RuntimeError(
+                        "Device invocation persistence became unavailable"
+                    )
+                output, effect_disposition = self._device_resolution_output(
+                    pending.tool,
+                    resolved,
+                )
+                captured = await asyncio.to_thread(
+                    db.record_realtime_device_invocation_result,
+                    self.session_id,
+                    invocation_id,
+                    output=output,
+                    effect_disposition=effect_disposition,
+                    result_source="transport",
+                )
+                if not captured:
+                    raise RuntimeError(
+                        f"Device invocation {invocation_id} disconnect was not "
+                        "captured"
+                    )
+                self._remember_invocation(
+                    self._expired_device_invocations,
+                    invocation_id,
+                )
+                pending.future.set_result(resolved)
+
+    async def _handle_device_action_result(self, data: Mapping[str, Any]) -> str:
+        invocation_id = str(data.get("invocation_id") or "")
+        if invocation_id in self._completed_device_invocations:
+            return "duplicate"
+        if invocation_id in self._expired_device_invocations:
+            raise RealtimeProtocolError(
+                "Device invocation has expired",
+                code="expired_device_invocation",
+            )
+        pending = self._pending_device_invocations.get(invocation_id)
+        if pending is None:
+            db = getattr(self.agent, "_session_db", None)
+            durable = (
+                await asyncio.to_thread(
+                    db.get_realtime_device_invocation,
+                    self.session_id,
+                    invocation_id,
+                )
+                if db is not None
+                else None
+            )
+            if durable is not None and durable.get("status") == "completed":
+                if durable.get("result_source") != "device":
+                    self._remember_invocation(
+                        self._expired_device_invocations,
+                        invocation_id,
+                    )
+                    raise RealtimeProtocolError(
+                        "Device invocation is no longer accepting results",
+                        code="expired_device_invocation",
+                    )
+                self._remember_invocation(
+                    self._completed_device_invocations,
+                    invocation_id,
+                )
+                return "duplicate"
+            raise RealtimeProtocolError(
+                "Device invocation is not pending in this session",
+                code="unknown_device_invocation",
+            )
+        if not pending.dispatched:
+            raise RealtimeProtocolError(
+                "Device invocation has not been dispatched",
+                code="unknown_device_invocation",
+            )
+        accepted = False
+        async with pending.resolution_lock:
+            if pending.future.done():
+                winner = pending.future.result()
+                if winner.get("status") == "transport_error":
+                    raise RealtimeProtocolError(
+                        "Device invocation is no longer accepting results",
+                        code="expired_device_invocation",
+                    )
+            else:
+                if int(time.time() * 1000) > pending.expires_at_epoch_ms:
+                    self._remember_invocation(
+                        self._expired_device_invocations,
+                        invocation_id,
+                    )
+                    raise RealtimeProtocolError(
+                        "Device invocation has expired",
+                        code="expired_device_invocation",
+                    )
+                if data.get("status") == "ok":
+                    try:
+                        result = pending.tool.validate_result(data.get("result"))
+                    except DevicePayloadError as exc:
+                        raise RealtimeProtocolError(
+                            str(exc),
+                            code="invalid_device_action_result",
+                        ) from exc
+                    resolved = {"status": "ok", "result": result}
+                else:
+                    resolved = {
+                        "status": "error",
+                        "error": dict(data.get("error") or {}),
+                    }
+                db = getattr(self.agent, "_session_db", None)
+                if db is None:
+                    raise RealtimeProtocolError(
+                        "Durable device result storage is unavailable",
+                        code="device_persistence_unavailable",
+                    )
+                output, effect_disposition = self._device_resolution_output(
+                    pending.tool,
+                    resolved,
+                )
+                captured = await asyncio.to_thread(
+                    db.record_realtime_device_invocation_result,
+                    self.session_id,
+                    invocation_id,
+                    output=output,
+                    effect_disposition=effect_disposition,
+                    result_source="device",
+                )
+                if not captured:
+                    raise RealtimeProtocolError(
+                        "Device result could not be persisted",
+                        code="device_result_persistence_failed",
+                    )
+                pending.future.set_result(resolved)
+                accepted = True
+        persisted = await asyncio.shield(pending.completion_future)
+        if not persisted:
+            raise RealtimeProtocolError(
+                "Device result could not be persisted",
+                code="device_result_persistence_failed",
+            )
+        return "accepted" if accepted else "duplicate"
+
     async def _run_sideband(self) -> None:
         deadline: Optional[float] = None
         while not self._closed:
@@ -2073,6 +2448,11 @@ class RealtimeVoiceSession:
             except Exception as exc:
                 if self._closed:
                     return
+                if self._pending_device_continuation_events:
+                    await self._require_device_continuation_renewal(
+                        "device_continuation_transport_uncertain"
+                    )
+                    return
                 if deadline is None:
                     deadline = time.monotonic() + self.config.reconnect_grace_seconds
                     self._set_state("degraded", reason="sideband_disconnected")
@@ -2084,6 +2464,11 @@ class RealtimeVoiceSession:
                         },
                     )
                 if time.monotonic() >= deadline:
+                    if self._device_continuation_turn_active:
+                        await self._require_device_continuation_renewal(
+                            "device_continuation_reconnect_exhausted"
+                        )
+                        return
                     await self._persist_runtime_state("renewal_required")
                     self.broker.publish(
                         "session.rotation_required",
@@ -2220,7 +2605,8 @@ class RealtimeVoiceSession:
                     if self._continuation_pending:
                         self._schedule_interrupt_handoff_timeout()
                 if self.state == "tool_wait":
-                    self.agent._skip_unstarted_tool_calls = True
+                    self._skip_current_tool_batch = True
+                    self._set_skip_unstarted_tool_calls(True)
                     if self._active_response_id:
                         self._interrupted_response_ids.add(self._active_response_id)
                 if self.state == "responding":
@@ -2405,6 +2791,14 @@ class RealtimeVoiceSession:
                         if self._client_interrupt_pending:
                             await self._send_interrupt_cancel(response_id)
                 else:
+                    if self._pending_device_continuation_events:
+                        self._pending_device_continuation_events.popitem(last=False)
+                        db = getattr(self.agent, "_session_db", None)
+                        if db is not None:
+                            await asyncio.to_thread(
+                                db.clear_realtime_device_continuations,
+                                self.session_id,
+                            )
                     self._active_response_id = response_id
                     if response_id:
                         self._generation_active_response_ids.add(response_id)
@@ -2483,6 +2877,15 @@ class RealtimeVoiceSession:
                 error = event.get("error")
                 error = error if isinstance(error, Mapping) else {}
                 event_id = str(error.get("event_id") or event.get("event_id") or "")
+                rejected_device_continuation = (
+                    event_id in self._pending_device_continuation_events
+                )
+                if event_id:
+                    self._pending_device_continuation_events.pop(event_id, None)
+                if rejected_device_continuation:
+                    await self._require_device_continuation_renewal(
+                        "device_continuation_provider_rejected"
+                    )
                 provider_error = OpenAIRealtimeError(
                     str(error.get("message") or "Realtime provider error")[:1000],
                     code=str(error.get("code") or "openai_realtime_error"),
@@ -2777,7 +3180,7 @@ class RealtimeVoiceSession:
                     },
                 )
                 return
-            if self._skip_current_tool_batch:
+            if self._tool_batch_steer_captured:
                 self._pending_next_inputs.append((transcript, item_id))
                 self.broker.publish(
                     "turn.steered",
@@ -2787,7 +3190,9 @@ class RealtimeVoiceSession:
                     },
                 )
                 return
-            self.agent._skip_unstarted_tool_calls = True
+            self._set_skip_unstarted_tool_calls(True)
+            self._skip_current_tool_batch = True
+            self._tool_batch_steer_captured = True
             self.agent.steer(f"[User voice steer]\n{transcript}")
             self._client_interrupt_pending = False
             self._barge_in_during_response = False
@@ -2886,42 +3291,103 @@ class RealtimeVoiceSession:
         *,
         instructions: Optional[str] = None,
         status_message: bool = False,
+        count_iteration: bool = True,
     ) -> None:
         if not status_message:
             if self._turn is None:
                 return
-            if not self.agent.iteration_budget.consume():
-                self.broker.publish(
-                    "error",
-                    {
-                        "fatal": True,
-                        "code": "iteration_budget_exhausted",
-                        "message": "The realtime turn exceeded its iteration budget.",
-                    },
-                )
-                await self._finalize_current_turn(
-                    "[Realtime turn stopped after reaching its tool iteration limit.]",
-                    response_id="",
-                    failed=True,
-                )
-                return
-            self._turn_response_count += 1
-            if (
-                self.agent._skill_nudge_interval > 0
-                and "skill_manage" in self.agent.valid_tool_names
-            ):
-                self.agent._iters_since_skill += 1
-        await self.sideband.send(
-            response_create_event(
-                instructions=instructions,
-                status_message=status_message,
-                event_id=self._event_id("response"),
+            if count_iteration:
+                if not self.agent.iteration_budget.consume():
+                    self.broker.publish(
+                        "error",
+                        {
+                            "fatal": True,
+                            "code": "iteration_budget_exhausted",
+                            "message": (
+                                "The realtime turn exceeded its iteration budget."
+                            ),
+                        },
+                    )
+                    await self._finalize_current_turn(
+                        "[Realtime turn stopped after reaching its tool iteration limit.]",
+                        response_id="",
+                        failed=True,
+                    )
+                    return
+                self._turn_response_count += 1
+                if (
+                    self.agent._skill_nudge_interval > 0
+                    and "skill_manage" in self.agent.valid_tool_names
+                ):
+                    self.agent._iters_since_skill += 1
+        event_id = self._event_id("response")
+        db = getattr(self.agent, "_session_db", None)
+        continuation_pending = (
+            not status_message
+            and db is not None
+            and await asyncio.to_thread(
+                db.has_realtime_device_continuation,
+                self.session_id,
             )
         )
+        if continuation_pending:
+            rows = await asyncio.to_thread(
+                db.list_unfinished_realtime_device_invocations,
+                self.session_id,
+            )
+            self._active_device_continuation_invocation_ids.update(
+                str(row.get("invocation_id") or "")
+                for row in rows
+                if row.get("continuation_required")
+            )
+            self._active_device_continuation_invocation_ids.discard("")
+            self._device_continuation_turn_active = True
+            self._pending_device_continuation_events[event_id] = None
+        try:
+            await self.sideband.send(
+                response_create_event(
+                    instructions=instructions,
+                    status_message=status_message,
+                    event_id=event_id,
+                )
+            )
+        except asyncio.CancelledError:
+            self._pending_device_continuation_events.pop(event_id, None)
+            raise
+        except Exception:
+            self._pending_device_continuation_events.pop(event_id, None)
+            if continuation_pending:
+                await self._require_device_continuation_renewal(
+                    "device_continuation_delivery_failed"
+                )
+            raise
         if status_message:
             self._status_response_requested = True
         else:
             self._set_state("responding")
+
+    async def _require_device_continuation_renewal(self, reason: str) -> None:
+        async with self._device_continuation_renewal_lock:
+            if self._device_continuation_renewal_required:
+                return
+            db = getattr(self.agent, "_session_db", None)
+            if db is not None and self._active_device_continuation_invocation_ids:
+                rearmed = await asyncio.to_thread(
+                    db.require_realtime_device_continuations,
+                    self.session_id,
+                    sorted(self._active_device_continuation_invocation_ids),
+                )
+                if rearmed != len(
+                    self._active_device_continuation_invocation_ids
+                ):
+                    raise RuntimeError(
+                        "Could not preserve the pending device continuation"
+                    )
+            self._renewal_required = True
+            self._set_state("degraded", reason=reason)
+            await self._persist_runtime_state("renewal_required")
+            self.broker.publish("session.rotation_required", {"reason": reason})
+            self._device_continuation_renewal_required = True
 
     async def _handle_response_done(self, event: Mapping[str, Any]) -> None:
         response = event.get("response")
@@ -2983,6 +3449,7 @@ class RealtimeVoiceSession:
                 self._pending_next_inputs
             )
             self._skip_current_tool_batch = skip_unstarted
+            self._tool_batch_steer_captured = False
             self._tool_task = asyncio.create_task(
                 self._execute_tool_batch(
                     list(calls.values()),
@@ -3029,6 +3496,377 @@ class RealtimeVoiceSession:
             interrupted=response_interrupted,
             failed=status == "failed",
         )
+
+    def _device_tool_for_call(
+        self,
+        call: RealtimeFunctionCall,
+    ) -> Optional[DeviceToolDefinition]:
+        if self.device_binding is None:
+            return None
+        return self.device_binding.tool(call.name)
+
+    @staticmethod
+    def _device_resolution_output(
+        tool: DeviceToolDefinition,
+        resolved: Mapping[str, Any],
+    ) -> tuple[str, Optional[str]]:
+        if resolved["status"] == "ok":
+            output_payload = {
+                "success": True,
+                "result": resolved["result"],
+            }
+            effect_disposition = None
+        elif resolved["status"] in {"error", "not_dispatched"}:
+            output_payload = {
+                "success": False,
+                "error": resolved["error"],
+            }
+            effect_disposition = "none"
+        else:
+            error = dict(resolved["error"])
+            if tool.side_effecting and tool.idempotency == "at_most_once":
+                error = {
+                    "code": "outcome_unknown",
+                    "message": (
+                        f"{error['message']} The action may have reached the "
+                        "device; Hermes will not retry it with a new invocation "
+                        "ID."
+                    ),
+                    "retryable": False,
+                }
+                effect_disposition = "unknown"
+            else:
+                effect_disposition = "none"
+            output_payload = {"success": False, "error": error}
+        return (
+            json.dumps(
+                output_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            effect_disposition,
+        )
+
+    async def _persist_device_tool_result(
+        self,
+        call: RealtimeFunctionCall,
+        output: str,
+        *,
+        effect_disposition: Optional[str] = None,
+    ) -> None:
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        assert self._turn is not None
+        self._turn.messages.append(
+            make_tool_result_message(
+                call.name,
+                output,
+                call.call_id,
+                effect_disposition=effect_disposition,
+            )
+        )
+        persisted = await asyncio.to_thread(
+            self._run_in_session_context,
+            self.agent._flush_messages_to_session_db,
+            self._turn.messages,
+            self._turn.conversation_history,
+        )
+        if persisted is False:
+            self.agent._incremental_persistence_failed = True
+            raise RuntimeError(f"Device tool {call.name} result could not be persisted")
+        self.broker.publish(
+            "tool.completed",
+            {"call_id": call.call_id, "name": call.name},
+        )
+
+    async def _execute_device_tool_call(
+        self,
+        call: RealtimeFunctionCall,
+        tool: DeviceToolDefinition,
+        *,
+        skip_unstarted: bool,
+    ) -> None:
+        effective_skip = (
+            skip_unstarted
+            or self._closing
+            or self._closed
+            or self._skip_current_tool_batch
+            or self._client_interrupt_pending
+            or getattr(self.agent, "_skip_unstarted_tool_calls", False)
+        )
+        if effective_skip:
+            reason = (
+                "the session closed before this device action started"
+                if self._closing or self._closed
+                else "the user spoke before this device action started"
+            )
+            await self._persist_device_tool_result(
+                call,
+                f"[Tool execution skipped - {reason}, so the model must reevaluate it.]",
+                effect_disposition="none",
+            )
+            return
+
+        try:
+            parsed_arguments = json.loads(call.arguments)
+        except (json.JSONDecodeError, TypeError):
+            parsed_arguments = None
+        try:
+            arguments = tool.normalize_arguments(parsed_arguments)
+        except DevicePayloadError as exc:
+            await self._persist_device_tool_result(
+                call,
+                json.dumps(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "invalid_arguments",
+                            "message": str(exc),
+                            "retryable": False,
+                        },
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                effect_disposition="none",
+            )
+            return
+
+        db = getattr(self.agent, "_session_db", None)
+        if db is None:
+            await self._persist_device_tool_result(
+                call,
+                json.dumps(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "device_persistence_unavailable",
+                            "message": (
+                                "Hermes cannot dispatch a device action without "
+                                "durable invocation storage."
+                            ),
+                            "retryable": False,
+                        },
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                effect_disposition="none",
+            )
+            return
+
+        timeout_seconds = min(
+            float(tool.timeout_seconds),
+            float(self.config.device_action_timeout_cap_seconds),
+        )
+        expires_at_epoch_ms = int(
+            time.time() * 1000 + timeout_seconds * 1000
+        )
+        request_data = {
+            "invocation_id": call.call_id,
+            "device_instance_id": self.device_binding.instance_id,
+            "tool_name": tool.name,
+            "capability": tool.capability,
+            "operation": tool.operation,
+            "arguments": arguments,
+            "expires_at_epoch_ms": expires_at_epoch_ms,
+        }
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        completion_future = loop.create_future()
+        pending = _PendingDeviceInvocation(
+            invocation_id=call.call_id,
+            tool=tool,
+            future=future,
+            completion_future=completion_future,
+            resolution_lock=asyncio.Lock(),
+            request_data=request_data,
+            expires_at_epoch_ms=expires_at_epoch_ms,
+        )
+        self._pending_device_invocations[call.call_id] = pending
+        try:
+            created = await asyncio.to_thread(
+                db.create_realtime_device_invocation,
+                self.session_id,
+                invocation_id=call.call_id,
+                tool_name=tool.name,
+                side_effecting=tool.side_effecting,
+                request_data=request_data,
+                expires_at_epoch_ms=expires_at_epoch_ms,
+            )
+            if not created:
+                raise RuntimeError(
+                    f"Device invocation {call.call_id} already exists"
+                )
+
+            async with pending.resolution_lock:
+                pending.durably_claimed = True
+                resolved_before_dispatch = (
+                    future.result() if future.done() else None
+                )
+                if (
+                    resolved_before_dispatch is None
+                    and (self._closing or self._closed)
+                ):
+                    resolved_before_dispatch = {
+                        "status": "not_dispatched",
+                        "error": {
+                            "code": "device_action_not_dispatched",
+                            "message": (
+                                "The session closed before Hermes dispatched "
+                                "the device action."
+                            ),
+                            "retryable": False,
+                        },
+                    }
+                    future.set_result(resolved_before_dispatch)
+
+            if resolved_before_dispatch is None:
+                dispatching = await asyncio.to_thread(
+                    db.mark_realtime_device_invocation_dispatch,
+                    self.session_id,
+                    call.call_id,
+                    dispatched=False,
+                )
+                if not dispatching:
+                    raise RuntimeError(
+                        f"Device invocation {call.call_id} could not enter the "
+                        "dispatch phase"
+                    )
+                async with pending.resolution_lock:
+                    resolved_before_dispatch = (
+                        future.result() if future.done() else None
+                    )
+                    if (
+                        resolved_before_dispatch is None
+                        and (self._closing or self._closed)
+                    ):
+                        resolved_before_dispatch = {
+                            "status": "not_dispatched",
+                            "error": {
+                                "code": "device_action_not_dispatched",
+                                "message": (
+                                    "The session closed before Hermes dispatched "
+                                    "the device action."
+                                ),
+                                "retryable": False,
+                            },
+                        }
+                        future.set_result(resolved_before_dispatch)
+                    if resolved_before_dispatch is None:
+                        pending.dispatched = True
+
+            if resolved_before_dispatch is not None:
+                resolved = resolved_before_dispatch
+                output, effect_disposition = self._device_resolution_output(
+                    tool,
+                    resolved,
+                )
+                captured = await asyncio.to_thread(
+                    db.record_realtime_device_invocation_result,
+                    self.session_id,
+                    call.call_id,
+                    output=output,
+                    effect_disposition=effect_disposition,
+                    result_source="transport",
+                )
+                if not captured:
+                    raise RuntimeError(
+                        f"Device invocation {call.call_id} cancellation was not "
+                        "captured"
+                    )
+            else:
+                self.broker.publish("device.action.request", request_data)
+                await asyncio.to_thread(
+                    db.mark_realtime_device_invocation_dispatch,
+                    self.session_id,
+                    call.call_id,
+                    dispatched=True,
+                )
+
+            self.broker.publish(
+                "tool.started",
+                {
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "argument_keys": sorted(arguments),
+                },
+            )
+            if resolved_before_dispatch is None:
+                try:
+                    resolved = await asyncio.wait_for(
+                        asyncio.shield(future),
+                        timeout=timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    async with pending.resolution_lock:
+                        if future.done():
+                            resolved = future.result()
+                        else:
+                            self._remember_invocation(
+                                self._expired_device_invocations,
+                                call.call_id,
+                            )
+                            resolved = {
+                                "status": "transport_error",
+                                "error": {
+                                    "code": "device_action_timeout",
+                                    "message": (
+                                        "The device did not return a result before "
+                                        "the action expired."
+                                    ),
+                                    "retryable": False,
+                                },
+                            }
+                            output, effect_disposition = (
+                                self._device_resolution_output(tool, resolved)
+                            )
+                            captured = await asyncio.to_thread(
+                                db.record_realtime_device_invocation_result,
+                                self.session_id,
+                                call.call_id,
+                                output=output,
+                                effect_disposition=effect_disposition,
+                                result_source="transport",
+                            )
+                            if not captured:
+                                raise RuntimeError(
+                                    f"Device invocation {call.call_id} timeout was "
+                                    "not captured"
+                                )
+                            future.set_result(resolved)
+
+            output, effect_disposition = self._device_resolution_output(
+                tool,
+                resolved,
+            )
+
+            await self._persist_device_tool_result(
+                call,
+                output,
+                effect_disposition=effect_disposition,
+            )
+            completed = await asyncio.to_thread(
+                db.complete_realtime_device_invocation,
+                self.session_id,
+                call.call_id,
+            )
+            if not completed:
+                raise RuntimeError(
+                    f"Device invocation {call.call_id} was not completed"
+                )
+            if resolved["status"] in {"ok", "error"}:
+                self._remember_invocation(
+                    self._completed_device_invocations,
+                    call.call_id,
+                )
+            completion_future.set_result(True)
+        except BaseException:
+            if not completion_future.done():
+                completion_future.set_result(False)
+            raise
+        finally:
+            self._pending_device_invocations.pop(call.call_id, None)
 
     async def _execute_tool_batch(
         self,
@@ -3089,22 +3927,73 @@ class RealtimeVoiceSession:
                         "Assistant function-call row could not be persisted"
                     )
 
-                assistant_message = SimpleNamespace(
-                    content=spoken_preamble or "",
-                    tool_calls=[_tool_call_object(call) for call in new_calls],
-                )
                 self._intermediate_task = asyncio.create_task(
                     self._send_intermediate_after_delay(),
                     name=f"realtime-intermediate-{self.session_id}",
                 )
-                await asyncio.to_thread(
-                    self._execute_tools_sync,
-                    assistant_message,
-                    self._turn.messages,
-                    self._turn.effective_task_id,
-                    self._turn_response_count,
-                    skip_unstarted,
-                )
+
+                async def execute_server_calls(
+                    server_calls: list[RealtimeFunctionCall],
+                ) -> None:
+                    if not server_calls:
+                        return
+                    await asyncio.to_thread(
+                        self._execute_tools_sync,
+                        SimpleNamespace(
+                            content=spoken_preamble or "",
+                            tool_calls=[
+                                _tool_call_object(call) for call in server_calls
+                            ],
+                        ),
+                        self._turn.messages,
+                        self._turn.effective_task_id,
+                        self._turn_response_count,
+                        skip_unstarted or self._closing or self._closed,
+                        False,
+                    )
+
+                pending_server_calls: list[RealtimeFunctionCall] = []
+                for call in new_calls:
+                    device_tool = self._device_tool_for_call(call)
+                    if device_tool is not None:
+                        await execute_server_calls(pending_server_calls)
+                        pending_server_calls.clear()
+                        if getattr(
+                            self.agent,
+                            "_incremental_persistence_failed",
+                            False,
+                        ):
+                            break
+                        await self._execute_device_tool_call(
+                            call,
+                            device_tool,
+                            skip_unstarted=skip_unstarted,
+                        )
+                    else:
+                        pending_server_calls.append(call)
+                    if getattr(
+                        self.agent,
+                        "_incremental_persistence_failed",
+                        False,
+                    ):
+                        break
+                else:
+                    await execute_server_calls(pending_server_calls)
+                if not getattr(
+                    self.agent,
+                    "_incremental_persistence_failed",
+                    False,
+                ):
+                    from agent.tool_executor import finalize_tool_batch
+
+                    await asyncio.to_thread(
+                        self._run_in_session_context,
+                        finalize_tool_batch,
+                        self.agent,
+                        self._turn.messages,
+                        self._turn.effective_task_id,
+                        len(new_calls),
+                    )
                 # The canonical executor may append a queued /steer marker to
                 # the last result after its per-result flush. Persist that final
                 # form before projecting any function output to Realtime.
@@ -3235,6 +4124,7 @@ class RealtimeVoiceSession:
         task_id: str,
         api_call_count: int,
         skip_unstarted: bool = False,
+        finalize: bool = True,
     ) -> None:
         from tools.terminal_tool import (
             set_approval_callback,
@@ -3244,21 +4134,39 @@ class RealtimeVoiceSession:
         tokens = self._bind_session_context()
         set_approval_callback(None)
         set_sudo_password_callback(self._secret_sync)
-        effective_skip = (
-            skip_unstarted
-            or self._skip_current_tool_batch
-            or self._client_interrupt_pending
-        )
-        self.agent._skip_unstarted_tool_calls = effective_skip
+        with self._tool_skip_lock:
+            effective_skip = (
+                skip_unstarted
+                or self._closing
+                or self._closed
+                or self._skip_current_tool_batch
+                or self._client_interrupt_pending
+            )
+            self.agent._skip_unstarted_tool_calls = effective_skip
         try:
             # Realtime batches stay sequential so a barge-in can suppress calls
             # that have not started without cancelling the operation already in
             # progress. Every call still uses the canonical executor pipeline.
-            self.agent._execute_tool_calls_sequential(
-                assistant_message, messages, task_id, api_call_count
-            )
+            if finalize:
+                self.agent._execute_tool_calls_sequential(
+                    assistant_message,
+                    messages,
+                    task_id,
+                    api_call_count,
+                )
+            else:
+                from agent.tool_executor import execute_tool_calls_sequential
+
+                execute_tool_calls_sequential(
+                    self.agent,
+                    assistant_message,
+                    messages,
+                    task_id,
+                    api_call_count,
+                    finalize=False,
+                )
         finally:
-            self.agent._skip_unstarted_tool_calls = False
+            self._set_skip_unstarted_tool_calls(False)
             set_sudo_password_callback(None)
             set_approval_callback(None)
             self._clear_session_context(tokens)
@@ -3639,6 +4547,8 @@ class RealtimeVoiceSession:
         )
         self.messages = list(result.get("messages") or turn.messages)
         self._turn = None
+        self._device_continuation_turn_active = False
+        self._active_device_continuation_invocation_ids.clear()
         self._deferred_turn_finalization = None
         self._turn_response_count = 0
         self._tool_task = None
@@ -3663,7 +4573,8 @@ class RealtimeVoiceSession:
                 self._response_audio_bytes.pop((finalized_response_id, item), None)
         self._barge_in_during_response = False
         self._skip_current_tool_batch = False
-        self.agent._skip_unstarted_tool_calls = False
+        self._tool_batch_steer_captured = False
+        self._set_skip_unstarted_tool_calls(False)
         self._client_interrupt_pending = False
         self._pending_interrupt_audio_end_ms = None
         self._cancel_interrupt_handoff_timeout()
@@ -3777,12 +4688,16 @@ class RealtimeVoiceSession:
         *,
         sideband: OpenAIRealtimeSideband,
         call_id: str,
+        frozen_tools: Optional[list[dict[str, Any]]] = None,
+        device_binding: Optional[DeviceSessionBinding] = None,
     ) -> None:
         async with self._event_lock:
             async with self._close_lock:
                 await self._replace_sideband_locked(
                     sideband=sideband,
                     call_id=call_id,
+                    frozen_tools=frozen_tools,
+                    device_binding=device_binding,
                 )
 
     async def _replace_sideband_locked(
@@ -3790,11 +4705,16 @@ class RealtimeVoiceSession:
         *,
         sideband: OpenAIRealtimeSideband,
         call_id: str,
+        frozen_tools: Optional[list[dict[str, Any]]] = None,
+        device_binding: Optional[DeviceSessionBinding] = None,
     ) -> None:
         if not self.can_renew:
             raise RealtimeProtocolError(
                 "Session is busy and cannot rotate yet", code="session_busy"
             )
+        resume_device_continuation = (
+            self._device_continuation_renewal_required and self._turn is not None
+        )
         self._set_state("rotating")
         old_task, self._receive_task = self._receive_task, None
         if old_task is not None:
@@ -3808,6 +4728,11 @@ class RealtimeVoiceSession:
             )
         self.sideband = sideband
         self.call_id = call_id
+        if frozen_tools is not None:
+            self.frozen_tools = json.loads(
+                json.dumps(frozen_tools, ensure_ascii=False, default=str)
+            )
+            self.device_binding = device_binding
         self._audio_uplink = None
         self._audio_uplinks.clear()
         self._audio_uplink_items.clear()
@@ -3856,6 +4781,7 @@ class RealtimeVoiceSession:
         self._quarantined_input_items.clear()
         self._rotation_notified = False
         self._renewal_required = False
+        self._device_continuation_renewal_required = False
         if self._rotation_task is not None:
             self._rotation_task.cancel()
         self._rotation_task = asyncio.create_task(
@@ -3865,8 +4791,29 @@ class RealtimeVoiceSession:
             self._run_sideband(), name=f"realtime-sideband-{self.session_id}"
         )
         self._set_state("ready", rotated=True)
-        await self._persist_runtime_state("ready")
+        await self._persist_runtime_state(
+            "turn_active" if resume_device_continuation else "ready"
+        )
         self.broker.publish("session.rotated", {"call_id": call_id})
+        if resume_device_continuation:
+            try:
+                await self._send_response_create(count_iteration=False)
+            except Exception as exc:
+                self._renewal_required = True
+                self._device_continuation_renewal_required = True
+                self._set_state(
+                    "degraded",
+                    reason="device_continuation_delivery_failed",
+                )
+                await self._persist_runtime_state("renewal_required")
+                self.broker.publish(
+                    "session.rotation_required",
+                    {"reason": "device_continuation_delivery_failed"},
+                )
+                raise RealtimeProtocolError(
+                    "The renewed provider call rejected the pending continuation",
+                    code="device_continuation_delivery_failed",
+                ) from exc
 
     async def _seed_history(self) -> None:
         from agent.message_content import flatten_message_text
@@ -3962,6 +4909,7 @@ class RealtimeVoiceSession:
             if self._closed:
                 return
             self._closing = True
+            self._set_skip_unstarted_tool_calls(True)
             self._logical_end = end_session
             if recoverable_state is not None:
                 persisted_state = recoverable_state
@@ -3980,6 +4928,13 @@ class RealtimeVoiceSession:
                         exc_info=True,
                     )
             self._set_state("closing", reason=reason)
+            await self._fail_pending_device_invocations(
+                code="session_closed",
+                message=(
+                    "The realtime session closed before Hermes received the "
+                    "device action result."
+                ),
+            )
             self._closed = True
             from tools.approval import unregister_gateway_notify
 

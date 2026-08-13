@@ -25,9 +25,11 @@ from gateway.realtime.protocol import (
     validate_audio_stream_id,
     validate_audio_uplink_command,
     validate_control_command,
+    validate_device_advertisement,
 )
 
 STREAM_ID = "11111111-1111-4111-8111-111111111111"
+DEVICE_ID = "22222222-2222-4222-8222-222222222222"
 
 
 def test_config_builds_hermes_owned_vad_session():
@@ -319,6 +321,95 @@ def test_control_commands_require_structured_authorization():
             "type": "approval.respond",
             "data": {"choice": "spoken-yes"},
         })
+
+
+def test_device_advertisement_accepts_only_versioned_capability_names():
+    advertisement = validate_device_advertisement({
+        "protocol_version": 1,
+        "instance_id": DEVICE_ID,
+        "capabilities": [
+            {"name": "timer", "version": 1},
+            {"name": "future_capability", "version": 7},
+        ],
+    })
+
+    assert advertisement.instance_id == DEVICE_ID
+    assert advertisement.capabilities == (("timer", 1), ("future_capability", 7))
+    assert validate_device_advertisement(None) is None
+
+    with pytest.raises(RealtimeProtocolError) as client_schema:
+        validate_device_advertisement({
+            "protocol_version": 1,
+            "instance_id": DEVICE_ID,
+            "capabilities": [
+                {
+                    "name": "timer",
+                    "version": 1,
+                    "tools": [{"name": "client_supplied"}],
+                }
+            ],
+        })
+    assert client_schema.value.code == "invalid_device_capability"
+
+    with pytest.raises(RealtimeProtocolError) as duplicate_name:
+        validate_device_advertisement({
+            "protocol_version": 1,
+            "instance_id": DEVICE_ID,
+            "capabilities": [
+                {"name": "timer", "version": 1},
+                {"name": "timer", "version": 2},
+            ],
+        })
+    assert duplicate_name.value.code == "duplicate_device_capability"
+
+
+def test_device_action_result_requires_correlated_bounded_shapes():
+    success = validate_control_command({
+        "version": 1,
+        "request_id": "android-123",
+        "type": "device.action.result",
+        "data": {
+            "invocation_id": "provider-call-1",
+            "status": "ok",
+            "result": {
+                "timer_id": "timer-42",
+                "fires_at_epoch_ms": 1_786_450_195_000,
+                "label": None,
+            },
+        },
+    })
+    assert success["data"]["result"]["timer_id"] == "timer-42"
+
+    failure = validate_control_command({
+        "version": 1,
+        "request_id": "android-124",
+        "type": "device.action.result",
+        "data": {
+            "invocation_id": "provider-call-1",
+            "status": "error",
+            "error": {
+                "code": "permission_denied",
+                "message": "Exact alarms are unavailable",
+                "retryable": False,
+            },
+        },
+    })
+    assert failure["data"]["error"]["retryable"] is False
+
+    with pytest.raises(RealtimeProtocolError) as missing_request:
+        validate_control_command({
+            "type": "device.action.result",
+            "data": {
+                "invocation_id": "provider-call-1",
+                "status": "ok",
+                "result": {},
+            },
+        })
+    assert missing_request.value.code == "invalid_request_id"
+
+    with pytest.raises(RealtimeProtocolError) as oversized:
+        validate_control_command("x" * (64 * 1024 + 1))
+    assert oversized.value.code == "control_command_too_large"
 
 
 def test_interrupt_command_requires_playout_position_and_correlation_id():

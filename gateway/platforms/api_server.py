@@ -2849,21 +2849,22 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _read_realtime_offer(self, request: "web.Request"):
         """Read a bounded raw-or-JSON SDP offer without logging media metadata."""
 
+        device = None
         try:
             realtime_config, _api_key, _review_configured = self._realtime_runtime_status()
         except Exception as exc:
-            return None, None, self._realtime_error_response(exc)
+            return None, None, None, self._realtime_error_response(exc)
         if (
             request.content_length is not None
             and request.content_length > realtime_config.max_sdp_bytes
         ):
-            return None, None, web.json_response(
+            return None, None, None, web.json_response(
                 _openai_error("SDP offer is too large", code="sdp_offer_too_large"),
                 status=413,
             )
         raw = await request.read()
         if len(raw) > realtime_config.max_sdp_bytes:
-            return None, None, web.json_response(
+            return None, None, None, web.json_response(
                 _openai_error("SDP offer is too large", code="sdp_offer_too_large"),
                 status=413,
             )
@@ -2872,22 +2873,28 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 body = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
-                return None, None, web.json_response(
+                return None, None, None, web.json_response(
                     _openai_error("Invalid JSON in request body", code="invalid_json"),
                     status=400,
                 )
             if not isinstance(body, dict):
-                return None, None, web.json_response(
+                return None, None, None, web.json_response(
                     _openai_error("Request body must be an object"),
                     status=400,
                 )
             offer_sdp = body.get("sdp")
             requested_session_id = body.get("session_id") or requested_session_id
+            try:
+                from gateway.realtime.protocol import validate_device_advertisement
+
+                device = validate_device_advertisement(body.get("device"))
+            except Exception as exc:
+                return None, None, None, self._realtime_error_response(exc)
             for immutable in ("model", "voice"):
                 requested = body.get(immutable)
                 configured = getattr(realtime_config, immutable)
                 if requested is not None and str(requested) != configured:
-                    return None, None, web.json_response(
+                    return None, None, None, web.json_response(
                         _openai_error(
                             f"{immutable} overrides are not allowed by this server",
                             code=f"{immutable}_override_not_allowed",
@@ -2900,16 +2907,16 @@ class APIServerAdapter(BasePlatformAdapter):
             except UnicodeDecodeError:
                 offer_sdp = ""
         if not isinstance(offer_sdp, str) or not offer_sdp.strip():
-            return None, None, web.json_response(
+            return None, None, None, web.json_response(
                 _openai_error("A non-empty SDP offer is required", code="missing_sdp"),
                 status=400,
             )
         if "v=0" not in offer_sdp or "m=audio" not in offer_sdp:
-            return None, None, web.json_response(
+            return None, None, None, web.json_response(
                 _openai_error("The SDP offer does not contain an audio media line", code="invalid_sdp"),
                 status=400,
             )
-        return offer_sdp, requested_session_id, None
+        return offer_sdp, requested_session_id, device, None
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -3071,9 +3078,12 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        offer_sdp, requested_session_id, error = await self._read_realtime_offer(
-            request
-        )
+        (
+            offer_sdp,
+            requested_session_id,
+            device,
+            error,
+        ) = await self._read_realtime_offer(request)
         if error is not None:
             return error
         try:
@@ -3081,6 +3091,7 @@ class APIServerAdapter(BasePlatformAdapter):
             created = await manager.create_session(
                 offer_sdp,
                 requested_session_id=requested_session_id,
+                device=device,
             )
             config = created.session.config
             payload = {
@@ -3105,6 +3116,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 payload["audio_uplink_url"] = (
                     f"/v1/realtime/sessions/{created.session.session_id}/audio/uplink"
                 )
+            accepted_device = created.session.device_response()
+            if accepted_device is not None:
+                payload["device"] = accepted_device
             return web.json_response(payload)
         except Exception as exc:
             logger.warning("Realtime session creation failed: %s", exc)
@@ -3302,15 +3316,20 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        offer_sdp, _requested_session_id, error = await self._read_realtime_offer(
-            request
-        )
+        (
+            offer_sdp,
+            _requested_session_id,
+            device,
+            error,
+        ) = await self._read_realtime_offer(request)
         if error is not None:
             return error
         try:
             manager = self._ensure_realtime_manager()
             created = await manager.renew_session(
-                request.match_info["session_id"], offer_sdp
+                request.match_info["session_id"],
+                offer_sdp,
+                device=device,
             )
             config = created.session.config
             payload = {
@@ -3329,6 +3348,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 payload["audio_uplink_url"] = (
                     f"/v1/realtime/sessions/{created.session.session_id}/audio/uplink"
                 )
+            accepted_device = created.session.device_response()
+            if accepted_device is not None:
+                payload["device"] = accepted_device
             return web.json_response(payload)
         except Exception as exc:
             logger.warning("Realtime session renewal failed: %s", exc)
@@ -3447,6 +3469,10 @@ class APIServerAdapter(BasePlatformAdapter):
             max_msg_size=manager.config.max_control_event_bytes,
         )
         await ws.prepare(request)
+        control_client_id = uuid.uuid4().hex
+        attach_control = getattr(session, "control_client_attached", None)
+        if callable(attach_control):
+            attach_control(control_client_id)
 
         def build_resync_event(reason: str) -> dict[str, Any]:
             snapshot_factory = getattr(session, "control_snapshot", None)
@@ -3526,18 +3552,29 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 async for message in ws:
                     if message.type == web.WSMsgType.TEXT:
+                        command = None
                         try:
                             command = validate_control_command(message.data)
                             await session.handle_control_command(command)
                         except Exception as exc:
                             code = getattr(exc, "code", "invalid_control_command")
-                            session.broker.publish(
-                                "control.error",
-                                {
-                                    "code": code,
-                                    "message": _redact_api_error_text(exc),
-                                },
-                            )
+                            error_data = {
+                                "code": code,
+                                "message": _redact_api_error_text(exc),
+                            }
+                            if isinstance(command, Mapping):
+                                request_id = str(command.get("request_id") or "")
+                                invocation_id = str(
+                                    (command.get("data") or {}).get(
+                                        "invocation_id"
+                                    )
+                                    or ""
+                                )
+                                if request_id:
+                                    error_data["request_id"] = request_id
+                                if invocation_id:
+                                    error_data["invocation_id"] = invocation_id
+                            session.broker.publish("control.error", error_data)
                         if session.closed:
                             break
                     elif message.type == web.WSMsgType.BINARY:
@@ -3559,6 +3596,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 await asyncio.gather(sender, return_exceptions=True)
         finally:
             session.broker.unsubscribe(subscription)
+            detach_control = getattr(session, "control_client_detached", None)
+            if callable(detach_control):
+                await detach_control(control_client_id)
             await ws.close()
         return ws
 
@@ -3579,6 +3619,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 AUDIO_UPLINK_SAMPLE_RATE_HZ,
                 AUDIO_UPLINK_SAMPLE_WIDTH_BYTES,
             )
+            from gateway.realtime.device_actions import DEVICE_CAPABILITY_CATALOG
 
             realtime_config, realtime_key, review_configured = (
                 self._realtime_runtime_status()
@@ -3640,6 +3681,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "configured": review_configured,
                     "silent_by_default": True,
                 },
+                "device_actions": {
+                    "available": realtime_available,
+                    "protocol_version": (
+                        DEVICE_CAPABILITY_CATALOG.protocol_version
+                    ),
+                    "catalog_version": DEVICE_CAPABILITY_CATALOG.catalog_version,
+                    "capabilities": (
+                        DEVICE_CAPABILITY_CATALOG.advertised_capabilities()
+                    ),
+                    "transport": "realtime_control_websocket",
+                    "delivery": "at_least_once",
+                },
             }
             if realtime_config.enabled and not realtime_key:
                 realtime_details["unavailable_reason"] = "openai_credentials_missing"
@@ -3666,12 +3719,13 @@ class APIServerAdapter(BasePlatformAdapter):
             },
             "runtime": {
                 "mode": "server_agent",
-                "tool_execution": "server",
-                "split_runtime": False,
+                "tool_execution": "server_with_negotiated_device_actions",
+                "split_runtime": True,
                 "description": (
                     "The API server creates a server-side Hermes AIAgent; "
-                    "tools execute on the API-server host unless a future "
-                    "explicit split-runtime mode is enabled."
+                    "normal tools execute on the API-server host, while trusted "
+                    "session-negotiated device actions use the authenticated "
+                    "Realtime control WebSocket."
                 ),
             },
             "features": {
@@ -3699,6 +3753,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "audio_api": realtime_available,
                 "realtime_voice": realtime_available,
                 "realtime_voice_details": realtime_details,
+                "device_actions": realtime_details.get(
+                    "device_actions",
+                    {
+                        "available": False,
+                        "protocol_version": 1,
+                        "capabilities": {},
+                    },
+                ),
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),

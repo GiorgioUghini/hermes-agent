@@ -16,6 +16,7 @@ from gateway.realtime.openai_sideband import (
     OpenAIRealtimeSideband,
 )
 from gateway.realtime.protocol import RealtimeVoiceConfig
+from gateway.realtime.device_actions import DEVICE_CAPABILITY_CATALOG
 from gateway.realtime.session import REALTIME_SYSTEM_GUIDANCE
 from hermes_state import SessionDB
 
@@ -32,6 +33,8 @@ class _FakeSession:
         self.audio_ended = False
         self.audio_teardown_reason = ""
         self.audio_abort_reason = ""
+        self.device = None
+        self.control_clients = set()
 
     def control_snapshot(self):
         return {
@@ -54,6 +57,15 @@ class _FakeSession:
                     "command": command["type"],
                 },
             )
+
+    def device_response(self):
+        return self.device.public_payload() if self.device is not None else None
+
+    def control_client_attached(self, client_id):
+        self.control_clients.add(client_id)
+
+    async def control_client_detached(self, client_id):
+        self.control_clients.discard(client_id)
 
     async def begin_audio_uplink(self, command, *, owner_id=""):
         self.audio_begin = dict(command)
@@ -97,16 +109,40 @@ class _FakeManager:
         self.session = _FakeSession()
         self.session.config = self.config
         self.created_offer = ""
+        self.created_device = None
         self.suspended_session_id = ""
 
-    async def create_session(self, offer_sdp, requested_session_id=None):
+    async def create_session(
+        self,
+        offer_sdp,
+        requested_session_id=None,
+        device=None,
+    ):
         self.created_offer = offer_sdp
+        self.created_device = device
+        self.session.device = (
+            DEVICE_CAPABILITY_CATALOG.negotiate(
+                protocol_version=device.protocol_version,
+                instance_id=device.instance_id,
+                capabilities=device.capabilities,
+            )
+            if device is not None
+            else None
+        )
         if requested_session_id:
             self.session.session_id = requested_session_id
         return SimpleNamespace(
             session=self.session,
             answer_sdp="v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
             call_id="call_1",
+        )
+
+    async def renew_session(self, session_id, offer_sdp, device=None):
+        assert session_id == self.session.session_id
+        return await self.create_session(
+            offer_sdp,
+            requested_session_id=session_id,
+            device=device,
         )
 
     def require(self, session_id):
@@ -154,6 +190,10 @@ def _adapter_and_app():
         adapter._handle_realtime_audio_uplink,
     )
     app.router.add_post(
+        "/v1/realtime/sessions/{session_id}/renew",
+        adapter._handle_realtime_session_renew,
+    )
+    app.router.add_post(
         "/v1/realtime/sessions/{session_id}/suspend",
         adapter._handle_realtime_session_suspend,
     )
@@ -199,6 +239,74 @@ async def test_create_returns_sdp_metadata_without_standard_openai_key():
     assert payload["suspend_url"] == "/v1/realtime/sessions/voice_1/suspend"
     assert manager.created_offer.startswith("v=0")
     assert "sk-openai-server-only" not in str(payload)
+    assert "device" not in payload
+
+
+@pytest.mark.asyncio
+async def test_create_intersects_device_advertisement_with_server_catalog():
+    adapter, manager, app = _adapter_and_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/v1/realtime/sessions",
+            json={
+                "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                "device": {
+                    "protocol_version": 1,
+                    "instance_id": "22222222-2222-4222-8222-222222222222",
+                    "capabilities": [
+                        {"name": "timer", "version": 1},
+                        {"name": "unsupported_future", "version": 7},
+                    ],
+                },
+            },
+            headers=_authorization(adapter),
+        )
+        payload = await response.json()
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert response.status == 200
+    assert manager.created_device.capabilities == (
+        ("timer", 1),
+        ("unsupported_future", 7),
+    )
+    assert payload["device"]["capabilities"] == [{"name": "timer", "version": 1}]
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_client_supplied_device_tool_configuration():
+    adapter, _manager, app = _adapter_and_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/v1/realtime/sessions",
+            json={
+                "sdp": "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+                "device": {
+                    "protocol_version": 1,
+                    "instance_id": "22222222-2222-4222-8222-222222222222",
+                    "capabilities": [
+                        {
+                            "name": "timer",
+                            "version": 1,
+                            "schema": {"type": "object"},
+                        }
+                    ],
+                },
+            },
+            headers=_authorization(adapter),
+        )
+        payload = await response.json()
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "invalid_device_capability"
 
 
 @pytest.mark.asyncio
@@ -435,6 +543,7 @@ async def test_control_socket_replays_state_and_accepts_structured_ping():
     assert replay["type"] == "session.state"
     assert pong["type"] == "session.pong"
     assert pong["data"]["request_id"] == "request_1"
+    assert manager.session.control_clients == set()
 
 
 @pytest.mark.asyncio
@@ -574,6 +683,9 @@ async def test_capabilities_report_transport_and_authorization_semantics():
     assert details["playback_completion_command"] == "response.playback_completed"
     assert details["turn_completed_after_playback"] is True
     assert details["idle_provider_suspension"] is True
+    assert details["device_actions"]["capabilities"] == {"timer": 1}
+    assert details["device_actions"]["delivery"] == "at_least_once"
+    assert payload["features"]["device_actions"] == details["device_actions"]
     assert details["audio_uplink"] == {
         "available": True,
         "transport": "websocket",
