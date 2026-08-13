@@ -240,6 +240,10 @@ The Android OpenAI data channel is transport-only. It must not send
 client state from bypassing its frozen prompt, authorization, or durable
 ordering.
 
+Android clients that execute trusted local actions can negotiate them in this
+same JSON request. See [Realtime device actions](./realtime-device-actions) for
+the versioned catalog, reverse-RPC messages, replay rules, and renewal contract.
+
 #### 1a. Stream the pre-wake burst and live microphone
 
 `features.realtime_voice_details.audio_uplink` describes the authenticated

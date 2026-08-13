@@ -5758,6 +5758,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         voice: str = "",
         frozen_instructions: str,
         frozen_tools: Any,
+        frozen_base_tools: Any = None,
+        device_context: Any = None,
     ) -> None:
         """Persist the recoverable OpenAI call projection for a voice session."""
 
@@ -5766,14 +5768,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        frozen_base_tools_json = json.dumps(
+            (
+                frozen_base_tools
+                if isinstance(frozen_base_tools, list)
+                else (frozen_tools if isinstance(frozen_tools, list) else [])
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        device_context_json = (
+            json.dumps(
+                device_context,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            if isinstance(device_context, dict)
+            else None
+        )
 
         def _do(conn):
             conn.execute(
                 """INSERT INTO realtime_sessions (
                        session_id, provider_call_id, provider_call_started_at,
                        state, model, voice, frozen_instructions, frozen_tools,
-                       updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       frozen_base_tools, device_context, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(session_id) DO UPDATE SET
                        provider_call_id = excluded.provider_call_id,
                        provider_call_started_at = excluded.provider_call_started_at,
@@ -5782,6 +5802,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        voice = excluded.voice,
                        frozen_instructions = excluded.frozen_instructions,
                        frozen_tools = excluded.frozen_tools,
+                       frozen_base_tools = excluded.frozen_base_tools,
+                       device_context = excluded.device_context,
                        updated_at = excluded.updated_at""",
                 (
                     session_id,
@@ -5792,6 +5814,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     str(voice or ""),
                     str(frozen_instructions or ""),
                     frozen_tools_json,
+                    frozen_base_tools_json,
+                    device_context_json,
                     time.time(),
                 ),
             )
@@ -5818,9 +5842,267 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except (json.JSONDecodeError, TypeError):
             tools = []
         result["frozen_tools"] = tools if isinstance(tools, list) else []
+        try:
+            base_tools = json.loads(result.get("frozen_base_tools") or "null")
+        except (json.JSONDecodeError, TypeError):
+            base_tools = None
+        result["frozen_base_tools"] = (
+            base_tools if isinstance(base_tools, list) else None
+        )
+        try:
+            device_context = json.loads(result.get("device_context") or "null")
+        except (json.JSONDecodeError, TypeError):
+            device_context = None
+        result["device_context"] = (
+            device_context if isinstance(device_context, dict) else None
+        )
         result["review_memory"] = bool(result.get("review_memory"))
         result["review_skills"] = bool(result.get("review_skills"))
         return result
+
+    def create_realtime_device_invocation(
+        self,
+        session_id: str,
+        *,
+        invocation_id: str,
+        tool_name: str,
+        side_effecting: bool,
+        request_data: Dict[str, Any],
+        expires_at_epoch_ms: int,
+    ) -> bool:
+        """Durably claim a device invocation before publishing its request."""
+
+        request_json = json.dumps(
+            request_data,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO realtime_device_invocations (
+                       session_id, invocation_id, tool_name, side_effecting,
+                       status, request_data, expires_at_epoch_ms,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    invocation_id,
+                    tool_name,
+                    int(bool(side_effecting)),
+                    request_json,
+                    int(expires_at_epoch_ms),
+                    now,
+                    now,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def mark_realtime_device_invocation_dispatch(
+        self,
+        session_id: str,
+        invocation_id: str,
+        *,
+        dispatched: bool,
+    ) -> bool:
+        """Advance a claimed invocation through its durable dispatch phases."""
+
+        target = "dispatched" if dispatched else "dispatching"
+        expected = "dispatching" if dispatched else "claimed"
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE realtime_device_invocations
+                   SET dispatch_state = ?, updated_at = ?
+                   WHERE session_id = ? AND invocation_id = ?
+                     AND status = 'pending' AND dispatch_state = ?""",
+                (
+                    target,
+                    time.time(),
+                    session_id,
+                    invocation_id,
+                    expected,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def get_realtime_device_invocation(
+        self,
+        session_id: str,
+        invocation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return one durable device invocation scoped to its logical session."""
+
+        if not session_id or not invocation_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                """SELECT session_id, invocation_id, tool_name, side_effecting,
+                          status, dispatch_state, request_data,
+                          expires_at_epoch_ms, output,
+                          effect_disposition, result_source,
+                          continuation_required, created_at, updated_at
+                   FROM realtime_device_invocations
+                   WHERE session_id = ? AND invocation_id = ?""",
+                (session_id, invocation_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._decode_realtime_device_invocation(row)
+
+    def list_unfinished_realtime_device_invocations(
+        self,
+        session_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Return pending or not-yet-projected device results in creation order."""
+
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                """SELECT session_id, invocation_id, tool_name, side_effecting,
+                          status, dispatch_state, request_data,
+                          expires_at_epoch_ms, output,
+                          effect_disposition, result_source,
+                          continuation_required, created_at, updated_at
+                   FROM realtime_device_invocations
+                   WHERE session_id = ?
+                     AND (
+                         status IN ('pending', 'result_received')
+                         OR continuation_required = 1
+                     )
+                   ORDER BY created_at, invocation_id""",
+                (session_id,),
+            ).fetchall()
+        return [
+            self._decode_realtime_device_invocation(row)
+            for row in rows
+        ]
+
+    @staticmethod
+    def _decode_realtime_device_invocation(row) -> Dict[str, Any]:
+        result = dict(row)
+        try:
+            request_data = json.loads(result.get("request_data") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            request_data = {}
+        result["request_data"] = (
+            request_data if isinstance(request_data, dict) else {}
+        )
+        result["side_effecting"] = bool(result.get("side_effecting"))
+        result["continuation_required"] = bool(
+            result.get("continuation_required")
+        )
+        return result
+
+    def record_realtime_device_invocation_result(
+        self,
+        session_id: str,
+        invocation_id: str,
+        *,
+        output: str,
+        effect_disposition: Optional[str],
+        result_source: str,
+    ) -> bool:
+        """Capture the first result durably before client acknowledgement."""
+
+        if result_source not in {"device", "transport", "recovery"}:
+            raise ValueError("Invalid realtime device result source")
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE realtime_device_invocations
+                   SET status = 'result_received', output = ?,
+                       effect_disposition = ?, result_source = ?,
+                       continuation_required = 1, updated_at = ?
+                   WHERE session_id = ? AND invocation_id = ?
+                     AND status = 'pending'""",
+                (
+                    str(output),
+                    effect_disposition,
+                    result_source,
+                    time.time(),
+                    session_id,
+                    invocation_id,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def clear_realtime_device_continuations(self, session_id: str) -> int:
+        """Mark device results as projected into a provider continuation."""
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE realtime_device_invocations
+                   SET continuation_required = 0, updated_at = ?
+                   WHERE session_id = ? AND continuation_required = 1""",
+                (time.time(), session_id),
+            )
+            return int(cursor.rowcount)
+
+        return int(self._execute_write(_do))
+
+    def require_realtime_device_continuations(
+        self,
+        session_id: str,
+        invocation_ids: list[str],
+    ) -> int:
+        """Re-arm durable results that must be projected after provider loss."""
+
+        normalized = [str(value) for value in invocation_ids if str(value)]
+        if not normalized:
+            return 0
+        placeholders = ",".join("?" for _ in normalized)
+
+        def _do(conn):
+            cursor = conn.execute(
+                f"""UPDATE realtime_device_invocations
+                    SET continuation_required = 1, updated_at = ?
+                    WHERE session_id = ?
+                      AND invocation_id IN ({placeholders})
+                      AND output IS NOT NULL""",
+                (time.time(), session_id, *normalized),
+            )
+            return int(cursor.rowcount)
+
+        return int(self._execute_write(_do))
+
+    def has_realtime_device_continuation(self, session_id: str) -> bool:
+        """Return whether a device result still needs provider acceptance."""
+
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                """SELECT 1
+                   FROM realtime_device_invocations
+                   WHERE session_id = ? AND continuation_required = 1
+                   LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
+    def complete_realtime_device_invocation(
+        self,
+        session_id: str,
+        invocation_id: str,
+    ) -> bool:
+        """Mark a result complete after its canonical tool message is durable."""
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE realtime_device_invocations
+                   SET status = 'completed', updated_at = ?
+                   WHERE session_id = ? AND invocation_id = ?
+                     AND status = 'result_received'""",
+                (time.time(), session_id, invocation_id),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
 
     def mark_realtime_review_due(
         self,

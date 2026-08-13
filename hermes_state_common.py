@@ -287,12 +287,36 @@ CREATE TABLE IF NOT EXISTS realtime_sessions (
     voice TEXT NOT NULL DEFAULT '',
     frozen_instructions TEXT NOT NULL DEFAULT '',
     frozen_tools TEXT NOT NULL DEFAULT '[]',
+    frozen_base_tools TEXT,
+    device_context TEXT,
     review_state TEXT NOT NULL DEFAULT 'idle',
     review_boundary_message_id INTEGER,
     review_memory INTEGER NOT NULL DEFAULT 0,
     review_skills INTEGER NOT NULL DEFAULT 0,
     review_error TEXT,
     updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS realtime_device_invocations (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    invocation_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    side_effecting INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'result_received', 'completed')),
+    dispatch_state TEXT NOT NULL DEFAULT 'claimed'
+        CHECK(dispatch_state IN ('claimed', 'dispatching', 'dispatched')),
+    request_data TEXT NOT NULL,
+    expires_at_epoch_ms INTEGER NOT NULL,
+    output TEXT,
+    effect_disposition TEXT,
+    result_source TEXT
+        CHECK(result_source IN ('device', 'transport', 'recovery')),
+    continuation_required INTEGER NOT NULL DEFAULT 0
+        CHECK(continuation_required IN (0, 1)),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (session_id, invocation_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -305,6 +329,8 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_realtime_device_invocations_status
+    ON realtime_device_invocations(session_id, status, updated_at);
 """
 
 

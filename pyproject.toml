@@ -372,12 +372,10 @@ include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*",
 
 [tool.setuptools.package-data]
 hermes_cli = ["observability/schemas/*.json"]
-# gateway/assets/ ships status_phrases.yaml and the Telegram BotFather
-# screenshot. Without this, sealed venvs (uv2nix) silently lose both —
-# status phrases fall back to the tiny hardcoded set and the Telegram
-# topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
-# in gateway/status_phrases.py and gateway/run.py.
-gateway = ["assets/**/*"]
+# gateway package data includes runtime-loaded assets and the trusted Realtime
+# device catalog. Without this, sealed venvs (uv2nix) silently lose files that
+# are present in source checkouts.
+gateway = ["assets/**/*", "realtime/device_capabilities.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -2,13 +2,20 @@ import asyncio
 import base64
 import json
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from gateway.realtime.device_actions import DEVICE_CAPABILITY_CATALOG
 from gateway.realtime.openai_sideband import OpenAIRealtimeError
-from gateway.realtime.protocol import RealtimeProtocolError, RealtimeVoiceConfig
+from gateway.realtime.protocol import (
+    RealtimeFunctionCall,
+    RealtimeProtocolError,
+    RealtimeVoiceConfig,
+    validate_control_command,
+)
 from gateway.realtime.session import RealtimeVoiceSession, prepare_realtime_agent
 from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
@@ -118,6 +125,49 @@ class _CommitThenFailAppendSideband(_FakeSideband):
 
 
 STREAM_ID = "11111111-1111-4111-8111-111111111111"
+DEVICE_ID = "22222222-2222-4222-8222-222222222222"
+
+
+def _timer_binding():
+    return DEVICE_CAPABILITY_CATALOG.negotiate(
+        protocol_version=1,
+        instance_id=DEVICE_ID,
+        capabilities=[("timer", 1)],
+    )
+
+
+def _device_test_session(session_id, *, db, timeout_cap=1.0):
+    db.create_session(session_id=session_id, source="realtime_voice")
+    return RealtimeVoiceSession(
+        session_id=session_id,
+        agent=SimpleNamespace(
+            tools=[],
+            _session_db=db,
+            _skip_unstarted_tool_calls=False,
+        ),
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            device_action_timeout_cap_seconds=timeout_cap,
+        ),
+        frozen_instructions="prompt",
+        frozen_tools=_timer_binding().model_tools(),
+        frozen_base_tools=[],
+        device_binding=_timer_binding(),
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id=f"provider-{session_id}",
+    )
+
+
+def _timer_call(call_id="device-call-1"):
+    return RealtimeFunctionCall(
+        call_id=call_id,
+        name="device_timer_create",
+        arguments='{"duration_seconds":300}',
+        item_id=f"item-{call_id}",
+        response_id=f"response-{call_id}",
+    )
 
 
 def _begin_command(stream_id=STREAM_ID, *, preroll_ms=0):
@@ -1450,6 +1500,49 @@ def test_new_tool_batch_clears_stale_skip_without_losing_active_interrupt():
 
 
 @pytest.mark.asyncio
+async def test_close_suppresses_unstarted_server_calls_mid_batch():
+    first_started = threading.Event()
+    release_first = threading.Event()
+    executed = []
+    agent = SimpleNamespace(
+        tools=[],
+        _session_db=None,
+        _skip_unstarted_tool_calls=False,
+    )
+
+    def execute(_assistant, _messages, _task_id, _api_call_count):
+        executed.append("first")
+        first_started.set()
+        assert release_first.wait(timeout=2)
+        if not agent._skip_unstarted_tool_calls:
+            executed.append("second")
+
+    agent._execute_tool_calls_sequential = execute
+    session = RealtimeVoiceSession(
+        session_id="close-mid-server-batch",
+        agent=agent,
+        config=RealtimeVoiceConfig(enabled=True),
+        frozen_instructions="prompt",
+        conversation_history=[],
+        sideband=_FakeSideband(),
+        call_id="call-close-mid-batch",
+    )
+    worker = asyncio.create_task(asyncio.to_thread(
+        session._execute_tools_sync,
+        SimpleNamespace(content="", tool_calls=[]),
+        [],
+        "task",
+        1,
+    ))
+    assert await asyncio.to_thread(first_started.wait, 2)
+    await session.close(reason="test_close", end_session=False)
+    release_first.set()
+    await worker
+
+    assert executed == ["first"]
+
+
+@pytest.mark.asyncio
 async def test_status_interruption_with_pending_continuation_starts_handoff_timeout():
     sideband = _FakeSideband()
     agent = SimpleNamespace(
@@ -1513,6 +1606,554 @@ async def test_recovered_call_rotation_uses_remaining_provider_lifetime():
     event = session.broker.snapshot()[-1]
     assert event["type"] == "session.rotation_required"
     assert event["data"]["renew_within_seconds"] == 10
+
+
+@pytest.mark.asyncio
+async def test_device_timer_pipeline_persists_correlated_output_before_continuation(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id="device-timer-session",
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._skill_nudge_interval = 0
+    binding = _timer_binding()
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id="device-timer-session",
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        frozen_tools=[*agent.tools, *binding.model_tools()],
+        frozen_base_tools=agent.tools,
+        device_binding=binding,
+        conversation_history=[],
+        sideband=sideband,
+        call_id="provider-device-timer",
+    )
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input-device-1",
+            "transcript": "Set a five minute timer.",
+        })
+        create_started = threading.Event()
+        release_create = threading.Event()
+        create_invocation = db.create_realtime_device_invocation
+
+        def gated_create(*args, **kwargs):
+            create_started.set()
+            assert release_create.wait(timeout=2)
+            return create_invocation(*args, **kwargs)
+
+        with patch.object(
+            db,
+            "create_realtime_device_invocation",
+            side_effect=gated_create,
+        ):
+            await session.handle_provider_event({
+                "type": "response.done",
+                "response": {
+                    "id": "response-device-1",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "item-device-call-1",
+                            "call_id": "device-call-1",
+                            "name": "device_timer_create",
+                            "arguments": '{"duration_seconds":300}',
+                        }
+                    ],
+                },
+            })
+            assert await asyncio.to_thread(create_started.wait, 2)
+            assert not any(
+                event["type"] == "device.action.request"
+                for event in session.control_snapshot()["pending_controls"]
+            )
+            assert not any(
+                event["type"] == "device.action.request"
+                for event in session.broker.snapshot()
+            )
+            release_create.set()
+        await _wait_until(
+            lambda: any(
+                event["type"] == "device.action.request"
+                for event in session.broker.snapshot()
+            )
+        )
+
+        request_event = next(
+            event
+            for event in session.broker.snapshot()
+            if event["type"] == "device.action.request"
+        )
+        request = request_event["data"]
+        assert request["invocation_id"] == "device-call-1"
+        assert request["device_instance_id"] == DEVICE_ID
+        assert request["tool_name"] == "device_timer_create"
+        assert request["capability"] == "timer"
+        assert request["operation"] == "create"
+        assert request["arguments"] == {
+            "duration_seconds": 300,
+            "label": None,
+        }
+        assert request["expires_at_epoch_ms"] > 0
+
+        result_command = validate_control_command({
+            "version": 1,
+            "request_id": "android-result-1",
+            "type": "device.action.result",
+            "data": {
+                "invocation_id": "device-call-1",
+                "status": "ok",
+                "result": {
+                    "timer_id": "timer-42",
+                    "fires_at_epoch_ms": 1_786_450_195_000,
+                    "label": None,
+                },
+            },
+        })
+        persist_started = asyncio.Event()
+        release_persist = asyncio.Event()
+        persist_device_result = session._persist_device_tool_result
+
+        async def gated_persist(*args, **kwargs):
+            persist_started.set()
+            await release_persist.wait()
+            await persist_device_result(*args, **kwargs)
+
+        with patch.object(
+            session,
+            "_persist_device_tool_result",
+            side_effect=gated_persist,
+        ):
+            result_task = asyncio.create_task(
+                session.handle_control_command(result_command)
+            )
+            await asyncio.wait_for(persist_started.wait(), timeout=2)
+            try:
+                captured = db.get_realtime_device_invocation(
+                    "device-timer-session",
+                    "device-call-1",
+                )
+                assert captured["status"] == "result_received"
+                assert captured["result_source"] == "device"
+                assert result_task.done() is False
+            finally:
+                release_persist.set()
+            await result_task
+        await session._tool_task
+
+        durable = db.get_tool_result_by_call_id(
+            "device-timer-session",
+            "device-call-1",
+        )
+        assert durable is not None
+        assert json.loads(durable["content"]) == {
+            "success": True,
+            "result": {
+                "timer_id": "timer-42",
+                "fires_at_epoch_ms": 1_786_450_195_000,
+                "label": None,
+            },
+        }
+        output_index = next(
+            index
+            for index, event in enumerate(sideband.sent)
+            if event.get("item", {}).get("type") == "function_call_output"
+            and event["item"]["call_id"] == "device-call-1"
+        )
+        continuation_index = next(
+            index
+            for index, event in enumerate(sideband.sent)
+            if index > output_index and event.get("type") == "response.create"
+        )
+        assert output_index < continuation_index
+        assert any(
+            event["type"] == "device.action.request"
+            and event["data"]["expires_at_epoch_ms"]
+            == request["expires_at_epoch_ms"]
+            for event in session.broker.snapshot()
+        )
+        sideband._stop.set()
+        await _wait_until(
+            lambda: any(
+                event["type"] == "session.rotation_required"
+                for event in session.broker.snapshot()
+            )
+        )
+        assert session.can_renew
+        assert db.get_realtime_device_invocation(
+            "device-timer-session",
+            "device-call-1",
+        )["continuation_required"] is True
+        assert db.get_realtime_session_state(
+            "device-timer-session"
+        )["state"] == "renewal_required"
+        rotation_reasons = [
+            event["data"]["reason"]
+            for event in session.broker.snapshot()
+            if event["type"] == "session.rotation_required"
+        ]
+        assert rotation_reasons == ["device_continuation_transport_uncertain"]
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.parametrize("include_server_tool", [False, True])
+@pytest.mark.asyncio
+async def test_device_tool_batch_preserves_voice_steer_and_skips_remaining_calls(
+    tmp_path,
+    include_server_tool,
+):
+    session_id = f"device-steer-{include_server_tool}"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = AIAgent(
+        model="gpt-realtime",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        provider="openai-api",
+        api_mode="chat_completions",
+        enabled_toolsets=["todo"],
+        session_id=session_id,
+        platform="realtime_voice",
+        session_db=db,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._skill_nudge_interval = 0
+    binding = _timer_binding()
+    sideband = _FakeSideband()
+    session = RealtimeVoiceSession(
+        session_id=session_id,
+        agent=agent,
+        config=RealtimeVoiceConfig(
+            enabled=True,
+            intermediate_speech_enabled=False,
+            provider_call_max_seconds=3600,
+        ),
+        frozen_instructions=prepare_realtime_agent(agent, []),
+        frozen_tools=[*agent.tools, *binding.model_tools()],
+        frozen_base_tools=agent.tools,
+        device_binding=binding,
+        conversation_history=[],
+        sideband=sideband,
+        call_id=f"provider-{session_id}",
+    )
+    calls = [
+        {
+            "type": "function_call",
+            "id": "item-device-steer",
+            "call_id": "device-call-steer",
+            "name": "device_timer_create",
+            "arguments": '{"duration_seconds":300}',
+        }
+    ]
+    if include_server_tool:
+        calls.append({
+            "type": "function_call",
+            "id": "item-todo-after-device",
+            "call_id": "todo-after-device",
+            "name": "todo",
+            "arguments": (
+                '{"todos":[{"id":"should-not-run","content":"should not run",'
+                '"status":"pending"}]}'
+            ),
+        })
+
+    await session.start()
+    try:
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input-device-steer",
+            "transcript": "Set a timer.",
+        })
+        await session.handle_provider_event({
+            "type": "response.done",
+            "response": {
+                "id": "response-device-steer",
+                "status": "completed",
+                "output": calls,
+            },
+        })
+        await _wait_until(
+            lambda: any(
+                event["type"] == "device.action.request"
+                for event in session.broker.snapshot()
+            )
+        )
+        await session.handle_provider_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "input-steer-during-device",
+            "transcript": "Use a shorter timer instead.",
+        })
+        await session.handle_control_command(validate_control_command({
+            "version": 1,
+            "request_id": "android-steer-result",
+            "type": "device.action.result",
+            "data": {
+                "invocation_id": "device-call-steer",
+                "status": "ok",
+                "result": {
+                    "timer_id": "timer-steer",
+                    "fires_at_epoch_ms": 1_786_450_195_000,
+                    "label": None,
+                },
+            },
+        }))
+        await session._tool_task
+
+        device_result = db.get_tool_result_by_call_id(
+            session_id,
+            "device-call-steer",
+        )
+        assert device_result is not None
+        if include_server_tool:
+            server_result = db.get_tool_result_by_call_id(
+                session_id,
+                "todo-after-device",
+            )
+            assert server_result is not None
+            assert "Tool execution skipped" in server_result["content"]
+            assert "Use a shorter timer instead." in server_result["content"]
+        else:
+            assert "Use a shorter timer instead." in device_result["content"]
+    finally:
+        await session.close(reason="test_complete", end_session=False)
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_device_error_is_nonfatal_and_not_ambiguous(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session = _device_test_session("device-error", db=db)
+    call = _timer_call()
+    with patch.object(
+        session,
+        "_persist_device_tool_result",
+        new_callable=AsyncMock,
+    ) as persist:
+        task = asyncio.create_task(
+            session._execute_device_tool_call(
+                call,
+                session.device_binding.tool(call.name),
+                skip_unstarted=False,
+            )
+        )
+        await _wait_until(
+            lambda: any(
+                event["type"] == "device.action.request"
+                for event in session.broker.snapshot()
+            )
+        )
+        await session.handle_control_command(validate_control_command({
+            "version": 1,
+            "request_id": "android-error-1",
+            "type": "device.action.result",
+            "data": {
+                "invocation_id": call.call_id,
+                "status": "error",
+                "error": {
+                    "code": "permission_denied",
+                    "message": "Exact alarms are unavailable",
+                    "retryable": False,
+                },
+            },
+        }))
+        await task
+
+    output = json.loads(persist.await_args.args[1])
+    assert output["error"]["code"] == "permission_denied"
+    assert persist.await_args.kwargs["effect_disposition"] == "none"
+    assert session.closed is False
+    db.close()
+
+
+@pytest.mark.parametrize("failure_mode", ["timeout", "disconnect"])
+@pytest.mark.asyncio
+async def test_unconfirmed_device_action_reports_ambiguous_outcome(
+    failure_mode,
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session = _device_test_session(
+        "device-ambiguous",
+        db=db,
+        timeout_cap=0.02,
+    )
+    call = _timer_call()
+    if failure_mode == "disconnect":
+        session.control_client_attached("android-control")
+
+    with patch.object(
+        session,
+        "_persist_device_tool_result",
+        new_callable=AsyncMock,
+    ) as persist:
+        task = asyncio.create_task(
+            session._execute_device_tool_call(
+                call,
+                session.device_binding.tool(call.name),
+                skip_unstarted=False,
+            )
+        )
+        await _wait_until(
+            lambda: any(
+                event["type"] == "device.action.request"
+                for event in session.broker.snapshot()
+            )
+        )
+        request = next(
+            event["data"]
+            for event in session.broker.snapshot()
+            if event["type"] == "device.action.request"
+        )
+        if failure_mode == "disconnect":
+            await session.control_client_detached("android-control")
+        await task
+
+    output = json.loads(persist.await_args.args[1])
+    assert output["error"]["code"] == "outcome_unknown"
+    assert output["error"]["retryable"] is False
+    assert persist.await_args.kwargs["effect_disposition"] == "unknown"
+    assert request["expires_at_epoch_ms"] > 0
+    assert call.call_id in session._expired_device_invocations
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_valid_device_result_wins_when_durable_write_crosses_timeout(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session = _device_test_session(
+        "device-result-timeout-race",
+        db=db,
+        timeout_cap=0.2,
+    )
+    call = _timer_call()
+    original_record = db.record_realtime_device_invocation_result
+
+    def delayed_record(*args, **kwargs):
+        if kwargs.get("result_source") == "device":
+            time.sleep(0.3)
+        return original_record(*args, **kwargs)
+
+    with (
+        patch.object(
+            session,
+            "_persist_device_tool_result",
+            new_callable=AsyncMock,
+        ) as persist,
+        patch.object(
+            db,
+            "record_realtime_device_invocation_result",
+            side_effect=delayed_record,
+        ),
+    ):
+        execution = asyncio.create_task(
+            session._execute_device_tool_call(
+                call,
+                session.device_binding.tool(call.name),
+                skip_unstarted=False,
+            )
+        )
+        await _wait_until(
+            lambda: any(
+                event["type"] == "device.action.request"
+                for event in session.broker.snapshot()
+            )
+        )
+        result = asyncio.create_task(session._handle_device_action_result({
+            "invocation_id": call.call_id,
+            "status": "ok",
+            "result": {
+                "timer_id": "timer-race",
+                "fires_at_epoch_ms": 1_786_450_195_000,
+                "label": None,
+            },
+        }))
+        assert await result == "accepted"
+        await execution
+
+    output = json.loads(persist.await_args.args[1])
+    assert output["success"] is True
+    invocation = db.get_realtime_device_invocation(
+        "device-result-timeout-race",
+        call.call_id,
+    )
+    assert invocation["result_source"] == "device"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_device_results_are_session_scoped_and_first_valid_result_wins(
+    tmp_path,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    first = _device_test_session("device-first", db=db)
+    second = _device_test_session("device-second", db=db)
+    call = _timer_call()
+    result = {
+        "invocation_id": call.call_id,
+        "status": "ok",
+        "result": {
+            "timer_id": "timer-42",
+            "fires_at_epoch_ms": 1_786_450_195_000,
+            "label": None,
+        },
+    }
+
+    with patch.object(
+        first,
+        "_persist_device_tool_result",
+        new_callable=AsyncMock,
+    ) as persist:
+        task = asyncio.create_task(
+            first._execute_device_tool_call(
+                call,
+                first.device_binding.tool(call.name),
+                skip_unstarted=False,
+            )
+        )
+        await _wait_until(
+            lambda: any(
+                event["type"] == "device.action.request"
+                for event in first.broker.snapshot()
+            )
+        )
+
+        with pytest.raises(RealtimeProtocolError) as cross_session:
+            await second._handle_device_action_result(result)
+        assert cross_session.value.code == "unknown_device_invocation"
+        assert call.call_id in first._pending_device_invocations
+
+        assert await first._handle_device_action_result(result) == "accepted"
+        assert await first._handle_device_action_result(result) == "duplicate"
+        await task
+
+    persist.assert_awaited_once()
+    db.close()
 
 
 @pytest.mark.asyncio

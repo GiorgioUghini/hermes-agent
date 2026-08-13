@@ -17,6 +17,7 @@ import uuid
 CONTROL_PROTOCOL_VERSION = 1
 MAX_CONTROL_COMMAND_BYTES = 64 * 1024
 MAX_TOOL_COUNT = 128
+MAX_DEVICE_CAPABILITIES = 32
 AUDIO_UPLINK_SAMPLE_RATE_HZ = 24_000
 AUDIO_UPLINK_CHANNELS = 1
 AUDIO_UPLINK_SAMPLE_WIDTH_BYTES = 2
@@ -49,6 +50,7 @@ SESSION_STATES = frozenset({
 CONTROL_COMMAND_TYPES = frozenset({
     "approval.respond",
     "clarification.respond",
+    "device.action.result",
     "response.interrupt",
     "response.playback_completed",
     "secret.respond",
@@ -59,6 +61,8 @@ CONTROL_COMMAND_TYPES = frozenset({
 APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
+_CAPABILITY_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_DEVICE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _VOICE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _DEFAULT_CALL_URL = "https://api.openai.com/v1/realtime/calls"
 _DEFAULT_SIDEBAND_URL = "wss://api.openai.com/v1/realtime"
@@ -70,6 +74,109 @@ class RealtimeProtocolError(ValueError):
     def __init__(self, message: str, *, code: str = "invalid_realtime_payload"):
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True)
+class DeviceAdvertisement:
+    """Strict client advertisement before server-owned catalog intersection."""
+
+    protocol_version: int
+    instance_id: str
+    capabilities: tuple[tuple[str, int], ...]
+
+
+def validate_device_advertisement(raw: Any) -> Optional[DeviceAdvertisement]:
+    """Validate optional device metadata without accepting any client schemas."""
+
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise RealtimeProtocolError(
+            "device must be an object",
+            code="invalid_device_advertisement",
+        )
+    unknown = set(raw) - {"protocol_version", "instance_id", "capabilities"}
+    if unknown:
+        raise RealtimeProtocolError(
+            f"device contains unknown fields: {sorted(unknown)}",
+            code="invalid_device_advertisement",
+        )
+    protocol_version = raw.get("protocol_version")
+    if isinstance(protocol_version, bool) or not isinstance(protocol_version, int):
+        raise RealtimeProtocolError(
+            "device.protocol_version must be an integer",
+            code="invalid_device_protocol_version",
+        )
+    from gateway.realtime.device_actions import DEVICE_CAPABILITY_CATALOG
+
+    if protocol_version != DEVICE_CAPABILITY_CATALOG.protocol_version:
+        raise RealtimeProtocolError(
+            f"Unsupported device protocol version: {protocol_version}",
+            code="unsupported_device_protocol_version",
+        )
+    instance_id = str(raw.get("instance_id") or "").strip()
+    try:
+        canonical_instance_id = str(uuid.UUID(instance_id))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise RealtimeProtocolError(
+            "device.instance_id must be a canonical installation UUID",
+            code="invalid_device_instance_id",
+        ) from exc
+    if canonical_instance_id != instance_id.lower():
+        raise RealtimeProtocolError(
+            "device.instance_id must use canonical UUID notation",
+            code="invalid_device_instance_id",
+        )
+    raw_capabilities = raw.get("capabilities")
+    if not isinstance(raw_capabilities, list):
+        raise RealtimeProtocolError(
+            "device.capabilities must be an array",
+            code="invalid_device_capabilities",
+        )
+    if len(raw_capabilities) > MAX_DEVICE_CAPABILITIES:
+        raise RealtimeProtocolError(
+            f"device.capabilities supports at most {MAX_DEVICE_CAPABILITIES} entries",
+            code="too_many_device_capabilities",
+        )
+    capabilities = []
+    seen_names = set()
+    for raw_capability in raw_capabilities:
+        if (
+            not isinstance(raw_capability, Mapping)
+            or set(raw_capability) != {"name", "version"}
+        ):
+            raise RealtimeProtocolError(
+                "Each device capability must contain only name and version",
+                code="invalid_device_capability",
+            )
+        name = raw_capability.get("name")
+        version = raw_capability.get("version")
+        if not isinstance(name, str) or not _CAPABILITY_NAME_RE.fullmatch(name):
+            raise RealtimeProtocolError(
+                "Device capability name is invalid",
+                code="invalid_device_capability_name",
+            )
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or not 1 <= version <= 1_000_000
+        ):
+            raise RealtimeProtocolError(
+                "Device capability version is invalid",
+                code="invalid_device_capability_version",
+            )
+        if name in seen_names:
+            raise RealtimeProtocolError(
+                "A device capability may advertise only one version",
+                code="duplicate_device_capability",
+            )
+        seen_names.add(name)
+        capabilities.append((name, version))
+    return DeviceAdvertisement(
+        protocol_version=protocol_version,
+        instance_id=canonical_instance_id,
+        capabilities=tuple(capabilities),
+    )
 
 
 def _as_mapping(value: Any) -> Mapping[str, Any]:
@@ -193,6 +300,7 @@ class RealtimeVoiceConfig:
     control_buffer_events: int = 256
     control_subscriber_queue_events: int = 128
     history_message_limit: int = 40
+    device_action_timeout_cap_seconds: float = 30.0
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any] | None) -> "RealtimeVoiceConfig":
@@ -202,6 +310,7 @@ class RealtimeVoiceConfig:
         interim = _as_mapping(raw.get("intermediate_speech"))
         legacy_preroll = _as_mapping(raw.get("preroll"))
         audio_uplink = _as_mapping(raw.get("audio_uplink"))
+        device_actions = _as_mapping(raw.get("device_actions"))
         limits = _as_mapping(raw.get("limits"))
         transport = _as_mapping(raw.get("transport"))
 
@@ -392,6 +501,12 @@ class RealtimeVoiceConfig:
                 cls.history_message_limit,
                 4,
                 200,
+            ),
+            device_action_timeout_cap_seconds=_bounded_float(
+                device_actions.get("timeout_cap_seconds"),
+                cls.device_action_timeout_cap_seconds,
+                1.0,
+                120.0,
             ),
         )
 
@@ -1051,4 +1166,81 @@ def validate_control_command(raw: Any) -> dict[str, Any]:
                 code="invalid_response_id",
             )
         normalized["data"] = {"response_id": response_id}
+    elif command_type == "device.action.result":
+        if not request_id:
+            raise RealtimeProtocolError(
+                "device.action.result requires request_id",
+                code="invalid_request_id",
+            )
+        invocation_id = str(data.get("invocation_id") or "").strip()
+        if not _ID_RE.fullmatch(invocation_id):
+            raise RealtimeProtocolError(
+                "invocation_id is invalid",
+                code="invalid_device_invocation_id",
+            )
+        status = str(data.get("status") or "").strip()
+        if status == "ok":
+            if set(data) != {"invocation_id", "status", "result"}:
+                raise RealtimeProtocolError(
+                    "Successful device results require only invocation_id, status, and result",
+                    code="invalid_device_action_result",
+                )
+            result = data.get("result")
+            if not isinstance(result, Mapping):
+                raise RealtimeProtocolError(
+                    "device action result must be an object",
+                    code="invalid_device_action_result",
+                )
+            normalized["data"] = {
+                "invocation_id": invocation_id,
+                "status": "ok",
+                "result": dict(result),
+            }
+        elif status == "error":
+            if set(data) != {"invocation_id", "status", "error"}:
+                raise RealtimeProtocolError(
+                    "Failed device results require only invocation_id, status, and error",
+                    code="invalid_device_action_error",
+                )
+            error = data.get("error")
+            if not isinstance(error, Mapping) or set(error) != {
+                "code",
+                "message",
+                "retryable",
+            }:
+                raise RealtimeProtocolError(
+                    "device action error is invalid",
+                    code="invalid_device_action_error",
+                )
+            error_code = str(error.get("code") or "").strip()
+            message = str(error.get("message") or "").strip()
+            retryable = error.get("retryable")
+            if not _DEVICE_ERROR_CODE_RE.fullmatch(error_code):
+                raise RealtimeProtocolError(
+                    "device action error code is invalid",
+                    code="invalid_device_action_error",
+                )
+            if (
+                not 1 <= len(message) <= 1000
+                or any(ch in message for ch in ("\r", "\n", "\x00"))
+                or not isinstance(retryable, bool)
+            ):
+                raise RealtimeProtocolError(
+                    "device action error details are invalid",
+                    code="invalid_device_action_error",
+                )
+            normalized["data"] = {
+                "invocation_id": invocation_id,
+                "status": "error",
+                "error": {
+                    "code": error_code,
+                    "message": message,
+                    "retryable": retryable,
+                },
+            }
+        else:
+            raise RealtimeProtocolError(
+                "device action status must be ok or error",
+                code="invalid_device_action_status",
+            )
     return normalized
